@@ -2,17 +2,13 @@
   "name": "image-generator-api",
   "private": true,
   "version": "1.0.0",
-  "description": "Serverless API on Vercel to generate images via Replicate (FLUX).",
   "type": "module",
   "main": "api/ping.js",
   "scripts": {
-    "dev": "vercel dev",
     "start": "node api/ping.js"
   },
   "dependencies": {
     "replicate": "^0.29.4"
   },
-  "engines": {
-    "node": ">=18.17"
-  }
+  "engines": { "node": ">=18.17" }
 }
