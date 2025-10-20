@@ -1,6 +1,10 @@
 {
-  "packageManager": "npm@9.8.0",
-  "engines": {
-    "node": ">=18.17.0 <19"
-  }
+  "functions": {
+    "api/*.js": {
+      "runtime": "nodejs18.x"
+    }
+  },
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api/$1" }
+  ]
 }
