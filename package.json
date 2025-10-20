@@ -2,7 +2,6 @@
   "name": "image-generator-api",
   "private": true,
   "version": "1.0.0",
-  "type": "module",
   "main": "api/ping.js",
   "scripts": {
     "start": "node api/ping.js"
@@ -10,5 +9,5 @@
   "dependencies": {
     "replicate": "^0.29.4"
   },
-  "engines": { "node": ">=18.17" }
+  "engines": { "node": "18.x" }
 }
