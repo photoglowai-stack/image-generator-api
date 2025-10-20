@@ -1,8 +1,15 @@
 {
-  "builds": [
-    { "src": "api/*.js", "use": "@vercel/node" }
-  ],
-  "routes": [
-    { "src": "/api/(.*)", "dest": "/api/$1" }
-  ]
+  "name": "image-generator-api",
+  "private": true,
+  "version": "1.0.0",
+  "main": "api/ping.js",
+  "scripts": {
+    "start": "node api/ping.js"
+  },
+  "dependencies": {
+    "replicate": "^0.29.4"
+  },
+  "engines": {
+    "node": "18.x"
+  }
 }
