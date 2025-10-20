@@ -1,8 +1,7 @@
-// api/generate.js
-import Replicate from "replicate";
-import { createClient } from "@supabase/supabase-js";
+const Replicate = require("replicate");
+const { createClient } = require("@supabase/supabase-js");
 
-export default async function handler(req, res) {
+module.exports = async (req, res) => {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Méthode non autorisée (POST attendu)" });
   }
@@ -15,26 +14,23 @@ export default async function handler(req, res) {
 
     const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 
+    // Modèle rapide et qualitatif
     const output = await replicate.run("black-forest-labs/flux-schnell", {
-      input: {
-        prompt,
-        num_outputs,      // 1–4
-        aspect_ratio,     // "1:1", "16:9", "2:3", ...
-        seed: seed ?? undefined
-      },
+      input: { prompt, num_outputs, aspect_ratio, seed: seed ?? undefined }
     });
 
     const images = Array.isArray(output) ? output : [output];
     const imageUrl = images[0];
 
+    // Optionnel : enregistre dans Supabase si les clés existent
     if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
       const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
       await supabase.from("images").insert([{ prompt, image_url: imageUrl }]);
     }
 
     return res.status(200).json({ success: true, imageUrl, images });
-  } catch (error) {
-    console.error(error);
+  } catch (err) {
+    console.error(err);
     return res.status(500).json({ error: "Erreur lors de la génération." });
   }
-}
+};
