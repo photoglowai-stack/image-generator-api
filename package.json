@@ -1,0 +1,11 @@
+{
+  "name": "image-generator-api",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.47.5",
+    "replicate": "^0.27.1"
+  }
+}
