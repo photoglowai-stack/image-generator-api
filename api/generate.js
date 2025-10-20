@@ -1,38 +1,24 @@
-// api/generate.js
-const Replicate = require("replicate");
-const { createClient } = require("@supabase/supabase-js");
+import Replicate from "replicate";
 
-module.exports = async (req, res) => {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Méthode non autorisée (POST attendu)" });
-  }
+export const config = { api: { bodyParser: { sizeLimit: "1mb" } } };
 
-  // certains hébergeurs donnent req.body en string
-  const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
-  const { prompt, num_outputs = 1, aspect_ratio = "1:1", seed = null } = body;
-
-  if (!prompt || typeof prompt !== "string") {
-    return res.status(400).json({ error: "Le prompt est manquant" });
-  }
+export default async function handler(req, res) {
+  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
-    const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+    const { prompt, num_outputs = 1, aspect_ratio = "1:1", seed = null } = req.body || {};
+    if (!prompt || typeof prompt !== "string") return res.status(400).json({ error: "Missing prompt" });
 
-    const output = await replicate.run("black-forest-labs/flux-schnell", {
-      input: { prompt, num_outputs, aspect_ratio, seed: seed ?? undefined }
+    const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+    const model = "black-forest-labs/flux-1.1-pro"; // change si tu utilises un autre modèle
+
+    const output = await replicate.run(model, {
+      input: { prompt, num_outputs, aspect_ratio, seed }
     });
 
-    const images = Array.isArray(output) ? output : [output];
-    const imageUrl = images[0];
-
-    if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
-      const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-      await supabase.from("images").insert([{ prompt, image_url: imageUrl }]);
-    }
-
-    return res.status(200).json({ success: true, imageUrl, images });
-  } catch (err) {
-    console.error("Replicate error:", err);
-    return res.status(500).json({ error: "Erreur lors de la génération." });
+    res.status(200).json({ output });
+  } catch (e) {
+    console.error("Replicate error:", e);
+    res.status(500).json({ error: e?.message || "Server error while generating image" });
   }
-};
+}
