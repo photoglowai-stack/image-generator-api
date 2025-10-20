@@ -1,5 +1,11 @@
 {
   "functions": {
-    "api/*.js": { "runtime": "nodejs18.x", "maxDuration": 60 }
-  }
+    "api/*.js": {
+      "runtime": "nodejs18.x",
+      "maxDuration": 60
+    }
+  },
+  "builds": [
+    { "src": "api/*.js", "use": "@vercel/node" }
+  ]
 }
