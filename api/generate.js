@@ -1,19 +1,72 @@
+// /api/generate.js
 const Replicate = require("replicate");
 
 module.exports = async (req, res) => {
+  // CORS
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "content-type, authorization");
+  if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
-    const { prompt, num_outputs = 1, aspect_ratio = "1:1", seed = null } = req.body || {};
-    if (!prompt || typeof prompt !== "string") return res.status(400).json({ error: "Missing prompt" });
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const {
+      // commun
+      prompt,
+      num_outputs = 1,
+      aspect_ratio,           // ex: "1:1", "4:5", "16:9" ou "match_input_image" pour Kontext
+      seed = null,
+
+      // image -> image (Kontext)
+      input_image,            // URL https publique
+      output_format = "jpg",  // "jpg" | "png"
+      safety_tolerance = 2    // 0 à 6 (Kontext)
+    } = body;
+
+    if (!prompt || typeof prompt !== "string") {
+      return res.status(400).json({ error: "Missing prompt" });
+    }
 
     const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-    const model = "black-forest-labs/flux-1.1-pro";
 
-    const output = await replicate.run(model, { input: { prompt, num_outputs, aspect_ratio, seed } });
-    res.status(200).json({ output });
+    // Choix du modèle selon présence d'une image d'entrée
+    const isEdit = !!input_image;
+    const model = isEdit
+      ? "black-forest-labs/flux-kontext-pro"  // image -> image
+      : "black-forest-labs/flux-1.1-pro";     // texte -> image
+
+    // Construction des inputs selon le modèle
+    const input = isEdit
+      ? {
+          prompt,
+          input_image,                 // URL HTTPS publique
+          aspect_ratio: aspect_ratio || "match_input_image",
+          output_format,
+          safety_tolerance
+        }
+      : {
+          prompt,
+          num_outputs,
+          aspect_ratio: aspect_ratio || "1:1",
+          seed
+        };
+
+    // Appel Replicate
+    const outputs = await replicate.run(model, { input });
+
+    // Le SDK retourne des FileOutput → on récupère des URLs
+    const urls = await Promise.all(
+      (Array.isArray(outputs) ? outputs : [outputs]).map(async (o) => {
+        if (o && typeof o.url === "function") return o.url();
+        if (typeof o === "string") return o; // au cas où tu optes pour URL direct
+        return null;
+      })
+    );
+
+    return res.status(200).json({ model, urls: urls.filter(Boolean) });
   } catch (e) {
     console.error("Replicate error:", e);
-    res.status(500).json({ error: e?.message || "Server error" });
+    return res.status(500).json({ error: e?.message || "Server error" });
   }
 };
