@@ -9,6 +9,7 @@
   "dependencies": {
     "replicate": "^0.31.0",
     "@supabase/supabase-js": "^2.44.2",
-    "formidable": "^3.5.0"
+    "formidable": "^3.5.0",
+    "fs-extra": "^11.2.0"
   }
 }
