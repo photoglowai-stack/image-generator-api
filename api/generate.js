@@ -2,7 +2,6 @@
 const Replicate = require("replicate");
 
 module.exports = async (req, res) => {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "content-type, authorization");
@@ -12,16 +11,13 @@ module.exports = async (req, res) => {
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
     const {
-      // commun
       prompt,
       num_outputs = 1,
-      aspect_ratio,           // ex: "1:1", "4:5", "16:9" ou "match_input_image" pour Kontext
-      seed = null,
-
-      // image -> image (Kontext)
-      input_image,            // URL https publique
-      output_format = "jpg",  // "jpg" | "png"
-      safety_tolerance = 2    // 0 à 6 (Kontext)
+      aspect_ratio,
+      seed, // on ne met plus de valeur par défaut ici
+      input_image,
+      output_format = "jpg",
+      safety_tolerance = 2
     } = body;
 
     if (!prompt || typeof prompt !== "string") {
@@ -29,18 +25,16 @@ module.exports = async (req, res) => {
     }
 
     const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-
-    // Choix du modèle selon présence d'une image d'entrée
     const isEdit = !!input_image;
     const model = isEdit
-      ? "black-forest-labs/flux-kontext-pro"  // image -> image
-      : "black-forest-labs/flux-1.1-pro";     // texte -> image
+      ? "black-forest-labs/flux-kontext-pro"
+      : "black-forest-labs/flux-1.1-pro";
 
-    // Construction des inputs selon le modèle
+    // On construit l’objet d’entrée sans inclure seed si il n’existe pas
     const input = isEdit
       ? {
           prompt,
-          input_image,                 // URL HTTPS publique
+          input_image,
           aspect_ratio: aspect_ratio || "match_input_image",
           output_format,
           safety_tolerance
@@ -49,17 +43,15 @@ module.exports = async (req, res) => {
           prompt,
           num_outputs,
           aspect_ratio: aspect_ratio || "1:1",
-          seed
+          ...(seed ? { seed } : {}) // <= ici la magie
         };
 
-    // Appel Replicate
     const outputs = await replicate.run(model, { input });
 
-    // Le SDK retourne des FileOutput → on récupère des URLs
     const urls = await Promise.all(
       (Array.isArray(outputs) ? outputs : [outputs]).map(async (o) => {
         if (o && typeof o.url === "function") return o.url();
-        if (typeof o === "string") return o; // au cas où tu optes pour URL direct
+        if (typeof o === "string") return o;
         return null;
       })
     );
