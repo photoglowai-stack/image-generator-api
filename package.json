@@ -7,7 +7,8 @@
     "start": "node api/ping.js"
   },
   "dependencies": {
-    "replicate": "^0.29.4",
-    "@supabase/supabase-js": "^2.43.2"
+    "replicate": "^0.31.0",
+    "@supabase/supabase-js": "^2.44.2",
+    "formidable": "^3.5.0"
   }
 }
