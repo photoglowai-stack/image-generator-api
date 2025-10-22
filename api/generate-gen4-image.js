@@ -1,117 +1,109 @@
+// /api/generate-gen4-image.js
+// text2img Runway Gen4 Image → rehost Supabase + insert photos_meta
 import Replicate from "replicate";
 import { createClient } from "@supabase/supabase-js";
-import { randomUUID } from "crypto";
+import { randomUUID } from "node:crypto";
 
-const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
 
-// 👉 Choisis ici le bucket de SORTIE (tu as "generated_images" dans Supabase)
-const OUTPUT_BUCKET = "generated_images"; // <— change depuis "photos"
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false } });
+const replicate = new Replicate({ auth: REPLICATE_TOKEN });
+
+// tiny 1x1 JPEG for test_mode
+const B64_JPEG_1x1 =
+  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxAQEA8QDw8PDw8PDw8PDw8PDw8PDw8PFREWFhUR" +
+  "GyggGBolGxUVITEhJSkrLi4uFx8zODMtNygtLisBCgoKDg0OGxAQGi0lHyUtLS0tLS0tLS0tLS0t" +
+  "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLf/AABEIAAEAAQMBIgACEQEDEQH/xAAX" +
+  "AAADAQAAAAAAAAAAAAAAAAABAgME/8QAFxABAQEBAAAAAAAAAAAAAAAAAQIDAP/aAAwDAQACEQMR" +
+  "AD8A4kYAAAAA//Z";
+
+function todayISODate() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`;
+}
+async function fetchAsBuffer(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`download_failed_${r.status}`);
+  return Buffer.from(await r.arrayBuffer());
+}
+async function uploadToSupabasePublic(buffer, path) {
+  const { error } = await supabase
+    .storage.from("generated_images")
+    .upload(path, buffer, { contentType: "image/jpeg", cacheControl: "31536000", upsert: false });
+  if (error) throw error;
+  const { data } = supabase.storage.from("generated_images").getPublicUrl(path);
+  return data.publicUrl;
+}
+async function insertMeta(row) {
+  const { error } = await supabase.from("photos_meta").insert(row);
+  if (error) console.warn("⚠️ insert photos_meta failed:", error.message);
+}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") {
-      return res.status(200).json({ ok: true, endpoint: "gen4-image" });
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+    const { prompt, aspect_ratio = "16:9", num_outputs = 1, source = "api-gen4", test_mode = false, category = "ai-headshots" } = req.body || {};
+    if (!prompt && !test_mode) return res.status(400).json({ success: false, error: "Missing prompt" });
+
+    const dateSlug = todayISODate();
+    const batch_id = randomUUID();
+    const receivedAt = new Date().toISOString();
+    const items = [];
+    const started = Date.now();
+
+    // TEST MODE → bypass Replicate, juste pour valider pipeline
+    if (test_mode) {
+      for (let i = 0; i < Math.min(Math.max(parseInt(num_outputs,10)||1,1),4); i++) {
+        const fileId = randomUUID();
+        const buf = Buffer.from(B64_JPEG_1x1, "base64");
+        const path = `categories/${category}/outputs/${dateSlug}/${fileId}.jpg`;
+        const publicUrl = await uploadToSupabasePublic(buf, path);
+        await insertMeta({
+          created_at: receivedAt, prompt, category, source,
+          image_url: publicUrl, mode: "gen4-test", batch_id,
+          input_url: null, output_path: path, model: "runwayml/gen4-image", duration_ms: 1
+        });
+        items.push({ prompt, image_url: publicUrl, replicate_url: null, prediction_id: "test-mode", duration_ms: 1 });
+      }
+      return res.status(200).json({ success: true, mode: "gen4-test", category, batch_id, count: items.length, duration_ms: Date.now()-started, items });
     }
 
-    const t0 = Date.now();
-    const {
-      prompt,
-      reference_images = [],         // 0..3 URLs publiques
-      aspect_ratio = "16:9",
-      resolution = "1080p",          // "720p" | "1080p"
-      seed,
-      category = "gen4-image",
-      source = "photoglow-gen4",
-      user_id                         // optionnel: pour décrémenter les crédits
-    } = req.body ?? {};
+    // PROD: Runway Gen4 Image via Replicate
+    const input = { prompt, aspect_ratio, num_outputs: Math.min(Math.max(parseInt(num_outputs,10)||1,1),4) };
+    console.log("🧪 [gen4] Calling Replicate:", { model: "runwayml/gen4-image", input });
 
-    if (!prompt || typeof prompt !== "string") {
-      return res.status(422).json({ error: "prompt (string) requis" });
+    let pred = await replicate.predictions.create({ model: "runwayml/gen4-image", input });
+    while (["queued","starting","processing"].includes(pred.status)) {
+      await sleep(1000);
+      pred = await replicate.predictions.get(pred.id);
     }
-    if (!Array.isArray(reference_images)) {
-      return res.status(422).json({ error: "reference_images doit être un tableau de strings (URLs)" });
-    }
-    if (reference_images.length > 3) {
-      return res.status(422).json({ error: "reference_images: maximum 3" });
-    }
-    if (!["720p","1080p"].includes(resolution)) {
-      return res.status(422).json({ error: "resolution doit être '720p' ou '1080p'" });
+    if (pred.status !== "succeeded") {
+      console.error("❌ Gen4 failed:", pred);
+      return res.status(502).json({ success:false, error:`replicate_failed_${pred.status}` });
     }
 
-    console.log("🧾 /api/generate-gen4-image received:", {
-      prompt,
-      refs: reference_images.length,
-      aspect_ratio,
-      resolution,
-      seed,
-      user_id
-    });
-
-    const input = {
-      prompt,
-      reference_images,
-      aspect_ratio,
-      resolution,
-      ...(seed != null ? { seed: Number(seed) } : {})
-    };
-
-    console.log("🧪 Calling Replicate:", { model: "runwayml/gen4-image", input });
-
-    const output = await replicate.run("runwayml/gen4-image", { input });
-    const replicateUrl = typeof output === "string" ? output : Array.isArray(output) ? output[0] : null;
-    if (!replicateUrl) {
-      return res.status(500).json({ error: "Aucune URL image retournée par Replicate" });
-    }
-
-    // Download output → upload Supabase
-    const resp = await fetch(replicateUrl);
-    if (!resp.ok) return res.status(502).json({ error: `Download failed: ${resp.status}` });
-    const buf = Buffer.from(await resp.arrayBuffer());
-
-    const today = new Date().toISOString().slice(0,10);
-    const fileName = `outputs/${today}/${randomUUID()}.jpg`;
-
-    // ✅ UPLOAD dans le bucket de sortie choisi
-    const { error: upErr } = await supabase.storage
-      .from(OUTPUT_BUCKET)
-      .upload(fileName, buf, { contentType: "image/jpeg", cacheControl: "31536000" });
-    if (upErr) {
-      console.error("Supabase upload error:", upErr);
-      return res.status(500).json({ error: "Supabase upload failed" });
-    }
-
-    // ✅ URL publique depuis le même bucket
-    const { data: pub } = supabase.storage.from(OUTPUT_BUCKET).getPublicUrl(fileName);
-    const image_url = pub?.publicUrl;
-
-    const duration_ms = Date.now() - t0;
-
-    // meta
-    try {
-      await supabase.from("photos_meta").insert({
-        image_url, prompt, category, source, mode: "text2img-gen4", duration_ms
+    const outs = Array.isArray(pred.output) ? pred.output : [pred.output];
+    for (const u of outs) {
+      if (typeof u !== "string") continue;
+      const fileId = randomUUID();
+      const buf = await fetchAsBuffer(u);
+      const path = `categories/${category}/outputs/${dateSlug}/${fileId}.jpg`;
+      const publicUrl = await uploadToSupabasePublic(buf, path);
+      await insertMeta({
+        created_at: receivedAt, prompt, category, source,
+        image_url: publicUrl, mode: "gen4", batch_id,
+        input_url: null, output_path: path, model: "runwayml/gen4-image", duration_ms: pred.metrics?.predict_time ? Math.round(pred.metrics.predict_time*1000) : null
       });
-      console.log("Insert photos_meta OK");
-    } catch (e) {
-      console.warn("Insert photos_meta WARN:", e?.message || e);
+      items.push({ prompt, image_url: publicUrl, replicate_url: u, prediction_id: pred.id, duration_ms: pred.metrics?.predict_time ? Math.round(pred.metrics.predict_time*1000) : null });
     }
 
-    // décrément crédits (optionnel)
-    if (user_id) {
-      // await supabase.rpc("decrement_credits", { uid: user_id });
-    }
-
-    return res.status(200).json({
-      success: true,
-      mode: "text2img-gen4",
-      model: "runwayml/gen4-image",
-      image_url,
-      replicate_url: replicateUrl,
-      duration_ms
-    });
+    return res.status(200).json({ success:true, mode:"gen4", category, batch_id, count: items.length, duration_ms: Date.now()-started, items });
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "Unhandled error", detail: e?.message || String(e) });
+    console.error("❌ /api/generate-gen4-image error:", e?.message || e);
+    return res.status(500).json({ success:false, error: e?.message || "internal_error" });
   }
 }
