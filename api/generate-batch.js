@@ -1,6 +1,7 @@
 // /api/generate-batch.js
-// Unifié multi-prompts + img2img/text2img, reupload Supabase, insert photos_meta
-
+// Batch prompts + num_outputs en UNE prédiction par prompt
+// Reupload Supabase + insertion photos_meta
+// test_mode: bypass Replicate (placeholder JPEG) pour valider la pipeline sans crédit
 import Replicate from "replicate";
 import { createClient } from "@supabase/supabase-js";
 import { randomUUID } from "node:crypto";
@@ -43,7 +44,15 @@ function ensureArrayPrompts(body) {
   return [];
 }
 
-/** Télécharge une URL (replicate.delivery) → Buffer */
+/** Placeholder 1x1 JPEG (b64) pour test_mode */
+const B64_JPEG_1x1 =
+  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxAQEA8QDw8PDw8PDw8PDw8PDw8PDw8PFREWFhUR"
++ "GyggGBolGxUVITEhJSkrLi4uFx8zODMtNygtLisBCgoKDg0OGxAQGi0lHyUtLS0tLS0tLS0tLS0t"
++ "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLf/AABEIAAEAAQMBIgACEQEDEQH/xAAX"
++ "AAADAQAAAAAAAAAAAAAAAAABAgME/8QAFxABAQEBAAAAAAAAAAAAAAAAAQIDAP/aAAwDAQACEQMR"
++ "AD8A4kYAAAAA//Z";
+
+/** Télécharge une URL → Buffer */
 async function fetchAsBuffer(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`download_failed_${r.status}`);
@@ -61,39 +70,57 @@ async function uploadToSupabasePublic(buffer, path) {
       upsert: false
     });
   if (upErr) throw upErr;
-
   const { data } = supabase.storage.from("generated_images").getPublicUrl(path);
   return data.publicUrl;
 }
 
-/** Insert meta row */
+/** Insert meta row (best-effort) */
 async function insertMeta(row) {
-  // RLS: en proto, policy d'insert publique doit être active
   const { error } = await supabase.from("photos_meta").insert(row);
-  if (error) {
-    console.warn("⚠️ insert photos_meta failed:", error.message);
-  }
+  if (error) console.warn("⚠️ insert photos_meta failed:", error.message);
 }
 
-/** Appel Replicate (retourne 1 URL d'image) */
-async function callReplicateOnce({ mode, model, prompt, input_image, aspect_ratio }) {
+/** Attente utilitaire */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/** Appel Replicate (ARRAY d'URLs) avec retry 429, stop clair sur 402 */
+async function callReplicateOnce({ mode, model, prompt, input_image, aspect_ratio, num_outputs }) {
   const t0 = Date.now();
   const input = mode === "img2img"
-    ? { prompt, image: input_image } // flux-kontext-pro (img2img)
-    : { prompt, aspect_ratio };      // flux-1.1-pro (text2img)
+    ? { prompt, image: input_image, num_outputs }
+    : { prompt, aspect_ratio, num_outputs };
 
-  console.log("🧪 [batch] Calling Replicate:", { model, input });
+  console.log("🧪 [batch] Calling Replicate:", { model, input: { ...input, image: input.image ? "<redacted>" : undefined } });
 
-  // On utilise predictions.create pour rester compatible
-  const prediction = await replicate.predictions.create({
-    model,
-    input
-  });
+  let attempt = 0;
+  let pred;
+  while (true) {
+    try {
+      pred = await replicate.predictions.create({ model, input });
+      break;
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (msg.includes("Payment Required") || msg.includes("Insufficient credit")) {
+        // on remonte explicitement pour couper court
+        const err = new Error("payment_required");
+        err.code = 402;
+        throw err;
+      }
+      if (msg.includes("Too Many Requests") && attempt < 1) {
+        attempt++;
+        const retryAfter = /retry_after\":\s*(\d+)/.exec(msg)?.[1];
+        const wait = (parseInt(retryAfter || "10", 10) + 2) * 1000;
+        console.warn(`⚠️ 429 from Replicate, retrying in ~${wait}ms...`);
+        await sleep(wait);
+        continue;
+      }
+      throw e;
+    }
+  }
 
-  // Poll simple jusqu’au statut terminal
-  let pred = prediction;
+  // Polling
   while (pred.status === "starting" || pred.status === "processing" || pred.status === "queued") {
-    await new Promise(r => setTimeout(r, 1000));
+    await sleep(1000);
     pred = await replicate.predictions.get(pred.id);
   }
 
@@ -102,16 +129,12 @@ async function callReplicateOnce({ mode, model, prompt, input_image, aspect_rati
     throw new Error(`replicate_failed_${pred.status}`);
   }
 
-  // pred.output peut être string ou array; on normalise
-  const out = Array.isArray(pred.output) ? pred.output : [pred.output];
-  const firstUrl = out.find(u => typeof u === "string") || null;
+  const outs = Array.isArray(pred.output) ? pred.output : [pred.output];
+  const urls = outs.filter(u => typeof u === "string");
   const duration_ms = Date.now() - t0;
 
-  if (!firstUrl) {
-    throw new Error("no_output_url");
-  }
-
-  return { replicate_url: firstUrl, duration_ms, prediction_id: pred.id };
+  if (!urls.length) throw new Error("no_output_url");
+  return { replicate_urls: urls, duration_ms, prediction_id: pred.id };
 }
 
 /** ---------- Handler ---------- */
@@ -125,7 +148,6 @@ export default async function handler(req, res) {
     const body = req.body || {};
     console.log("🧾 /api/generate-batch received:", body);
 
-    // Inputs
     const prompts = ensureArrayPrompts(body);
     if (prompts.length === 0) {
       return res.status(400).json({ success: false, error: "Missing prompt(s)" });
@@ -138,79 +160,117 @@ export default async function handler(req, res) {
 
     // Mode + AR
     const mode = input_image ? "img2img" : "text2img";
-
     let aspect_ratio = body.aspect_ratio;
-    if (mode === "img2img") {
-      aspect_ratio = "match_input_image"; // forcé
-    } else {
-      if (!ALLOWED_AR.has(aspect_ratio)) {
-        // défaut raisonnable
-        aspect_ratio = "1:1";
-      }
-    }
+    if (mode === "img2img") aspect_ratio = "match_input_image";
+    else if (!ALLOWED_AR.has(aspect_ratio)) aspect_ratio = "1:1";
 
     // Modèle
-    const model = body.model
-      || (mode === "img2img" ? DEFAULT_IMG2IMG_MODEL : DEFAULT_TEXT2IMG_MODEL);
-
-    // num_outputs (cap 4) : on duplique les prompts si demandé
-    let requested = Math.min(Math.max(parseInt(body.num_outputs || 1, 10), 1), 4);
-    const worklist = [];
-    for (const p of prompts) {
-      for (let i = 0; i < requested; i++) worklist.push(p);
-    }
+    const model = body.model || (mode === "img2img" ? DEFAULT_IMG2IMG_MODEL : DEFAULT_TEXT2IMG_MODEL);
+    // num_outputs par prompt (1..4)
+    const num_outputs = Math.min(Math.max(parseInt(body.num_outputs || 1, 10), 1), 4);
 
     const dateSlug = todayISODate();
     const items = [];
     const started = Date.now();
 
-    // Exécution en série (plus simple à débug; on parallélisera plus tard si besoin)
-    for (const p of worklist) {
+    // ----- TEST MODE: bypass Replicate -----
+    if (body.test_mode === true) {
+      for (const p of prompts) {
+        for (let i = 0; i < num_outputs; i++) {
+          const buf = Buffer.from(B64_JPEG_1x1, "base64");
+          const fileId = randomUUID();
+          const path = `categories/${category_slug}/outputs/${dateSlug}/${fileId}.jpg`;
+          const publicUrl = await uploadToSupabasePublic(buf, path);
+
+          await insertMeta({
+            created_at: receivedAt,
+            prompt: p,
+            category: category_slug,
+            source,
+            image_url: publicUrl,
+            mode: `${mode}-test`,
+            batch_id,
+            input_url: input_image,
+            output_path: path,
+            model: "test-placeholder",
+            duration_ms: 1
+          });
+
+          items.push({
+            prompt: p,
+            image_url: publicUrl,
+            replicate_url: null,
+            prediction_id: "test-mode",
+            duration_ms: 1
+          });
+        }
+      }
+
+      const total_ms = Date.now() - started;
+      return res.status(200).json({
+        success: true,
+        mode: `${mode}-test`,
+        category: category_slug,
+        batch_id,
+        count: items.length,
+        duration_ms: total_ms,
+        items
+      });
+    }
+    // ----- FIN TEST MODE -----
+
+    // Production: un appel Replicate PAR prompt, avec num_outputs
+    for (const p of prompts) {
       try {
-        const { replicate_url, duration_ms, prediction_id } = await callReplicateOnce({
-          mode, model, prompt: p, input_image, aspect_ratio
+        const { replicate_urls, duration_ms, prediction_id } = await callReplicateOnce({
+          mode, model, prompt: p, input_image, aspect_ratio, num_outputs
         });
 
-        // Download → Supabase
-        const buf = await fetchAsBuffer(replicate_url);
-        const fileId = randomUUID();
-        const path = `categories/${category_slug}/outputs/${dateSlug}/${fileId}.jpg`;
+        for (const rUrl of replicate_urls) {
+          const buf = await fetchAsBuffer(rUrl);
+          const fileId = randomUUID();
+          const path = `categories/${category_slug}/outputs/${dateSlug}/${fileId}.jpg`;
+          const publicUrl = await uploadToSupabasePublic(buf, path);
 
-        const publicUrl = await uploadToSupabasePublic(buf, path);
+          await insertMeta({
+            created_at: receivedAt,
+            prompt: p,
+            category: category_slug,
+            source,
+            image_url: publicUrl,
+            mode,
+            batch_id,
+            input_url: input_image,
+            output_path: path,
+            model,
+            duration_ms
+          });
 
-        // Meta row
-        await insertMeta({
-          created_at: receivedAt,
-          prompt: p,
-          category: category_slug,
-          source,
-          image_url: publicUrl,
-          mode,
-          batch_id,
-          input_url: input_image,
-          output_path: path,
-          model,
-          duration_ms
-        });
-
-        items.push({
-          prompt: p,
-          image_url: publicUrl,
-          replicate_url,
-          prediction_id,
-          duration_ms
-        });
+          items.push({
+            prompt: p,
+            image_url: publicUrl,
+            replicate_url: rUrl,
+            prediction_id,
+            duration_ms
+          });
+        }
       } catch (e) {
+        // Si 402, on remonte l’info proprement et on arrête (inutile de continuer)
+        if (e?.code === 402 || String(e?.message).includes("payment_required")) {
+          console.warn("⚠️ payment_required: stop batch early");
+          return res.status(402).json({
+            success: false,
+            error: "payment_required",
+            message: "Replicate credits required. Add a payment method and credit, then retry.",
+            mode, category: category_slug, batch_id, items
+          });
+        }
         console.error("❌ item_failed:", e?.message || e);
-        items.push({
-          prompt: p,
-          error: String(e?.message || e)
-        });
+        items.push({ prompt: p, error: String(e?.message || e) });
       }
     }
 
     const total_ms = Date.now() - started;
-
     return res.status(200).json({
       success: true,
       mode,
