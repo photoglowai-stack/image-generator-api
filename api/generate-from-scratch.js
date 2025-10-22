@@ -1,93 +1,36 @@
 // /api/generate-from-scratch.js
-const Replicate = require("replicate");
-const { createClient } = require("@supabase/supabase-js");
-
-const ALLOWED_AR = new Set([
-  "1:1","16:9","9:16","4:3","3:4","3:2","2:3","4:5","5:4","21:9","9:21","2:1","1:2"
-]);
-const toNumberOrNull = (v) => (typeof v === "number" ? v : (typeof v === "string" && v.trim() && !Number.isNaN(+v) ? +v : null));
-
-module.exports = async (req, res) => {
-  // CORS + healthcheck
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "content-type, authorization");
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method === "GET") return res.status(200).json({ ok: true, endpoint: "text2img" });
-  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
-
+// Transition: compat historique → délègue à /api/generate (text2img)
+export default async function handler(req, res) {
   try {
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
-    const norm = (x) => (typeof x === "string" ? x.trim() : x);
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    const prompt       = norm(body.prompt);
-    let   aspect_ratio = norm(body.aspect_ratio) || "1:1";          // pour text2img
-    const category     = norm(body.category) || "default";
-    const source       = norm(body.source) || "replicate-text2img";
-    const num_outputs  = toNumberOrNull(body.num_outputs) || 1;
-    const seed         = toNumberOrNull(body.seed);
-
-    if (!prompt || typeof prompt !== "string") {
-      return res.status(400).json({ error: "Missing or invalid 'prompt' (string)" });
-    }
-    if (!ALLOWED_AR.has(aspect_ratio)) aspect_ratio = "1:1";        // sanitize
-
-    // Choix du modèle text2img (configurable)
-    const model = process.env.TEXT2IMG_MODEL || "black-forest-labs/flux-1.1-pro";
-    const input = {
-      prompt,
-      aspect_ratio,
-      num_outputs,
-      ...(seed != null ? { seed } : {}),
-      output_format: "jpg",
-      safety_tolerance: 2,
+    const body = req.body || {};
+    // On force le mode text2img (ancien endpoint faisait du text2img)
+    const payload = {
+      prompt: body.prompt,
+      category: body.category || "ai-headshots",
+      aspect_ratio: body.aspect_ratio || "1:1",
+      num_outputs: Math.min(Math.max(parseInt(body.num_outputs || 1, 10), 1), 4),
+      negative_prompt: body.negative_prompt,
+      seed: body.seed,
+      source: body.source || "compat-generate-from-scratch",
+      test_mode: body.test_mode === true
     };
 
-    console.log("🧪 [t2i] Calling Replicate:", { model, input });
-    const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-    const outputs = await replicate.run(model, { input });
-    const arr = Array.isArray(outputs) ? outputs : [outputs];
-    const replicateUrl = arr[0];
-    if (!replicateUrl) return res.status(500).json({ error: "No output from Replicate" });
+    const proto = req.headers["x-forwarded-proto"] || "https";
+    const host  = req.headers["x-forwarded-host"] || req.headers.host;
+    const url   = `${proto}://${host}/api/generate`;
 
-    // Download -> upload to Supabase
-    const r = await fetch(replicateUrl);
-    if (!r.ok) throw new Error("Download failed: " + r.status);
-    const buffer = Buffer.from(await r.arrayBuffer());
-
-    const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-    const filename = `outputs/${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`;
-    const { error: upErr } = await supabase.storage.from("photos").upload(filename, buffer, {
-      contentType: "image/jpeg",
-      upsert: true,
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
     });
-    if (upErr) {
-      console.error("❌ Supabase upload error:", upErr);
-      return res.status(500).json({ error: "Supabase upload failed" });
-    }
 
-    const { data: pub } = supabase.storage.from("photos").getPublicUrl(filename);
-    const supaUrl = pub?.publicUrl;
-
-    // Meta
-    const { error: insErr } = await supabase.from("photos_meta").insert({
-      image_url: supaUrl,
-      prompt,
-      seed: seed ?? null,
-      category,
-      source,
-    });
-    if (insErr) console.warn("⚠️ Supabase insert warning:", insErr);
-
-    return res.status(200).json({
-      success: true,
-      mode: "text2img",
-      model,
-      image_url: supaUrl,        // ← URL durable à utiliser
-      replicate_url: replicateUrl
-    });
+    const data = await r.json().catch(() => ({}));
+    return res.status(r.status).json(data);
   } catch (e) {
-    console.error("❌ /api/generate-from-scratch error:", e);
-    return res.status(500).json({ error: e?.message || "Server error" });
+    console.error("❌ /api/generate-from-scratch proxy error:", e?.message || e);
+    return res.status(500).json({ error: "internal_error_proxy" });
   }
-};
+}
