@@ -1,11 +1,8 @@
 // /api/credits.mjs
-// GET  /api/credits?health=1          → healthcheck (aucun accès DB)
-// GET  /api/credits?user_id=...       → lecture crédits
-// POST /api/credits { user_id, op, amount } → debit|credit|reset
 import { createClient } from "@supabase/supabase-js";
 
 function setCORS(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*"); // durcis plus tard
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
@@ -18,13 +15,17 @@ if (SUPABASE_URL && SERVICE_ROLE) {
   supabase = createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } });
 }
 
+const isUUID = (s) =>
+  typeof s === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
+
 export default async function handler(req, res) {
   setCORS(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   res.setHeader("Content-Type", "application/json; charset=utf-8");
 
   try {
-    // 0) HEALTHCHECK SANS DB (doit répondre 200 si la route est bien chargée)
+    // Healthcheck
     if (req.method === "GET" && (req.query?.health === "1")) {
       return res.status(200).json({
         ok: true,
@@ -33,7 +34,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // 1) GARDE-FOUS ENV EXPLICITES (évite le crash silencieux)
     if (!SUPABASE_URL || !SERVICE_ROLE) {
       return res.status(500).json({
         success: false,
@@ -48,23 +48,21 @@ export default async function handler(req, res) {
     const { user_id } = req.method === "GET" ? req.query : (req.body || {});
     if (!user_id) return res.status(400).json({ error: "user_id required" });
 
+    // 👉 Empêche l'erreur 22P02 côté Postgres
+    if (!isUUID(user_id)) {
+      return res.status(400).json({ success: false, error: "user_id must be a UUID" });
+    }
+
     if (req.method === "GET") {
       const { data, error } = await supabase
         .from("user_credits")
         .select("credits")
         .eq("user_id", user_id)
         .single();
-
-      // PGRST116 = no rows → renvoyer 0 plutôt que crasher
       if (error && error.code !== "PGRST116") {
         return res.status(500).json({ success: false, error: error.message, code: error.code });
       }
-
-      return res.status(200).json({
-        success: true,
-        user_id,
-        credits: data?.credits ?? 0
-      });
+      return res.status(200).json({ success: true, user_id, credits: data?.credits ?? 0 });
     }
 
     if (req.method === "POST") {
@@ -111,7 +109,6 @@ export default async function handler(req, res) {
 
     return res.status(405).json({ error: "Method not allowed" });
   } catch (e) {
-    // Ne jamais laisser tomber → toujours renvoyer du JSON
     return res.status(500).json({ success: false, error: e?.message || "internal_error" });
   }
 }
