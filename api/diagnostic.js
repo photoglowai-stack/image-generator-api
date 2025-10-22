@@ -1,20 +1,15 @@
 // /api/diagnostic.js
-// Diagnostic JSON (toujours) : DB read, Storage write test, existence bucket "photos"
 import { createClient } from "@supabase/supabase-js";
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false } });
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, { auth: { persistSession: false } });
 
 export default async function handler(req, res) {
   try {
-    // force JSON
     res.setHeader("Content-Type", "application/json; charset=utf-8");
 
     const checks = [];
 
-    // 1) DB read test (photos_meta)
+    // DB test
     try {
       const { error } = await supabase.from("photos_meta").select("id").limit(1);
       checks.push({ key: "db_photos_meta_read", ok: !error, error: error?.message || null });
@@ -22,7 +17,7 @@ export default async function handler(req, res) {
       checks.push({ key: "db_photos_meta_read", ok: false, error: String(e?.message || e) });
     }
 
-    // 2) Storage write test (generated_images)
+    // Storage test
     try {
       const key = `diagnostics/${Date.now()}.txt`;
       const blob = new Blob([`ok:${new Date().toISOString()}`], { type: "text/plain" });
@@ -34,7 +29,7 @@ export default async function handler(req, res) {
       checks.push({ key: "storage_generated_images_write", ok: false, error: String(e?.message || e) });
     }
 
-    // 3) Bucket photos existence (sans lister — juste construire une URL)
+    // Photos bucket test
     try {
       const { data } = supabase.storage.from("photos").getPublicUrl("health/ghost.txt");
       if (!data?.publicUrl) throw new Error("no_public_url");
@@ -46,7 +41,6 @@ export default async function handler(req, res) {
     const ok = checks.every(c => c.ok);
     return res.status(ok ? 200 : 500).json({ ok, checks });
   } catch (e) {
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
