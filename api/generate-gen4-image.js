@@ -5,6 +5,9 @@ import { randomUUID } from "crypto";
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
+// 👉 Choisis ici le bucket de SORTIE (tu as "generated_images" dans Supabase)
+const OUTPUT_BUCKET = "generated_images"; // <— change depuis "photos"
+
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") {
@@ -68,15 +71,18 @@ export default async function handler(req, res) {
 
     const today = new Date().toISOString().slice(0,10);
     const fileName = `outputs/${today}/${randomUUID()}.jpg`;
+
+    // ✅ UPLOAD dans le bucket de sortie choisi
     const { error: upErr } = await supabase.storage
-      .from("photos")
+      .from(OUTPUT_BUCKET)
       .upload(fileName, buf, { contentType: "image/jpeg", cacheControl: "31536000" });
     if (upErr) {
       console.error("Supabase upload error:", upErr);
       return res.status(500).json({ error: "Supabase upload failed" });
     }
 
-    const { data: pub } = supabase.storage.from("photos").getPublicUrl(fileName);
+    // ✅ URL publique depuis le même bucket
+    const { data: pub } = supabase.storage.from(OUTPUT_BUCKET).getPublicUrl(fileName);
     const image_url = pub?.publicUrl;
 
     const duration_ms = Date.now() - t0;
@@ -93,10 +99,7 @@ export default async function handler(req, res) {
 
     // décrément crédits (optionnel)
     if (user_id) {
-      // si tu crées un RPC decrement_credits(uid uuid), décommente:
       // await supabase.rpc("decrement_credits", { uid: user_id });
-      // sinon: appel REST simple:
-      // await fetch(`${process.env.VERCEL_URL ?? ""}/api/update-credits`, {method:"POST", headers:{ "Content-Type":"application/json"}, body: JSON.stringify({ user_id, delta: -1 })});
     }
 
     return res.status(200).json({
