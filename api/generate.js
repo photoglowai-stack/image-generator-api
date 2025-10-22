@@ -1,34 +1,26 @@
-// /api/generate.js
-// Wrapper simple : normalise la payload et forward en POST vers /api/generate-batch
-// (corrige l'erreur "batch is not a function")
-
+// /api/generate-from-scratch.js
+// Transition: compat historique → délègue à /api/generate (text2img)
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method not allowed" });
-    }
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
     const body = req.body || {};
-    console.log("🧾 /api/generate received:", body);
-
-    // Normalisation légère
+    // On force le mode text2img (ancien endpoint faisait du text2img)
     const payload = {
-      // on passe au batch tel quel
-      ...body,
-      source: body.source || "wrapper-generate"
+      prompt: body.prompt,
+      category: body.category || "ai-headshots",
+      aspect_ratio: body.aspect_ratio || "1:1",
+      num_outputs: Math.min(Math.max(parseInt(body.num_outputs || 1, 10), 1), 4),
+      negative_prompt: body.negative_prompt,
+      seed: body.seed,
+      source: body.source || "compat-generate-from-scratch",
+      test_mode: body.test_mode === true
     };
 
-    // Si img2img → on force un AR safe côté wrapper aussi (le batch le refera de toute façon)
-    if (payload.input_image && payload.aspect_ratio !== "match_input_image") {
-      payload.aspect_ratio = "match_input_image";
-    }
-
-    // Construit l’URL interne de l’API batch (compatible Vercel preview/prod)
     const proto = req.headers["x-forwarded-proto"] || "https";
     const host  = req.headers["x-forwarded-host"] || req.headers.host;
-    const url   = `${proto}://${host}/api/generate-batch`;
+    const url   = `${proto}://${host}/api/generate`;
 
-    // Proxy POST
     const r = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -36,10 +28,9 @@ export default async function handler(req, res) {
     });
 
     const data = await r.json().catch(() => ({}));
-    // On propage le status HTTP du batch
     return res.status(r.status).json(data);
-  } catch (err) {
-    console.error("❌ /api/generate error:", err?.message || err);
-    return res.status(500).json({ error: "internal_error_generate_wrapper" });
+  } catch (e) {
+    console.error("❌ /api/generate-from-scratch proxy error:", e?.message || e);
+    return res.status(500).json({ error: "internal_error_proxy" });
   }
 }
