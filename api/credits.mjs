@@ -1,11 +1,12 @@
 // /api/credits.mjs
 // GET  /api/credits?health=1        → healthcheck
-// GET  /api/credits                 → lecture crédits (user du token)
+// GET  /api/credits                 → lecture crédits (sans reset !)
 // POST /api/credits {op, amount?}   → debit|credit|reset (user du token)
+
 import { createClient } from "@supabase/supabase-js";
 
 function setCORS(res) {
-  // Durcis si tu veux: "https://www.figma.com"
+  // Durcis si tu veux: process.env.FRONT_ORIGIN
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -34,46 +35,54 @@ export default async function handler(req, res) {
     return res.status(500).json({ success: false, error: "missing_env" });
   }
 
-  try {
-    // 1) Auth: extraire le user à partir du token
-    const auth = req.headers.authorization || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-    if (!token) return res.status(401).json({ success: false, error: "missing_bearer_token" });
+  // --- Auth: extraire le user depuis le JWT (Bearer)
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ success: false, error: "missing_bearer_token" });
 
-    const { data: userData, error: authErr } = await supabaseAdmin.auth.getUser(token);
-    if (authErr || !userData?.user) {
-      return res.status(401).json({ success: false, error: "invalid_token" });
-    }
-    const user_id = userData.user.id; // UUID
+  const { data: userData, error: authErr } = await supabaseAdmin.auth.getUser(token);
+  if (authErr || !userData?.user) {
+    return res.status(401).json({ success: false, error: "invalid_token" });
+  }
+  const user_id = userData.user.id;
 
-    if (req.method === "GET") {
-      // Upsert silencieux à 0 pour que la 1ère lecture retourne 0
-      await supabaseAdmin
-        .from("user_credits")
-        .upsert({ user_id, credits: 0 }, { onConflict: "user_id" });
+  // --- GET: lire le solde sans le réinitialiser ---
+  if (req.method === "GET") {
+    // lire
+    const { data: row, error: selErr } = await supabaseAdmin
+      .from("user_credits")
+      .select("credits")
+      .eq("user_id", user_id)
+      .maybeSingle();
 
-      const { data, error } = await supabaseAdmin
-        .from("user_credits")
-        .select("credits")
-        .eq("user_id", user_id)
-        .single();
-      if (error) return res.status(500).json({ success: false, error: error.message });
-
-      return res.status(200).json({ success: true, user_id, credits: data.credits });
+    if (selErr) {
+      // .maybeSingle() ne devrait pas planter, mais on sécurise
+      return res.status(500).json({ success: false, error: selErr.message });
     }
 
-    if (req.method === "POST") {
-      const { op = "debit", amount = 1 } = req.body || {};
-      if (!["debit", "credit", "reset"].includes(op)) {
-        return res.status(400).json({ error: "op must be 'debit', 'credit' or 'reset'" });
-      }
+    // si pas de ligne → l'initialiser à 0 une seule fois
+    if (!row) {
+      const { error: insErr } = await supabaseAdmin
+        .from("user_credits")
+        .insert({ user_id, credits: 0 });
+      if (insErr) return res.status(500).json({ success: false, error: insErr.message });
+      return res.status(200).json({ success: true, user_id, credits: 0 });
+    }
 
-      let credits = 0;
+    return res.status(200).json({ success: true, user_id, credits: row.credits });
+  }
 
+  // --- POST: op = credit | debit | reset ---
+  if (req.method === "POST") {
+    const { op = "debit", amount = 1 } = req.body || {};
+    if (!["debit", "credit", "reset"].includes(op)) {
+      return res.status(400).json({ success: false, error: "invalid_op" });
+    }
+
+    try {
       if (op === "debit") {
-        const { data, error } = await supabaseAdmin.rpc("debit_credits", {
-          p_user_id: user_id,
-          p_amount: amount
+        const { error } = await supabaseAdmin.rpc("debit_credits", {
+          p_user_id: user_id, p_amount: amount
         });
         if (error) {
           if (String(error.message).includes("insufficient_credits")) {
@@ -81,27 +90,33 @@ export default async function handler(req, res) {
           }
           return res.status(500).json({ success: false, error: error.message });
         }
-        credits = data;
       } else if (op === "credit") {
-        const { data, error } = await supabaseAdmin.rpc("credit_credits", {
-          p_user_id: user_id,
-          p_amount: amount
+        const { error } = await supabaseAdmin.rpc("credit_credits", {
+          p_user_id: user_id, p_amount: amount
         });
         if (error) return res.status(500).json({ success: false, error: error.message });
-        credits = data;
       } else if (op === "reset") {
         const { error } = await supabaseAdmin
           .from("user_credits")
-          .update({ credits: 0, updated_at: new Date().toISOString() })
-          .eq("user_id", user_id);
+          .upsert({ user_id, credits: 0 }, { onConflict: "user_id" });
         if (error) return res.status(500).json({ success: false, error: error.message });
       }
 
-      return res.status(200).json({ success: true, user_id, credits, op });
-    }
+      // relire le solde après l'op
+      const { data: row2, error: sel2 } = await supabaseAdmin
+        .from("user_credits")
+        .select("credits")
+        .eq("user_id", user_id)
+        .maybeSingle();
+      if (sel2) return res.status(500).json({ success: false, error: sel2.message });
 
-    return res.status(405).json({ error: "Method not allowed" });
-  } catch (e) {
-    return res.status(500).json({ success: false, error: e?.message || "internal_error" });
+      return res.status(200).json({
+        success: true, user_id, credits: row2?.credits ?? 0, op
+      });
+    } catch (e) {
+      return res.status(500).json({ success: false, error: String(e?.message || e) });
+    }
   }
+
+  return res.status(405).json({ success: false, error: "method_not_allowed" });
 }
