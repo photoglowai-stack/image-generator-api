@@ -8,7 +8,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false } });
+const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 const replicate = new Replicate({ auth: REPLICATE_TOKEN });
 
 // tiny 1x1 JPEG for test_mode
