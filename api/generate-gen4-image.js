@@ -76,7 +76,7 @@ export default async function handler(req, res) {
     const input = { prompt, aspect_ratio, num_outputs: Math.min(Math.max(parseInt(num_outputs,10)||1,1),4) };
     console.log("🧪 [gen4] Calling Replicate:", { model: "runwayml/gen4-image", input });
 
-    let pred = await replicate.predictions.create({ model: "runwayml/gen4-image", input });
+    let pred = await replicate.predictions.create({ model: req.body.model || "runwayml/gen4-image", input });
     while (["queued","starting","processing"].includes(pred.status)) {
       await sleep(1000);
       pred = await replicate.predictions.get(pred.id);
