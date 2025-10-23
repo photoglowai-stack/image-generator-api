@@ -84,6 +84,11 @@ export default async function handler(req, res) {
     if (!prompt && !test_mode)
       return res.status(400).json({ success: false, error: "Missing prompt" });
 
+    // ⛔ si pas de token Replicate ET test_mode=false → message clair (évite 500)
+    if (!test_mode && (!REPLICATE_API_TOKEN || REPLICATE_API_TOKEN === "")) {
+      return res.status(500).json({ success: false, error: "replicate_token_missing" });
+    }
+
     const dateSlug = todayISODate();
     const batch_id = randomUUID();
     const receivedAt = new Date().toISOString();
@@ -109,7 +114,8 @@ export default async function handler(req, res) {
           input_url: null,
           output_path: path,
           model: "runwayml/gen4-image",
-          duration_ms: 1,
+          duration_ms: 1
+          // user_id: <optionnel si tu envoies un token côté site>
         });
 
         items.push({
@@ -173,9 +179,8 @@ export default async function handler(req, res) {
         input_url: null,
         output_path: path,
         model: "runwayml/gen4-image",
-        duration_ms: pred.metrics?.predict_time
-          ? Math.round(pred.metrics.predict_time * 1000)
-          : null,
+        duration_ms: pred.metrics?.predict_time ? Math.round(pred.metrics.predict_time * 1000) : null
+        // user_id: <optionnel si tu envoies un token côté site>
       });
 
       items.push({
@@ -183,9 +188,7 @@ export default async function handler(req, res) {
         image_url: publicUrl,
         replicate_url: u,
         prediction_id: pred.id,
-        duration_ms: pred.metrics?.predict_time
-          ? Math.round(pred.metrics.predict_time * 1000)
-          : null,
+        duration_ms: pred.metrics?.predict_time ? Math.round(pred.metrics.predict_time * 1000) : null,
       });
     }
 
