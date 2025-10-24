@@ -1,13 +1,8 @@
-// /api/generate-gen4-image.js
-// Alias: /v1/jobs (mappé dans vercel.json)
-// POST /v1/jobs  { mode, model, prompt?, image_url?, aspect_ratio?, test_mode?, extra? }
-//   - mode: "text2img" | "img2img" (default: text2img)
-//   - model: "gen4" | "flux" | chemin complet Replicate (default: gen4)
-// GET  /v1/jobs  → healthcheck simple
+// /api/generate-gen4-image.js  (CommonJS, compatible Vercel sans "type":"module")
 
-import Replicate from "replicate";
-import { createClient } from "@supabase/supabase-js";
-import { randomUUID } from "crypto";
+const Replicate = require("replicate");
+const { createClient } = require("@supabase/supabase-js");
+const { randomUUID } = require("crypto");
 
 // ---------- CORS ----------
 function setCORS(res) {
@@ -26,7 +21,6 @@ const ANON_KEY      = process.env.SUPABASE_ANON_KEY;
 const BUCKET        = process.env.BUCKET_IMAGES || "photos";
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 
-// Clients Supabase (auth public vs admin)
 const supabaseAuth = (SUPABASE_URL && ANON_KEY)
   ? createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } })
   : null;
@@ -42,8 +36,6 @@ const MODEL_MAP = {
 };
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-// Poll Replicate jusqu'à "succeeded" (timeout ~25s)
 async function waitForPrediction(id, timeoutMs = 25000, intervalMs = 1250) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -56,7 +48,7 @@ async function waitForPrediction(id, timeoutMs = 25000, intervalMs = 1250) {
   return await replicate.predictions.get(id);
 }
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   setCORS(res);
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method === "HEAD")    return res.status(204).end();
@@ -95,7 +87,10 @@ export default async function handler(req, res) {
     const user_id = userData.user.id;
 
     // ---- Payload ----
-    const idem = (req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || null)?.toString() || null;
+    const idemHeader = req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || null;
+    const idem = idemHeader ? String(idemHeader) : null;
+
+    const body = req.body || {};
     const {
       mode = "text2img",
       model = "gen4",
@@ -105,7 +100,7 @@ export default async function handler(req, res) {
       aspect_ratio = "1:1",
       test_mode = false,
       extra = {}
-    } = req.body || {};
+    } = body;
 
     if (!["text2img", "img2img"].includes(mode)) {
       return res.status(422).json({ error: "invalid_mode" });
@@ -178,7 +173,7 @@ export default async function handler(req, res) {
     }
 
     const buffer = Buffer.from(await resp.arrayBuffer());
-    const filename = `gen/${user_id}/${Date.now()}_${randomUUID()}.jpg`; // <- robuste
+    const filename = `gen/${user_id}/${Date.now()}_${randomUUID()}.jpg`;
 
     const { error: upErr } = await supabaseAdmin.storage
       .from(BUCKET)
@@ -208,4 +203,4 @@ export default async function handler(req, res) {
       details: String(e?.message || e)
     });
   }
-}
+};
