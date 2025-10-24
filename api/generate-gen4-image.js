@@ -83,12 +83,15 @@ export default async function handler(req, res) {
     return data?.response || null;
   }
   async function idemWrite(key, route, userId, response) {
-    if (!key || !route) return;
-    // upsert sur (key,route) pour couvrir les repeated calls / concurrency
-    await supabaseAdmin
-      .from("idempotency_keys")
-      .upsert({ key, route, user_id: userId || null, response }, { onConflict: "key,route" });
+  if (!key || !route) return;
+  const { error } = await supabaseAdmin
+    .from("idempotency_keys")
+    .insert({ key, route, user_id: userId || null, response });
+  // 23505 = doublon (déjà écrit par un appel précédent/concurrent) → OK, on ignore
+  if (error && error.code !== "23505") {
+    console.error("IDEM_WRITE_ERR", error.message);
   }
+
 
   // ---------- Auth utilisateur (JWT Supabase) ----------
   async function getAuthUser() {
