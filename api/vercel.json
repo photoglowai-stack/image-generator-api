@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "routes": [
+    { "src": "/api/generate-gen4-image$", "dest": "/api/generate-gen4-image.js" },
+    { "src": "/v1/jobs$", "dest": "/api/generate-gen4-image.js" },
+    { "src": "/v1/jobs/(.*)", "dest": "/api/generate-gen4-image.js" },
+    { "src": "/api/credits$", "dest": "/api/generate-gen4-image.js" }
+  ]
+}
