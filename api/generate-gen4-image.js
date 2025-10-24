@@ -10,7 +10,7 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key, X-Admin-Token");
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  // ---------- Helpers basiques ----------
+  // ---------- Helpers ----------
   const json = (code, payload) => {
     res.status(code).setHeader("Content-Type", "application/json; charset=utf-8");
     res.end(JSON.stringify(payload));
@@ -18,7 +18,7 @@ export default async function handler(req, res) {
   const nowIso = () => new Date().toISOString();
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // randomUUID sûr (Node/Edge)
+  // UUID sûr (Node/Edge)
   let randomUUID = globalThis.crypto?.randomUUID;
   if (!randomUUID) {
     const { randomUUID: nodeRandomUUID } = await import("node:crypto");
@@ -27,10 +27,7 @@ export default async function handler(req, res) {
   const uuid = () => randomUUID();
 
   const parseUrl = () => new URL(req.url, `http://${req.headers.host}`);
-  const clientIp =
-    req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-    req.socket?.remoteAddress ||
-    "0.0.0.0";
+  const clientIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "0.0.0.0";
 
   async function readBody() {
     try {
@@ -41,11 +38,7 @@ export default async function handler(req, res) {
       let buf = "";
       req.on("data", (c) => (buf += c));
       req.on("end", () => {
-        try {
-          resolve(JSON.parse(buf || "{}"));
-        } catch {
-          resolve({});
-        }
+        try { resolve(JSON.parse(buf || "{}")); } catch { resolve({}); }
       });
     });
   }
@@ -54,16 +47,8 @@ export default async function handler(req, res) {
   const { createClient } = await import("@supabase/supabase-js");
 
   // ---------- Clients Supabase ----------
-  const supabaseAdmin = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY,
-    { auth: { persistSession: false } }
-  );
-  const supabaseAuth = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_ANON_KEY,
-    { auth: { persistSession: false } }
-  );
+  const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+  const supabaseAuth  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY,           { auth: { persistSession: false } });
 
   // ---------- Rate limit (60/min/IP/route) ----------
   async function rateLimit(routeKey, limitPerMin = 60) {
@@ -101,13 +86,12 @@ export default async function handler(req, res) {
     const { error } = await supabaseAdmin
       .from("idempotency_keys")
       .insert({ key, route, user_id: userId || null, response });
-    // 23505 = doublon (clé déjà écrite par un appel précédent/concurrent) → OK on ignore
     if (error && error.code !== "23505") {
       console.error("IDEM_WRITE_ERR", error.message);
     }
-  }
+  } // <<< 👈 ACCOLADE FERMANTE – manquante dans ton paste précédent
 
-  // ---------- Auth utilisateur (JWT Supabase) ----------
+  // ---------- Auth utilisateur ----------
   async function getAuthUser() {
     const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
     if (!token) return null;
@@ -122,18 +106,16 @@ export default async function handler(req, res) {
       p_user_id: userId,
       p_amount: amount,
       p_reason: "image_generation",
-      p_meta: context || null,
+      p_meta: context || null
     });
   }
 
-  // ---------- Parse route ----------
+  // ---------- Route parsing ----------
   const url = parseUrl();
   const path = url.pathname || "";
   const method = req.method;
 
-  // ==========================================================
-  // ================ /api/credits (admin) ====================
-  // ==========================================================
+  // ================= /api/credits (admin) =================
   if (path === "/api/credits") {
     const ADM = process.env.ADMIN_API_KEY || "";
     if (!ADM) return json(500, { success: false, error: "missing_admin_api_key_env" });
@@ -166,10 +148,9 @@ export default async function handler(req, res) {
 
       if (op === "credit") {
         const { error } = await supabaseAdmin.rpc("credit_credits", {
-          p_user_id: user_id,
-          p_amount: amount,
+          p_user_id: user_id, p_amount: amount,
           p_reason: reason || "admin_adjust",
-          p_meta: meta || { via: "api/credits" },
+          p_meta: meta || { via: "api/credits" }
         });
         if (error) return json(400, { success: false, error: "credit_failed", details: error.message });
         return json(200, { success: true, action: "credit" });
@@ -177,10 +158,9 @@ export default async function handler(req, res) {
 
       if (op === "debit") {
         const { error } = await supabaseAdmin.rpc("debit_credits", {
-          p_user_id: user_id,
-          p_amount: amount,
+          p_user_id: user_id, p_amount: amount,
           p_reason: reason || "manual_debit",
-          p_meta: meta || { via: "api/credits" },
+          p_meta: meta || { via: "api/credits" }
         });
         if (error) return json(400, { success: false, error: "debit_failed", details: error.message });
         return json(200, { success: true, action: "debit" });
@@ -192,14 +172,12 @@ export default async function handler(req, res) {
     }
   }
 
-  // ==========================================================
-  // =================== /v1/jobs (POST/GET) ==================
-  // ==========================================================
-  const isJobsList = path === "/v1/jobs";
-  const isJobsById = /^\/v1\/jobs\/[0-9a-fA-F-]{36}$/.test(path);
+  // ================= /v1/jobs (POST/GET) ==================
+  const isJobsList = (path === "/v1/jobs");
+  const isJobsById = (/^\/v1\/jobs\/[0-9a-fA-F-]{36}$/).test(path);
   const extractJobId = () => (isJobsById ? path.split("/").pop() : null);
 
-  // ---------- POST /v1/jobs ----------
+  // POST /v1/jobs
   if (isJobsList && method === "POST") {
     if (!(await rateLimit("/v1/jobs"))) return json(429, { success: false, error: "rate_limit_exceeded" });
     const body = await readBody();
@@ -207,33 +185,25 @@ export default async function handler(req, res) {
 
     // Validation
     const rawTest = test_mode;
-    const isTest =
-      rawTest === true ||
-      rawTest === "true" ||
-      rawTest === 1 ||
-      rawTest === "1" ||
-      String(rawTest).toLowerCase?.() === "yes";
-
+    const isTest = rawTest === true || rawTest === "true" || rawTest === 1 || rawTest === "1" || String(rawTest).toLowerCase?.() === "yes";
     const categorySafe = (category || "uncategorized").replace(/[^a-z0-9_\-\/]/gi, "_").slice(0, 64);
     const modeOk = mode === "text2img" || mode === "img2img";
-    const arOk = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "4:5", "5:4", "21:9", "9:21", "2:1", "1:2"].includes(
-      aspect_ratio || "1:1"
-    );
+    const arOk = ["1:1","16:9","9:16","4:3","3:4","3:2","2:3","4:5","5:4","21:9","9:21","2:1","1:2"].includes(aspect_ratio || "1:1");
     if (!modeOk) return json(422, { success: false, error: "invalid_mode" });
     if (!arOk) return json(422, { success: false, error: "invalid_aspect_ratio" });
     if (!isTest && !prompt) return json(400, { success: false, error: "missing_prompt" });
     if (!isTest && mode === "img2img" && !input_image_url) return json(422, { success: false, error: "missing_input_image_url" });
 
-    // Idempotence (clé + route)
+    // Idempotence
     const ROUTE = "/v1/jobs";
     const headerKey = readIdempotencyKey(req);
-    const idemKey = headerKey || (metadata && metadata.idempotency_key) || null;
+    const idemKey = headerKey || metadata?.idempotency_key || null;
     if (idemKey) {
       const cached = await idemRead(idemKey, ROUTE);
       if (cached) return json(200, cached);
     }
 
-    // Auth en prod
+    // Auth (prod seulement)
     let authUser = null;
     if (!isTest) {
       const user = await getAuthUser();
@@ -241,31 +211,25 @@ export default async function handler(req, res) {
       authUser = user;
     }
 
-    // Modèles (fallbacks pour éviter "undefined/undefined")
+    // Modèles (fallbacks)
     const provider = "replicate";
     const mText = `${process.env.REPLICATE_TEXT2IMG_OWNER || "black-forest-labs"}/${process.env.REPLICATE_TEXT2IMG_NAME || "flux-1.1-pro"}`;
-    const mImg = `${process.env.REPLICATE_IMG2IMG_OWNER || "runwayml"}/${process.env.REPLICATE_IMG2IMG_NAME || "gen4-image"}`;
+    const mImg  = `${process.env.REPLICATE_IMG2IMG_OWNER  || "runwayml"}/${process.env.REPLICATE_IMG2IMG_NAME  || "gen4-image"}`;
     const model = mode === "img2img" ? mImg : mText;
 
-    // Crée le job en DB (queued)
+    // Crée job
     const jobId = uuid();
     await supabaseAdmin.from("image_jobs").insert({
-      id: jobId,
-      provider,
-      model,
-      status: "queued",
-      prompt: prompt || null,
-      input_image_url: input_image_url || null,
+      id: jobId, provider, model, status: "queued", prompt: prompt || null, input_image_url: input_image_url || null
     });
 
-    // Débit en prod
+    // Débit (prod)
     const DEBIT_ENABLED = String(process.env.DEBIT_ENABLED ?? "true").toLowerCase() !== "false";
     if (!isTest && DEBIT_ENABLED) {
       const amount = Number(process.env.PRICE_PER_IMAGE || 1);
       const { error: debitErr } = await debitUser({
-        userId: authUser.id,
-        amount,
-        context: { idempotency_key: idemKey, route: ROUTE, source: source || "web", aspect_ratio },
+        userId: authUser.id, amount,
+        context: { idempotency_key: idemKey, route: ROUTE, source: source || "web", aspect_ratio }
       });
       if (debitErr) {
         await supabaseAdmin.from("image_jobs").update({ status: "failed", updated_at: nowIso() }).eq("id", jobId);
@@ -278,9 +242,8 @@ export default async function handler(req, res) {
       const t0 = Date.now();
 
       if (isTest) {
-        // --- TEST: JPEG 1x1 re-hosté dans Supabase Storage ---
-        const b64 =
-          "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxISEhAQEBAQEA8QEA8QDxAPEA8PDw8QFREWFhURFRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMtNygtLisBCgoKDQ0NDg0NDisZFRkrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrK//AABEIAKgBLAMBIgACEQEDEQH/xAAWAAEBAQAAAAAAAAAAAAAAAAAABQf/xAAaEAADAQEBAQAAAAAAAAAAAAAAARECAwQh/8QAFQEBAQAAAAAAAAAAAAAAAAAAAgP/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwC2gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/2Q==";
+        // JPEG 1x1 re-host
+        const b64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxISEhAQEBAQEA8QEA8QDxAPEA8PDw8QFREWFhURFRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMtNygtLisBCgoKDQ0NDg0NDisZFRkrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrK//AABEIAKgBLAMBIgACEQEDEQH/xAAWAAEBAQAAAAAAAAAAAAAAAAAABQf/xAAaEAADAQEBAQAAAAAAAAAAAAAAARECAwQh/8QAFQEBAQAAAAAAAAAAAAAAAAAAAgP/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwC2gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/2Q==";
         const buf = Buffer.from(b64, "base64");
         const pathOut = templatedPath(process.env.PATH_OUTPUTS_TEMPLATE || "outputs/{YYYY-MM-DD}/{UUID}.{EXT}", { ext: "jpg" });
         const { error: upErr } = await supabaseAdmin
@@ -290,51 +253,28 @@ export default async function handler(req, res) {
         finalUrl = supabaseAdmin.storage.from(process.env.BUCKET_IMAGES || "generated_images").getPublicUrl(pathOut).data.publicUrl;
 
         await supabaseAdmin.from("photos_meta").insert({
-          image_url: finalUrl,
-          prompt: prompt || "[test_mode]",
-          mode,
-          category: categorySafe,
-          source: source || "figma",
-          duration_ms: Date.now() - t0,
-          user_id: authUser?.id || null,
+          image_url: finalUrl, prompt: prompt || "[test_mode]", mode, category: categorySafe, source: source || "figma",
+          duration_ms: Date.now() - t0, user_id: authUser?.id || null
         });
 
-        await supabaseAdmin
-          .from("image_jobs")
-          .update({ status: "succeeded", result_url: finalUrl, updated_at: nowIso() })
-          .eq("id", jobId);
+        await supabaseAdmin.from("image_jobs").update({ status: "succeeded", result_url: finalUrl, updated_at: nowIso() }).eq("id", jobId);
 
-        const response = {
-          success: true,
-          job_id: jobId,
-          provider,
-          model,
-          status: "succeeded",
-          image_url: finalUrl,
-          mode: "test",
-        };
+        const response = { success: true, job_id: jobId, provider, model, status: "succeeded", image_url: finalUrl, mode: "test" };
         if (idemKey) await idemWrite(idemKey, ROUTE, authUser?.id, response);
         return json(200, response);
       }
 
-      // --- PROD: Replicate ---
+      // PROD : Replicate
       if (!process.env.REPLICATE_API_TOKEN) return json(500, { success: false, error: "replicate_token_missing" });
 
       await supabaseAdmin.from("image_jobs").update({ status: "running", updated_at: nowIso() }).eq("id", jobId);
-
       const imageUrl = await callReplicate({
         token: process.env.REPLICATE_API_TOKEN,
-        mode,
-        prompt,
-        input_image_url,
-        aspect_ratio,
-        modelVersions: {
-          text2img: process.env.REPLICATE_TEXT2IMG_VERSION,
-          img2img: process.env.REPLICATE_IMG2IMG_VERSION,
-        },
+        mode, prompt, input_image_url, aspect_ratio,
+        modelVersions: { text2img: process.env.REPLICATE_TEXT2IMG_VERSION, img2img: process.env.REPLICATE_IMG2IMG_VERSION }
       });
 
-      // Re-host dans Supabase Storage
+      // Re-host
       const pathOut = templatedPath(process.env.PATH_OUTPUTS_TEMPLATE || "outputs/{YYYY-MM-DD}/{UUID}.{EXT}", { ext: "jpg" });
       const fetched = await fetch(imageUrl);
       if (!fetched.ok) throw new Error(`download_failed_${fetched.status}`);
@@ -343,20 +283,15 @@ export default async function handler(req, res) {
         .storage.from(process.env.BUCKET_IMAGES || "generated_images")
         .upload(pathOut, Buffer.from(arr), { contentType: "image/jpeg", upsert: true });
       if (upErr2) throw upErr2;
-      finalUrl = supabaseAdmin.storage.from(process.env.BUCKET_IMAGES || "generated_images").getPublicUrl(pathOut).data.publicUrl;
+      const finalUrl2 = supabaseAdmin.storage.from(process.env.BUCKET_IMAGES || "generated_images").getPublicUrl(pathOut).data.publicUrl;
 
       await supabaseAdmin.from("photos_meta").insert({
-        image_url: finalUrl,
-        prompt,
-        mode,
-        category: categorySafe,
-        source: source || "web",
-        duration_ms: Date.now() - t0,
-        user_id: authUser?.id || null,
+        image_url: finalUrl2, prompt, mode, category: categorySafe, source: source || "web",
+        duration_ms: Date.now() - t0, user_id: authUser?.id || null
       });
-      await supabaseAdmin.from("image_jobs").update({ status: "succeeded", result_url: finalUrl, updated_at: nowIso() }).eq("id", jobId);
+      await supabaseAdmin.from("image_jobs").update({ status: "succeeded", result_url: finalUrl2, updated_at: nowIso() }).eq("id", jobId);
 
-      const response = { success: true, job_id: jobId, provider, model, status: "succeeded", image_url: finalUrl };
+      const response = { success: true, job_id: jobId, provider, model, status: "succeeded", image_url: finalUrl2 };
       if (idemKey) await idemWrite(idemKey, ROUTE, authUser?.id, response);
       return json(200, response);
     } catch (e) {
@@ -365,42 +300,32 @@ export default async function handler(req, res) {
     }
   }
 
-  // ---------- GET /v1/jobs/{id} ----------
+  // GET /v1/jobs/{id}
   if (isJobsById && method === "GET") {
     const jobId = extractJobId();
-    const { data, error } = await supabaseAdmin
-      .from("image_jobs")
-      .select("id,status,result_url")
-      .eq("id", jobId)
-      .maybeSingle();
+    const { data, error } = await supabaseAdmin.from("image_jobs").select("id,status,result_url").eq("id", jobId).maybeSingle();
     if (error || !data) return json(404, { success: false, error: "job_not_found" });
     return json(200, { success: true, job_id: data.id, status: data.status, image_url: data.result_url || null });
   }
 
-  // ==========================================================
-  // ======= LEGACY: /api/generate-gen4-image (compat) ========
-  // ==========================================================
+  // ===== LEGACY: /api/generate-gen4-image =====
   if (path === "/api/generate-gen4-image" && method === "POST") {
     const body = await readBody();
     const payload = {
       mode: body?.input_image_url ? "img2img" : "text2img",
-      prompt: body?.prompt,
-      input_image_url: body?.input_image_url,
+      prompt: body?.prompt, input_image_url: body?.input_image_url,
       aspect_ratio: body?.aspect_ratio || "1:1",
       category: body?.category || "uncategorized",
       source: body?.source || "figma",
       metadata: body?.metadata || {},
-      test_mode: body?.test_mode === true || body?.test_mode === "true",
+      test_mode: body?.test_mode === true || body?.test_mode === "true"
     };
-    // on redirige vers /v1/jobs
     req.headers["idempotency-key"] = req.headers["idempotency-key"] || body?.metadata?.idempotency_key || null;
-    req.method = "POST";
-    req.url = "/v1/jobs";
-    req.body = JSON.stringify(payload);
+    req.method = "POST"; req.url = "/v1/jobs"; req.body = JSON.stringify(payload);
     return handler(req, res);
   }
 
-  // ---------- Fallback ----------
+  // Fallback
   return json(404, { success: false, error: "route_not_found", path, method });
 
   // ---------- Helpers locaux ----------
