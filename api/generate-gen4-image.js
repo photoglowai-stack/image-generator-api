@@ -1,21 +1,18 @@
 // /api/generate-gen4-image.js
-// Alias: /v1/jobs → mappé dans vercel.json
-// POST /v1/jobs  { mode, model, prompt?, image_url?, aspect_ratio?, test_mode?, extra? }
-//   - mode: "text2img" | "img2img" (default: text2img)
-//   - model: "gen4" | "flux" | chemin complet Replicate (default: gen4)
-// GET  /v1/jobs?health=1 → healthcheck simple
+// Alias: /v1/jobs (mappé dans vercel.json)
 
 import Replicate from "replicate";
 import { createClient } from "@supabase/supabase-js";
+import { randomUUID } from "crypto";
 
 // ---------- CORS ----------
 function setCORS(res) {
   const origin = process.env.FRONT_ORIGIN || "*";
   res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "content-type, authorization, idempotency-key"
+    "content-type, authorization, idempotency-key, x-admin-token"
   );
 }
 
@@ -25,7 +22,7 @@ const ANON_KEY      = process.env.SUPABASE_ANON_KEY;
 const BUCKET        = process.env.BUCKET_IMAGES || "photos";
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 
-// Deux clients Supabase (auth vs admin)
+// Deux clients Supabase (auth public vs admin)
 const supabaseAuth = (SUPABASE_URL && ANON_KEY)
   ? createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } })
   : null;
@@ -40,10 +37,9 @@ const MODEL_MAP = {
   flux: "black-forest-labs/flux-1.1-pro"
 };
 
-// Petit helper pour attendre
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Poll Replicate jusqu'à "succeeded" (timeout ~25s max)
+// Poll Replicate jusqu'à "succeeded" (timeout ~25s)
 async function waitForPrediction(id, timeoutMs = 25000, intervalMs = 1250) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -53,15 +49,17 @@ async function waitForPrediction(id, timeoutMs = 25000, intervalMs = 1250) {
     }
     await sleep(intervalMs);
   }
-  // Dernière lecture si timeout
   return await replicate.predictions.get(id);
 }
 
 export default async function handler(req, res) {
   setCORS(res);
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method === "GET" && (req.query?.health === "1" || req.query?.health === 1)) {
-    return res.status(200).json({
+  if (req.method === "HEAD")    return res.status(204).end();
+
+  // --- Health GET (par défaut) ---
+  if (req.method === "GET") {
+    const health = {
       ok: true,
       endpoint: "jobs",
       has_env: {
@@ -71,8 +69,10 @@ export default async function handler(req, res) {
         REPLICATE_API_TOKEN: !!REPLICATE_API_TOKEN,
         BUCKET: BUCKET
       }
-    });
+    };
+    return res.status(200).json(health);
   }
+
   if (req.method !== "POST") {
     return res.status(405).json({ error: "method_not_allowed" });
   }
@@ -88,17 +88,15 @@ export default async function handler(req, res) {
     if (!token) return res.status(401).json({ error: "missing_bearer_token" });
 
     const { data: userData, error: authErr } = await supabaseAuth.auth.getUser(token);
-    if (authErr || !userData?.user) {
-      return res.status(401).json({ error: "invalid_token" });
-    }
+    if (authErr || !userData?.user) return res.status(401).json({ error: "invalid_token" });
     const user_id = userData.user.id;
 
     // ---- Payload ----
-    const idem = req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || null;
+    const idem = (req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || null)?.toString() || null;
     const {
-      mode = "text2img",
-      model = "gen4",
-      model_path,                 // permet de forcer un chemin complet Replicate
+      mode = "text2img",                        // "text2img" | "img2img"
+      model = "gen4",                           // "gen4" | "flux" | chemin complet
+      model_path,                               // option: chemin complet Replicate
       prompt = "",
       image_url = "",
       aspect_ratio = "1:1",
@@ -106,6 +104,9 @@ export default async function handler(req, res) {
       extra = {}
     } = req.body || {};
 
+    if (!["text2img", "img2img"].includes(mode)) {
+      return res.status(422).json({ error: "invalid_mode" });
+    }
     if (mode === "text2img" && !prompt) {
       return res.status(400).json({ error: "missing_prompt" });
     }
@@ -130,29 +131,29 @@ export default async function handler(req, res) {
     }
 
     // ---- Choix du modèle ----
-    const modelPath = model_path || MODEL_MAP[model] || MODEL_MAP.gen4;
+    const modelPath = model_path || MODEL_MAP[model] || model;
 
     // ---- Input modèle ----
-    const input = {
-      prompt,
-      aspect_ratio,
-      ...extra
-    };
+    const input = { prompt, aspect_ratio, ...extra };
     if (mode === "img2img") {
-      // Certains modèles acceptent image ou image_url ; on met les 2 pour compat
       input.image = image_url;
       input.image_url = image_url;
     }
 
     // ---- Appel Replicate (création + attente) ----
-    const created = await replicate.predictions.create({ model: modelPath, input });
-    const prediction = await waitForPrediction(created.id);
+    let created;
+    try {
+      created = await replicate.predictions.create({ model: modelPath, input });
+    } catch (err) {
+      if (debited) await supabaseAdmin.rpc("credit_credits", { p_user_id: user_id, p_amount: 1 });
+      const msg = String(err?.message || err);
+      const tag = /401|unauthorized|auth/i.test(msg) ? "replicate_auth_error" : "replicate_model_error";
+      return res.status(500).json({ error: tag, details: msg });
+    }
 
+    const prediction = await waitForPrediction(created.id);
     if (prediction?.status !== "succeeded") {
-      if (debited) {
-        // Rembourse si échec
-        await supabaseAdmin.rpc("credit_credits", { p_user_id: user_id, p_amount: 1 });
-      }
+      if (debited) await supabaseAdmin.rpc("credit_credits", { p_user_id: user_id, p_amount: 1 });
       return res.status(500).json({
         error: "prediction_failed",
         details: prediction?.error || prediction?.status || "unknown"
@@ -174,7 +175,7 @@ export default async function handler(req, res) {
     }
 
     const buffer = Buffer.from(await resp.arrayBuffer());
-    const filename = `gen/${user_id}/${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`;
+    const filename = `gen/${user_id}/${Date.now()}_${randomUUID()}.jpg`; // <- FIX uuid
 
     const { error: upErr } = await supabaseAdmin.storage
       .from(BUCKET)
@@ -196,7 +197,7 @@ export default async function handler(req, res) {
       image_url: pub?.publicUrl || null,
       source_url: rawUrl,
       test_mode,
-      idempotency_key: idem || null
+      idempotency_key: idem
     });
   } catch (e) {
     return res.status(500).json({
