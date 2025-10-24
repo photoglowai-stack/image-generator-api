@@ -1,5 +1,9 @@
 // /api/generate-gen4-image.js
 // Alias: /v1/jobs (mappé dans vercel.json)
+// POST /v1/jobs  { mode, model, prompt?, image_url?, aspect_ratio?, test_mode?, extra? }
+//   - mode: "text2img" | "img2img" (default: text2img)
+//   - model: "gen4" | "flux" | chemin complet Replicate (default: gen4)
+// GET  /v1/jobs  → healthcheck simple
 
 import Replicate from "replicate";
 import { createClient } from "@supabase/supabase-js";
@@ -22,7 +26,7 @@ const ANON_KEY      = process.env.SUPABASE_ANON_KEY;
 const BUCKET        = process.env.BUCKET_IMAGES || "photos";
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 
-// Deux clients Supabase (auth public vs admin)
+// Clients Supabase (auth public vs admin)
 const supabaseAuth = (SUPABASE_URL && ANON_KEY)
   ? createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } })
   : null;
@@ -57,9 +61,9 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method === "HEAD")    return res.status(204).end();
 
-  // --- Health GET (par défaut) ---
+  // GET = health
   if (req.method === "GET") {
-    const health = {
+    return res.status(200).json({
       ok: true,
       endpoint: "jobs",
       has_env: {
@@ -69,8 +73,7 @@ export default async function handler(req, res) {
         REPLICATE_API_TOKEN: !!REPLICATE_API_TOKEN,
         BUCKET: BUCKET
       }
-    };
-    return res.status(200).json(health);
+    });
   }
 
   if (req.method !== "POST") {
@@ -94,9 +97,9 @@ export default async function handler(req, res) {
     // ---- Payload ----
     const idem = (req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || null)?.toString() || null;
     const {
-      mode = "text2img",                        // "text2img" | "img2img"
-      model = "gen4",                           // "gen4" | "flux" | chemin complet
-      model_path,                               // option: chemin complet Replicate
+      mode = "text2img",
+      model = "gen4",
+      model_path,                 // facultatif: chemin complet Replicate
       prompt = "",
       image_url = "",
       aspect_ratio = "1:1",
@@ -175,7 +178,7 @@ export default async function handler(req, res) {
     }
 
     const buffer = Buffer.from(await resp.arrayBuffer());
-    const filename = `gen/${user_id}/${Date.now()}_${randomUUID()}.jpg`; // <- FIX uuid
+    const filename = `gen/${user_id}/${Date.now()}_${randomUUID()}.jpg`; // <- robuste
 
     const { error: upErr } = await supabaseAdmin.storage
       .from(BUCKET)
