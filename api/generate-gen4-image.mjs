@@ -1,8 +1,8 @@
-// /api/generate-gen4-image.js  (CommonJS, compatible Vercel sans "type":"module")
+// /api/generate-gen4-image.js (ESM, compatible avec "type":"module")
 
-const Replicate = require("replicate");
-const { createClient } = require("@supabase/supabase-js");
-const { randomUUID } = require("crypto");
+import Replicate from "replicate";
+import { createClient } from "@supabase/supabase-js";
+import { randomUUID } from "crypto";
 
 // ---------- CORS ----------
 function setCORS(res) {
@@ -48,7 +48,7 @@ async function waitForPrediction(id, timeoutMs = 25000, intervalMs = 1250) {
   return await replicate.predictions.get(id);
 }
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   setCORS(res);
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method === "HEAD")    return res.status(204).end();
@@ -90,17 +90,16 @@ module.exports = async function handler(req, res) {
     const idemHeader = req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || null;
     const idem = idemHeader ? String(idemHeader) : null;
 
-    const body = req.body || {};
     const {
       mode = "text2img",
       model = "gen4",
-      model_path,                 // facultatif: chemin complet Replicate
+      model_path,
       prompt = "",
       image_url = "",
       aspect_ratio = "1:1",
       test_mode = false,
       extra = {}
-    } = body;
+    } = req.body || {};
 
     if (!["text2img", "img2img"].includes(mode)) {
       return res.status(422).json({ error: "invalid_mode" });
@@ -203,4 +202,4 @@ module.exports = async function handler(req, res) {
       details: String(e?.message || e)
     });
   }
-};
+}
