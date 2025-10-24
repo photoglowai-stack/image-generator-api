@@ -208,7 +208,7 @@ export default async function handler(req, res) {
     const headerKey = readIdempotencyKey(req);
     const idemKey = headerKey || (metadata && metadata.idempotency_key) || null;
     if (idemKey) {
-      const cached = await idemRead(idemKey, ROUTE);
+      const cached = await idemRead(idemKey, "/v1/jobs");
       if (cached) return json(200, cached);
     }
 
