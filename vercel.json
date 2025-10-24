@@ -1,9 +1,19 @@
 {
   "version": 2,
+  "headers": [
+    {
+      "source": "/(v1|api)/(.*)",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "${FRONT_ORIGIN}" },
+        { "key": "Access-Control-Allow-Methods", "value": "GET,POST,OPTIONS" },
+        { "key": "Access-Control-Allow-Headers", "value": "content-type, authorization, idempotency-key" }
+      ]
+    }
+  ],
   "routes": [
-    { "src": "/api/generate-gen4-image$", "dest": "/api/generate-gen4-image.js" },
     { "src": "/v1/jobs$", "dest": "/api/generate-gen4-image.js" },
     { "src": "/v1/jobs/(.*)", "dest": "/api/generate-gen4-image.js" },
-    { "src": "/api/credits$", "dest": "/api/generate-gen4-image.js" }
+    { "src": "/api/generate-gen4-image$", "dest": "/api/generate-gen4-image.js" },
+    { "src": "/api/credits$", "dest": "/api/credits.mjs" }
   ]
 }
