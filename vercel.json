@@ -11,9 +11,10 @@
       "continue": true
     },
 
-    { "src": "/v1/jobs$", "dest": "/api/generate-gen4-image.js" },
-    { "src": "/v1/jobs/(.*)", "dest": "/api/generate-gen4-image.js" },
-    { "src": "/api/generate-gen4-image$", "dest": "/api/generate-gen4-image.js" },
+    { "src": "/v1/jobs$", "dest": "/api/v1-jobs.mjs" },
+    { "src": "/v1/jobs/(.*)", "dest": "/api/v1-jobs.mjs" },
+
+    { "src": "/api/generate-gen4-image$", "dest": "/api/generate-gen4-image.mjs" },
     { "src": "/api/credits$", "dest": "/api/credits.mjs" }
   ]
 }
