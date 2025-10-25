@@ -1,4 +1,8 @@
-// /api/generate-gen4-image.js (ESM, compatible avec "type":"module")
+// /api/generate-gen4-image.js  — ESM compatible ("type":"module")
+// - POST: crée une image via Replicate (ou bypass en test_mode), enregistre dans Supabase Storage, renvoie l’URL publique
+// - GET/HEAD/OPTIONS: health + CORS
+
+export const config = { runtime: "nodejs" };
 
 import Replicate from "replicate";
 import { createClient } from "@supabase/supabase-js";
@@ -15,66 +19,76 @@ function setCORS(res) {
   );
 }
 
+// ---------- ENV ----------
 const SUPABASE_URL  = process.env.SUPABASE_URL;
-const SERVICE_ROLE  = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SERVICE_ROLE  = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE;
 const ANON_KEY      = process.env.SUPABASE_ANON_KEY;
-const BUCKET        = process.env.BUCKET_IMAGES || "photos";
+const BUCKET        = process.env.BUCKET_IMAGES || "generated_images";
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 
-const supabaseAuth = (SUPABASE_URL && ANON_KEY)
+// ---------- Clients ----------
+const supabaseAuth  = (SUPABASE_URL && ANON_KEY)
   ? createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } })
   : null;
+
 const supabaseAdmin = (SUPABASE_URL && SERVICE_ROLE)
   ? createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } })
   : null;
 
 const replicate = REPLICATE_API_TOKEN ? new Replicate({ auth: REPLICATE_API_TOKEN }) : null;
 
+// ---------- Modèles ----------
 const MODEL_MAP = {
   gen4: "runwayml/gen4-image",
-  flux: "black-forest-labs/flux-1.1-pro"
+  flux: "black-forest-labs/flux-1.1-pro",
 };
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// ---------- Utils ----------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function waitForPrediction(id, timeoutMs = 25000, intervalMs = 1250) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const pred = await replicate.predictions.get(id);
-    if (pred?.status === "succeeded" || pred?.status === "failed" || pred?.status === "canceled") {
-      return pred;
-    }
+    const p = await replicate.predictions.get(id);
+    if (p?.status === "succeeded" || p?.status === "failed" || p?.status === "canceled") return p;
     await sleep(intervalMs);
   }
   return await replicate.predictions.get(id);
 }
 
+// 1x1 PNG transparent (base64) — pour test_mode (pas d’appel Replicate)
+const ONE_BY_ONE_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO4B2E0AAAAASUVORK5CYII=";
+
+function pickExtFromContentType(ct) {
+  if (!ct) return ".jpg";
+  if (ct.includes("png")) return ".png";
+  if (ct.includes("webp")) return ".webp";
+  if (ct.includes("jpeg") || ct.includes("jpg")) return ".jpg";
+  return ".jpg";
+}
+
 export default async function handler(req, res) {
   setCORS(res);
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method === "HEAD")    return res.status(204).end();
+  if (req.method === "OPTIONS" || req.method === "HEAD") return res.status(204).end();
 
   // GET = health
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      endpoint: "jobs",
+      endpoint: "generate-gen4-image",
       has_env: {
         SUPABASE_URL: !!SUPABASE_URL,
         SERVICE_ROLE: !!SERVICE_ROLE,
         ANON_KEY: !!ANON_KEY,
         REPLICATE_API_TOKEN: !!REPLICATE_API_TOKEN,
-        BUCKET: BUCKET
-      }
+        BUCKET,
+      },
     });
   }
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "method_not_allowed" });
-  }
-
-  if (!supabaseAuth || !supabaseAdmin || !replicate) {
-    return res.status(500).json({ error: "missing_env" });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
+  if (!supabaseAuth || !supabaseAdmin) return res.status(500).json({ error: "missing_env_supabase" });
 
   try {
     // ---- Auth Bearer (JWT Supabase) ----
@@ -88,17 +102,17 @@ export default async function handler(req, res) {
 
     // ---- Payload ----
     const idemHeader = req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || null;
-    const idem = idemHeader ? String(idemHeader) : null;
+    const idempotencyKey = idemHeader ? String(idemHeader) : null;
 
     const {
-      mode = "text2img",
-      model = "gen4",
-      model_path,
+      mode = "text2img",           // "text2img" | "img2img"
+      model = "gen4",              // "gen4" | "flux" | chemin complet
+      model_path,                  // si tu veux forcer un chemin
       prompt = "",
       image_url = "",
       aspect_ratio = "1:1",
       test_mode = false,
-      extra = {}
+      extra = {},                  // params supplémentaires (guidance, seed, etc.)
     } = req.body || {};
 
     if (!["text2img", "img2img"].includes(mode)) {
@@ -111,33 +125,65 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "missing_image_url" });
     }
 
-    // ---- Crédits : pré-débit si pas en test ----
+    // -------------------------------
+    // BYPASS TEST MODE (aucun débit, aucune requête Replicate)
+    // -------------------------------
+    if (test_mode === true) {
+      const jobId = `test_${Date.now()}_${randomUUID()}`;
+      const buffer = Buffer.from(ONE_BY_ONE_PNG_BASE64, "base64");
+      const filename = `gen/${user_id}/${jobId}.png`;
+
+      const { error: upErr } = await supabaseAdmin
+        .storage
+        .from(BUCKET)
+        .upload(filename, buffer, { contentType: "image/png", upsert: false });
+
+      if (upErr) return res.status(500).json({ error: "upload_failed", details: upErr.message });
+
+      const { data: pub } = supabaseAdmin.storage.from(BUCKET).getPublicUrl(filename);
+
+      return res.status(200).json({
+        ok: true,
+        job_id: jobId,
+        user_id,
+        model: "test_mode_dummy",
+        mode,
+        image_url: pub?.publicUrl || null,
+        source_url: null,
+        test_mode: true,
+        idempotency_key: idempotencyKey,
+      });
+    }
+
+    // ---- Replicate requis en prod réelle ----
+    if (!replicate) return res.status(500).json({ error: "missing_env_replicate" });
+
+    // ---- Crédits : pré-débit ----
     let debited = false;
-    if (!test_mode) {
+    {
       const { error: debitErr } = await supabaseAdmin.rpc("debit_credits", {
-        p_user_id: user_id, p_amount: 1
+        p_user_id: user_id,
+        p_amount: 1,
       });
       if (debitErr) {
-        if (String(debitErr.message).includes("insufficient_credits") ||
-            String(debitErr.message).includes("no_credits_row")) {
+        const msg = String(debitErr.message || "");
+        if (msg.includes("insufficient_credits") || msg.includes("no_credits_row")) {
           return res.status(402).json({ error: "insufficient_credits" });
         }
-        return res.status(500).json({ error: "debit_failed", details: debitErr.message });
+        return res.status(500).json({ error: "debit_failed", details: msg });
       }
       debited = true;
     }
 
-    // ---- Choix du modèle ----
+    // ---- Choix du modèle & input ----
     const modelPath = model_path || MODEL_MAP[model] || model;
-
-    // ---- Input modèle ----
     const input = { prompt, aspect_ratio, ...extra };
     if (mode === "img2img") {
       input.image = image_url;
       input.image_url = image_url;
     }
 
-    // ---- Appel Replicate (création + attente) ----
+    // ---- Appel Replicate ----
     let created;
     try {
       created = await replicate.predictions.create({ model: modelPath, input });
@@ -153,7 +199,7 @@ export default async function handler(req, res) {
       if (debited) await supabaseAdmin.rpc("credit_credits", { p_user_id: user_id, p_amount: 1 });
       return res.status(500).json({
         error: "prediction_failed",
-        details: prediction?.error || prediction?.status || "unknown"
+        details: prediction?.error || prediction?.status || "unknown",
       });
     }
 
@@ -164,19 +210,23 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "no_output_from_model" });
     }
 
-    // ---- Upload Storage Supabase ----
+    // ---- Télécharger et enregistrer dans Supabase Storage ----
     const resp = await fetch(rawUrl);
     if (!resp.ok) {
       if (debited) await supabaseAdmin.rpc("credit_credits", { p_user_id: user_id, p_amount: 1 });
       return res.status(500).json({ error: "download_failed", details: `status ${resp.status}` });
     }
 
-    const buffer = Buffer.from(await resp.arrayBuffer());
-    const filename = `gen/${user_id}/${Date.now()}_${randomUUID()}.jpg`;
+    const arrBuf = await resp.arrayBuffer();
+    const buffer = Buffer.from(arrBuf);
+    const ct = resp.headers.get("content-type") || "image/jpeg";
+    const ext = pickExtFromContentType(ct);
+    const filename = `gen/${user_id}/${Date.now()}_${randomUUID()}${ext}`;
 
-    const { error: upErr } = await supabaseAdmin.storage
+    const { error: upErr } = await supabaseAdmin
+      .storage
       .from(BUCKET)
-      .upload(filename, buffer, { contentType: "image/jpeg", upsert: false });
+      .upload(filename, buffer, { contentType: ct, upsert: false });
 
     if (upErr) {
       if (debited) await supabaseAdmin.rpc("credit_credits", { p_user_id: user_id, p_amount: 1 });
@@ -193,13 +243,13 @@ export default async function handler(req, res) {
       mode,
       image_url: pub?.publicUrl || null,
       source_url: rawUrl,
-      test_mode,
-      idempotency_key: idem
+      test_mode: false,
+      idempotency_key: idempotencyKey,
     });
   } catch (e) {
     return res.status(500).json({
       error: "FUNCTION_INVOCATION_FAILED",
-      details: String(e?.message || e)
+      details: String(e?.message || e),
     });
   }
 }
