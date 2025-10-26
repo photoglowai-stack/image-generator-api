@@ -1,6 +1,7 @@
 // /api/generate-gen4-image.mjs — Générateur unifié (Flux 1.1 Pro & Runway Gen-4)
 // • Modes: text2img | img2img
 // • Modèles: flux | gen4 | gen4-turbo  (surcharge possible via model_path)
+// • Flux: T2I = flux-1.1-pro, I2I = Kontext [pro]
 // • CORS Figma (Origin:null), idempotency, crédits, upload Supabase, insertion photos_meta
 // • Retour: URL Supabase (publique ou signée), jamais l’URL provider
 // • Runtime Node.js (Vercel): pas d’images en réponse (JSON léger)
@@ -68,6 +69,9 @@ const MODEL_MAP = {
   gen4: "runwayml/gen4-image",
   "gen4-turbo": "runwayml/gen4-image-turbo",
 };
+// FLUX variantes
+const FLUX_T2I_MODEL = "black-forest-labs/flux-1.1-pro";
+const FLUX_I2I_MODEL = process.env.FLUX_I2I_MODEL || "black-forest-labs/flux-kontext-pro";
 
 const RUNWAY_ASPECT_RATIOS = new Set(["1:1", "16:9", "9:16", "3:2", "2:3", "4:5", "5:4"]);
 
@@ -400,7 +404,7 @@ export default async function handler(req, res) {
     await safeDebitCredit({ user_id, amount: 1, op: "debit" });
 
     // ---- Choix modèle & inputs communs ----
-    const modelPath       = model_path || MODEL_MAP[model] || model; // accepte slug explicite
+    let modelPath         = model_path || MODEL_MAP[model] || model; // accepte slug explicite
     const normalizedAspect= normalizeAspectRatio(model, aspect_ratio);
     const normalizedSeed  = normalizeSeed(seed);
     const guidanceValue   = normalizeGuidanceValue(guidance);
@@ -417,6 +421,13 @@ export default async function handler(req, res) {
       reference_images, reference_tags, image_urls, image_url, image, images,
     });
     const resolvedRefs = await resolveReferenceUrls(refEntries, user_id);
+
+    // -- Sélection finale du modèle FLUX en fonction du mode effectif (T2I vs I2I)
+    if (model === "flux") {
+      const hasRef = resolvedRefs.length > 0;
+      const wantsI2I = (mode === "img2img") || (hasRef && mode === "text2img"); // auto i2i si ref fournie
+      modelPath = wantsI2I ? FLUX_I2I_MODEL : FLUX_T2I_MODEL;
+    }
 
     // ----- Négatif : supporté par FLUX uniquement -----
     if (negative_prompt && model === "flux") {
@@ -447,20 +458,26 @@ export default async function handler(req, res) {
       delete input.image_url;
 
     } else if (model === "flux") {
-      // FLUX : img2img = 1 image + prompt_strength ; guidance_scale optionnel
+      // FLUX : si img2img => route vers Kontext [pro] (image editing)
       const first = resolvedRefs[0];
-      const wantsI2I = mode === "img2img" || (!!first && mode === "text2img"); // auto-img2img si photo fournie
+      const wantsI2I = mode === "img2img" || (!!first && mode === "text2img"); // auto-img2img si ref
       const effectiveMode = wantsI2I ? "img2img:auto" : mode;
-      console.info("🧪 flux.effective_mode=", effectiveMode, { refs: resolvedRefs.length });
+      console.info("🧪 flux.effective_mode=", effectiveMode, { refs: resolvedRefs.length, modelPath });
 
       if (wantsI2I) {
         if (!first) {
           await safeDebitCredit({ user_id, amount: 1, op: "credit" });
           return res.status(400).json({ error: "missing_image_url" });
         }
+        // Kontext attend `image` (pas `image_url`) et n'utilise pas prompt_strength
         input.image = first;
-        input.image_url = first;
-        input.prompt_strength = normalizeStrength(prompt_strength);
+        delete input.image_url;
+        delete input.prompt_strength;
+      } else {
+        // FLUX T2I (flux-1.1-pro)
+        delete input.image;
+        delete input.image_url;
+        delete input.prompt_strength;
       }
       if (guidanceValue !== undefined) input.guidance_scale = guidanceValue;
 
