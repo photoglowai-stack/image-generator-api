@@ -1,11 +1,12 @@
 {
-  "version": 2,
-  "routes": [
-    { "src": "/v1/jobs$", "dest": "/api/v1-jobs.mjs" },
-    { "src": "/v1/jobs/(.*)", "dest": "/api/v1-jobs.mjs" },
-
-    { "src": "/api/generate-gen4-image$", "dest": "/api/generate-gen4-image.mjs" },
-    { "src": "/api/storage-signed-upload$", "dest": "/api/storage-signed-upload.js" },
-    { "src": "/api/system$", "dest": "/api/system.js" }
-  ]
+  "name": "image-generator-api",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.44.2",
+    "replicate": "^0.31.0"
+  },
+  "scripts": {}
 }
