@@ -38,6 +38,14 @@ const BUCKET_IMAGES  = process.env.BUCKET_IMAGES  || "generated_images"; // sort
 const BUCKET_UPLOADS = process.env.BUCKET_UPLOADS || "photos";           // entrées img2img
 const TABLE_META     = process.env.TABLE_META     || "photos_meta";
 
+// Références: liste blanche de buckets autorisés pour les images d'entrée
+const ALLOWED_REFERENCE_BUCKETS = (process.env.ALLOWED_REFERENCE_BUCKETS || BUCKET_UPLOADS)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const DEFAULT_REFERENCE_BUCKET = ALLOWED_REFERENCE_BUCKETS[0] || BUCKET_UPLOADS;
+const UPLOAD_OBJECT_PREFIX = process.env.UPLOAD_OBJECT_PREFIX || "uploads"; // anti cross-tenant
+
 // Sortie publique ou privée (signed URL)
 const OUTPUT_PUBLIC        = (process.env.OUTPUT_PUBLIC || "true") === "true";
 const OUTPUT_SIGNED_TTL_S  = Number(process.env.OUTPUT_SIGNED_TTL_S  || 60 * 60 * 24 * 7); // 7 j
@@ -200,18 +208,62 @@ function collectRefs({ reference_images, reference_tags, image_urls, image_url, 
   return { normalized, validTags };
 }
 
-function extractStorageTarget(rawValue) {
-  const cleaned = rawValue.replace(/^\/+/, "");
+// ---- Normalisation chemin + garde-fous cross-tenant ----
+function normalizeStoragePath(rawPath) {
+  const cleaned = String(rawPath || "")
+    .replace(/\\+/g, "/")
+    .replace(/^\/+/, "")
+    .trim();
   if (!cleaned) return null;
-  // si la chaîne commence par "<bucket>/...", respecte le bucket ; sinon, force BUCKET_UPLOADS
-  const match = cleaned.match(/^([A-Za-z0-9_-]+)\/(.+)$/);
-  if (match) return { bucket: match[1], path: match[2] };
-  return { bucket: BUCKET_UPLOADS, path: cleaned };
+  const segments = cleaned.split("/");
+  const safeSegments = [];
+  for (const segment of segments) {
+    if (!segment || segment === "." || segment === "..") return null;
+    const sanitized = segment
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^A-Za-z0-9._-]+/g, "-")
+      .replace(/-{2,}/g, "-")
+      .replace(/^-+|-+$/g, "");
+    if (!sanitized) return null;
+    safeSegments.push(sanitized);
+  }
+  return safeSegments.join("/");
 }
 
-async function resolveStorageReference(entry) {
+function extractStorageTarget(rawValue, userId) {
+  if (typeof rawValue !== "string") return null;
+  const cleaned = rawValue.replace(/^\/+/, "").trim();
+  if (!cleaned) return null;
+
+  const match = cleaned.match(/^([A-Za-z0-9_-]+)\/(.+)$/);
+  let bucket = DEFAULT_REFERENCE_BUCKET;
+  let path = cleaned;
+
+  // bucket explicite si fourni, sinon bucket par défaut
+  if (match) {
+    const [, candidateBucket, rest] = match;
+    const allowedSet = new Set(ALLOWED_REFERENCE_BUCKETS.length ? ALLOWED_REFERENCE_BUCKETS : [DEFAULT_REFERENCE_BUCKET]);
+    if (!allowedSet.has(candidateBucket)) return null; // bucket refusé
+    bucket = candidateBucket;
+    path = rest;
+  }
+
+  const normalizedPath = normalizeStoragePath(path);
+  if (!normalizedPath) return null;
+
+  // Anti cross-tenant: si on pointe vers le bucket d'uploads, forcer le préfixe uploads/<user_id>/
+  if (bucket === BUCKET_UPLOADS) {
+    const requiredPrefix = `${UPLOAD_OBJECT_PREFIX}/${userId}/`;
+    if (!normalizedPath.startsWith(requiredPrefix)) return null;
+  }
+
+  return { bucket, path: normalizedPath };
+}
+
+async function resolveStorageReference(entry, userId) {
   if (!supabaseAdmin) return null;
-  const target = extractStorageTarget(entry.value);
+  const target = extractStorageTarget(entry.value, userId);
   if (!target) return null;
   const { bucket, path } = target;
   try {
@@ -228,12 +280,12 @@ async function resolveStorageReference(entry) {
   }
 }
 
-async function resolveReferenceUrls(entries) {
+async function resolveReferenceUrls(entries, userId) {
   const out = [];
   for (const e of entries) {
     if (e.kind === "http") out.push(e.value);
     else if (e.kind === "storage") {
-      const u = await resolveStorageReference(e);
+      const u = await resolveStorageReference(e, userId);
       if (u) out.push(u);
     }
     // data: ignoré (Replicate attend des URLs distantes)
@@ -364,7 +416,7 @@ export default async function handler(req, res) {
     const { normalized: refEntries, validTags } = collectRefs({
       reference_images, reference_tags, image_urls, image_url, image, images,
     });
-    const resolvedRefs = await resolveReferenceUrls(refEntries);
+    const resolvedRefs = await resolveReferenceUrls(refEntries, user_id);
 
     // ----- Négatif : supporté par FLUX uniquement -----
     if (negative_prompt && model === "flux") {
@@ -396,8 +448,12 @@ export default async function handler(req, res) {
 
     } else if (model === "flux") {
       // FLUX : img2img = 1 image + prompt_strength ; guidance_scale optionnel
-      if (mode === "img2img") {
-        const first = resolvedRefs[0];
+      const first = resolvedRefs[0];
+      const wantsI2I = mode === "img2img" || (!!first && mode === "text2img"); // auto-img2img si photo fournie
+      const effectiveMode = wantsI2I ? "img2img:auto" : mode;
+      console.info("🧪 flux.effective_mode=", effectiveMode, { refs: resolvedRefs.length });
+
+      if (wantsI2I) {
         if (!first) {
           await safeDebitCredit({ user_id, amount: 1, op: "credit" });
           return res.status(400).json({ error: "missing_image_url" });
