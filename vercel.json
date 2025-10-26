@@ -1,12 +1,6 @@
 {
   "version": 2,
-  "functions": {
-    "api/*.mjs": { "runtime": "nodejs20.x", "maxDuration": 60 },
-    "api/*.js":  { "runtime": "nodejs20.x", "maxDuration": 60 }
-  },
   "routes": [
-    { "src": "/(v1|api)/(.*)", "continue": true },
-
     { "src": "/v1/jobs$", "dest": "/api/v1-jobs.mjs" },
     { "src": "/v1/jobs/(.*)", "dest": "/api/v1-jobs.mjs" },
 
