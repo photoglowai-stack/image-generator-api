@@ -1,8 +1,9 @@
-// /api/generate-gen4-image.mjs  — version complète patchée pour Figma / Vercel / Flux / Gen-4
-// - Gère prompt_final, negative_prompt, preset_id/version, guidance, prompt_strength, seed
-// - Supporte Origin:null (Figma)
-// - Renvoie toujours l’URL Supabase finale + meta complète
-// - Test_mode possible sans débit
+// /api/generate-gen4-image.mjs — Générateur unifié (Flux 1.1 Pro & Runway Gen-4)
+// • Modes: text2img | img2img
+// • Modèles: flux | gen4 | gen4-turbo  (surcharge possible via model_path)
+// • CORS Figma (Origin:null), idempotency, crédits, upload Supabase, insertion photos_meta
+// • Retour: URL Supabase (publique ou signée), jamais l’URL provider
+// • Runtime Node.js (Vercel): pas d’images en réponse (JSON léger)
 
 export const config = { runtime: "nodejs" };
 
@@ -12,12 +13,12 @@ import { randomUUID } from "crypto";
 
 // ---------- CORS ----------
 function setCORS(req, res) {
-  const reqOrigin = req.headers?.origin || "";
-  const allowNull = process.env.ALLOW_NULL_ORIGIN === "true";
-  const allowOrigin =
-    allowNull && reqOrigin === "null"
-      ? "null"
-      : process.env.FRONT_ORIGIN || "*";
+  const allowNull = (process.env.ALLOW_NULL_ORIGIN || "true") === "true";
+  const reqOrigin = req.headers?.origin;
+  const front = process.env.FRONT_ORIGIN || "*";
+  const allowOrigin = allowNull && (reqOrigin === "null" || reqOrigin === null)
+    ? "null"
+    : front;
 
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
@@ -29,330 +30,298 @@ function setCORS(req, res) {
 }
 
 // ---------- ENV ----------
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SERVICE_ROLE =
-  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE;
-const ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const BUCKET = process.env.BUCKET_IMAGES || "generated_images";
+const SUPABASE_URL   = process.env.SUPABASE_URL;
+const SERVICE_ROLE   = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE;
+const ANON_KEY       = process.env.SUPABASE_ANON_KEY;
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 
+// Buckets / tables — valeurs par défaut sûres
+const BUCKET_IMAGES  = process.env.BUCKET_IMAGES || "generated_images"; // sorties
+const TABLE_META     = process.env.TABLE_META || "photos_meta";
+
+// Sortie publique ou privée (signed URL)
+const OUTPUT_PUBLIC       = (process.env.OUTPUT_PUBLIC || "true") === "true";
+const OUTPUT_SIGNED_TTL_S = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7); // 7 jours
+
 // ---------- Clients ----------
-const supabaseAuth =
-  SUPABASE_URL && ANON_KEY
-    ? createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } })
-    : null;
-
-const supabaseAdmin =
-  SUPABASE_URL && SERVICE_ROLE
-    ? createClient(SUPABASE_URL, SERVICE_ROLE, {
-        auth: { persistSession: false },
-      })
-    : null;
-
-const replicate = REPLICATE_API_TOKEN
-  ? new Replicate({ auth: REPLICATE_API_TOKEN })
+const supabaseAuth = (SUPABASE_URL && ANON_KEY)
+  ? createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } })
   : null;
+
+const supabaseAdmin = (SUPABASE_URL && SERVICE_ROLE)
+  ? createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } })
+  : null;
+
+const replicate = REPLICATE_API_TOKEN ? new Replicate({ auth: REPLICATE_API_TOKEN }) : null;
 
 // ---------- Modèles ----------
 const MODEL_MAP = {
-  gen4: "runwayml/gen4-image",
   flux: "black-forest-labs/flux-1.1-pro",
+  gen4: "runwayml/gen4-image",
+  "gen4-turbo": "runwayml/gen4-image-turbo",
 };
 
 // ---------- Utils ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function waitForPrediction(id, timeoutMs = 25000, intervalMs = 1250) {
+async function waitForPrediction(id, timeoutMs = 25000, intervalMs = 1200) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const p = await replicate.predictions.get(id);
-    if (
-      p?.status === "succeeded" ||
-      p?.status === "failed" ||
-      p?.status === "canceled"
-    )
-      return p;
+    if (!p) break;
+    if (["succeeded", "failed", "canceled"].includes(p.status)) return p;
     await sleep(intervalMs);
   }
   return await replicate.predictions.get(id);
 }
 
-// 1x1 PNG transparent (base64) — pour test_mode (pas d’appel Replicate)
-const ONE_BY_ONE_PNG_BASE64 =
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO4B2E0AAAAASUVORK5CYII=";
-
 function pickExtFromContentType(ct) {
   if (!ct) return ".jpg";
-  if (ct.includes("png")) return ".png";
-  if (ct.includes("webp")) return ".webp";
-  if (ct.includes("jpeg") || ct.includes("jpg")) return ".jpg";
+  const v = ct.toLowerCase();
+  if (v.includes("png"))  return ".png";
+  if (v.includes("webp")) return ".webp";
+  if (v.includes("jpeg") || v.includes("jpg")) return ".jpg";
   return ".jpg";
 }
+
+async function downloadBuffer(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`download_failed status=${r.status}`);
+  const ct = r.headers.get("content-type") || "image/jpeg";
+  const buf = Buffer.from(await r.arrayBuffer());
+  return { buf, ct, ext: pickExtFromContentType(ct) };
+}
+
+async function uploadOutput(buffer, contentType, userId) {
+  const filename = `outputs/${userId}/${new Date().toISOString().slice(0,10)}/${randomUUID()}`;
+  const key = `${filename}${pickExtFromContentType(contentType)}`;
+
+  const { error } = await supabaseAdmin.storage
+    .from(BUCKET_IMAGES)
+    .upload(key, buffer, { contentType, upsert: false });
+  if (error) throw new Error(`upload_failed: ${error.message}`);
+
+  if (OUTPUT_PUBLIC) {
+    const { data } = supabaseAdmin.storage.from(BUCKET_IMAGES).getPublicUrl(key);
+    return data?.publicUrl || null;
+  } else {
+    const { data, error: signErr } = await supabaseAdmin.storage
+      .from(BUCKET_IMAGES)
+      .createSignedUrl(key, OUTPUT_SIGNED_TTL_S);
+    if (signErr) throw new Error(`signed_url_failed: ${signErr.message}`);
+    return data?.signedUrl || null;
+  }
+}
+
+async function safeDebitCredit({ user_id, amount = 1, op = "debit" }) {
+  // RPC facultatives : on “best-effort”, et on ne bloque pas si absent
+  const fn = op === "debit" ? "debit_credits" : "credit_credits";
+  try {
+    const { error } = await supabaseAdmin.rpc(fn, {
+      p_user_id: user_id,
+      p_amount: amount,
+    });
+    if (error && !/does not exist|not found/i.test(error.message)) {
+      throw error;
+    }
+  } catch { /* ignore in minimal setups */ }
+}
+
+async function insertPhotosMeta(row) {
+  try {
+    await supabaseAdmin.from(TABLE_META).insert(row);
+  } catch (e) {
+    // n’empêche pas le succès ; log côté Vercel
+    console.error("photos_meta insert failed:", e?.message || e);
+  }
+}
+
+// 1x1 PNG transparent pour test_mode (aucun appel provider)
+const ONE_BY_ONE_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO4B2E0AAAAASUVORK5CYII=";
 
 // ---------- HANDLER ----------
 export default async function handler(req, res) {
   setCORS(req, res);
-  if (req.method === "OPTIONS" || req.method === "HEAD")
-    return res.status(204).end();
+  if (req.method === "OPTIONS" || req.method === "HEAD") return res.status(204).end();
 
-  // GET = health check
+  // Health
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      endpoint: "generate-gen4-image",
+      endpoint: "generate-unified",
       has_env: {
         SUPABASE_URL: !!SUPABASE_URL,
         SERVICE_ROLE: !!SERVICE_ROLE,
         ANON_KEY: !!ANON_KEY,
         REPLICATE_API_TOKEN: !!REPLICATE_API_TOKEN,
-        BUCKET,
+        BUCKET_IMAGES,
+        TABLE_META,
+        OUTPUT_PUBLIC,
       },
     });
   }
 
-  if (req.method !== "POST")
-    return res.status(405).json({ error: "method_not_allowed" });
-  if (!supabaseAuth || !supabaseAdmin)
-    return res.status(500).json({ error: "missing_env_supabase" });
+  if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
+  if (!supabaseAuth || !supabaseAdmin) return res.status(500).json({ error: "missing_env_supabase" });
+  if (!replicate) return res.status(500).json({ error: "missing_env_replicate" });
 
   try {
-    // ---- Auth Bearer (JWT Supabase) ----
+    // ---- Auth: Bearer Supabase JWT ----
     const auth = req.headers.authorization || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
     if (!token) return res.status(401).json({ error: "missing_bearer_token" });
 
-    const { data: userData, error: authErr } =
-      await supabaseAuth.auth.getUser(token);
-    if (authErr || !userData?.user)
-      return res.status(401).json({ error: "invalid_token" });
+    const { data: userData, error: authErr } = await supabaseAuth.auth.getUser(token);
+    if (authErr || !userData?.user) return res.status(401).json({ error: "invalid_token" });
     const user_id = userData.user.id;
 
     // ---- Payload ----
-    const idemHeader =
-      req.headers["idempotency-key"] ||
-      req.headers["Idempotency-Key"] ||
-      null;
-    const idempotencyKey = idemHeader ? String(idemHeader) : null;
-
     const {
-      mode = "text2img",
-      model = "gen4",
-      model_path,
+      // “mode” et “model” pilotent tout :
+      mode = "text2img",                               // "text2img" | "img2img"
+      model = "flux",                                   // "flux" | "gen4" | "gen4-turbo"
+      model_path,                                       // surclassement direct (optionnel)
+      // prompts
       prompt_final,
-      prompt, // compat legacy
-      negative_prompt,
-      preset_id,
-      preset_version,
-      image_url = "",
+      prompt,                                           // compat legacy
+      negative_prompt,                                  // pris en charge pour FLUX
+      // img2img
+      image_url,
+      prompt_strength,                                  // 0.0–1.0
+      // divers
       aspect_ratio = "1:1",
-      guidance,
-      prompt_strength,
       seed,
+      guidance,
       test_mode = false,
       extra = {},
-    } = req.body || {};
+      source = "figma-admin"
+    } = (req.body || {});
 
     if (!["text2img", "img2img"].includes(mode)) {
       return res.status(422).json({ error: "invalid_mode" });
     }
-    if (mode === "text2img" && !prompt_final && !prompt) {
+    const promptText = prompt_final || prompt || "";
+    if (mode === "text2img" && !promptText) {
       return res.status(400).json({ error: "missing_prompt" });
     }
     if (mode === "img2img" && !image_url) {
       return res.status(400).json({ error: "missing_image_url" });
     }
 
-    const promptText = prompt_final || prompt || "";
-    const mergedExtra = {
-      ...extra,
-      guidance,
-      prompt_strength,
-      seed,
-      preset_id,
-      preset_version,
-    };
+    const idempotencyKey =
+      req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || null;
 
-    // -------------------------------
-    // BYPASS TEST MODE
-    // -------------------------------
+    // ---- test_mode: bypass sans appel provider ----
     if (test_mode === true) {
       const jobId = `test_${Date.now()}_${randomUUID()}`;
-      const buffer = Buffer.from(ONE_BY_ONE_PNG_BASE64, "base64");
-      const filename = `gen/${user_id}/${jobId}.png`;
+      const buf = Buffer.from(ONE_BY_ONE_PNG_BASE64, "base64");
+      const url = await uploadOutput(buf, "image/png", user_id);
 
-      const { error: upErr } = await supabaseAdmin.storage
-        .from(BUCKET)
-        .upload(filename, buffer, {
-          contentType: "image/png",
-          upsert: false,
-        });
-
-      if (upErr)
-        return res
-          .status(500)
-          .json({ error: "upload_failed", details: upErr.message });
-
-      const { data: pub } = supabaseAdmin.storage
-        .from(BUCKET)
-        .getPublicUrl(filename);
+      await insertPhotosMeta({
+        user_id,
+        mode,
+        model: "test_mode_dummy",
+        prompt: promptText || "(test)",
+        aspect_ratio,
+        image_url: url,
+        source,
+        created_at: new Date().toISOString(),
+      });
 
       return res.status(200).json({
         ok: true,
         job_id: jobId,
-        user_id,
-        model: "test_mode_dummy",
         mode,
-        image_url: pub?.publicUrl || null,
-        source_url: null,
+        model: "test_mode_dummy",
+        image_url: url,
         test_mode: true,
         idempotency_key: idempotencyKey,
       });
     }
 
-    // ---- Replicate requis en prod réelle ----
-    if (!replicate)
-      return res.status(500).json({ error: "missing_env_replicate" });
+    // ---- Crédit: pré-débit (best-effort) ----
+    await safeDebitCredit({ user_id, amount: 1, op: "debit" });
 
-    // ---- Crédits : pré-débit ----
-    let debited = false;
-    {
-      const { error: debitErr } = await supabaseAdmin.rpc("debit_credits", {
-        p_user_id: user_id,
-        p_amount: 1,
-      });
-      if (debitErr) {
-        const msg = String(debitErr.message || "");
-        if (
-          msg.includes("insufficient_credits") ||
-          msg.includes("no_credits_row")
-        ) {
-          return res.status(402).json({ error: "insufficient_credits" });
-        }
-        return res.status(500).json({ error: "debit_failed", details: msg });
-      }
-      debited = true;
-    }
+    // ---- Choix modèle & inputs ----
+    const modelPath = model_path || MODEL_MAP[model] || model; // accepte slug explicite
+    const input = {
+      prompt: promptText,
+      aspect_ratio,
+      seed,
+      guidance,
+      ...extra,
+    };
 
-    // ---- Choix du modèle & input ----
-    const modelPath = model_path || MODEL_MAP[model] || model;
-    const input = { prompt: promptText, aspect_ratio, ...mergedExtra };
-
-    // Support du negative_prompt uniquement pour FLUX
-    if (negative_prompt && model === "flux") {
+    // Négatif: supporté par FLUX
+    if (negative_prompt && model.startsWith("flux")) {
       input.negative_prompt = negative_prompt;
     }
 
+    // img2img
     if (mode === "img2img") {
-      input.image = image_url;
-      input.image_url = image_url;
-      if (prompt_strength) input.prompt_strength = prompt_strength;
+      input.image = image_url;           // Gen-4 / Flux acceptent "image"
+      input.image_url = image_url;       // compatibilité modèles acceptant image_url
+      if (typeof prompt_strength === "number") {
+        input.prompt_strength = prompt_strength;
+      }
     }
 
     // ---- Appel Replicate ----
     let created;
     try {
-      created = await replicate.predictions.create({
-        model: modelPath,
-        input,
-      });
+      created = await replicate.predictions.create({ model: modelPath, input });
     } catch (err) {
-      if (debited)
-        await supabaseAdmin.rpc("credit_credits", {
-          p_user_id: user_id,
-          p_amount: 1,
-        });
+      // rollback crédit
+      await safeDebitCredit({ user_id, amount: 1, op: "credit" });
       const msg = String(err?.message || err);
-      const tag = /401|unauthorized|auth/i.test(msg)
-        ? "replicate_auth_error"
-        : "replicate_model_error";
+      const tag = /401|unauthorized|auth/i.test(msg) ? "replicate_auth_error" : "replicate_model_error";
       return res.status(500).json({ error: tag, details: msg });
     }
 
     const prediction = await waitForPrediction(created.id);
-    if (prediction?.status !== "succeeded") {
-      if (debited)
-        await supabaseAdmin.rpc("credit_credits", {
-          p_user_id: user_id,
-          p_amount: 1,
-        });
+    if (!prediction || prediction.status !== "succeeded") {
+      await safeDebitCredit({ user_id, amount: 1, op: "credit" });
       return res.status(500).json({
         error: "prediction_failed",
         details: prediction?.error || prediction?.status || "unknown",
       });
     }
 
-    const output = prediction?.output;
-    const rawUrl = Array.isArray(output)
-      ? output[0]
-      : output?.[0] || output;
-    if (!rawUrl) {
-      if (debited)
-        await supabaseAdmin.rpc("credit_credits", {
-          p_user_id: user_id,
-          p_amount: 1,
-        });
-      return res
-        .status(500)
-        .json({ error: "no_output_from_model" });
+    // ---- Récupération de la sortie (URL provider -> buffer) ----
+    const out = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
+    if (!out) {
+      await safeDebitCredit({ user_id, amount: 1, op: "credit" });
+      return res.status(500).json({ error: "no_output_from_model" });
     }
 
-    // ---- Télécharger et enregistrer dans Supabase Storage ----
-    const resp = await fetch(rawUrl);
-    if (!resp.ok) {
-      if (debited)
-        await supabaseAdmin.rpc("credit_credits", {
-          p_user_id: user_id,
-          p_amount: 1,
-        });
-      return res
-        .status(500)
-        .json({ error: "download_failed", details: `status ${resp.status}` });
-    }
+    const { buf, ct } = await downloadBuffer(out);
 
-    const arrBuf = await resp.arrayBuffer();
-    const buffer = Buffer.from(arrBuf);
-    const ct = resp.headers.get("content-type") || "image/jpeg";
-    const ext = pickExtFromContentType(ct);
-    const filename = `gen/${user_id}/${Date.now()}_${randomUUID()}${ext}`;
+    // ---- Upload durable Supabase ----
+    const publicOrSignedUrl = await uploadOutput(buf, ct, user_id);
 
-    const { error: upErr } = await supabaseAdmin.storage
-      .from(BUCKET)
-      .upload(filename, buffer, { contentType: ct, upsert: false });
+    // ---- Meta DB (non bloquant) ----
+    await insertPhotosMeta({
+      user_id,
+      mode,
+      model: modelPath,
+      prompt: promptText,
+      aspect_ratio,
+      seed,
+      image_url: publicOrSignedUrl,
+      source,
+      created_at: new Date().toISOString(),
+    });
 
-    if (upErr) {
-      if (debited)
-        await supabaseAdmin.rpc("credit_credits", {
-          p_user_id: user_id,
-          p_amount: 1,
-        });
-      return res
-        .status(500)
-        .json({ error: "upload_failed", details: upErr.message });
-    }
-
-    const { data: pub } = supabaseAdmin.storage
-      .from(BUCKET)
-      .getPublicUrl(filename);
-
+    // ---- Réponse finale (pas d’URL provider éphémère) ----
     return res.status(200).json({
       ok: true,
       job_id: prediction.id,
-      user_id,
-      model: modelPath,
       mode,
-      image_url: pub?.publicUrl || null,
-      source_url: rawUrl,
+      model: modelPath,
+      image_url: publicOrSignedUrl,
       test_mode: false,
       idempotency_key: idempotencyKey,
-      meta: {
-        prompt_final: promptText,
-        prompt_negative: negative_prompt || null,
-        preset_id: preset_id || null,
-        preset_version: preset_version || null,
-        guidance: guidance ?? null,
-        prompt_strength: prompt_strength ?? null,
-        seed: seed ?? null,
-      },
     });
   } catch (e) {
     return res.status(500).json({
