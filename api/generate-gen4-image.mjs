@@ -16,9 +16,10 @@ function setCORS(req, res) {
   const allowNull = (process.env.ALLOW_NULL_ORIGIN || "true") === "true";
   const reqOrigin = req.headers?.origin;
   const front = process.env.FRONT_ORIGIN || "*";
-  const allowOrigin = allowNull && (reqOrigin === "null" || reqOrigin === null)
-    ? "null"
-    : front;
+  const allowOrigin =
+    allowNull && (reqOrigin === "null" || reqOrigin === null)
+      ? "null"
+      : front;
 
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
@@ -30,29 +31,38 @@ function setCORS(req, res) {
 }
 
 // ---------- ENV ----------
-const SUPABASE_URL   = process.env.SUPABASE_URL;
-const SERVICE_ROLE   = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE;
-const ANON_KEY       = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SERVICE_ROLE =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 
 // Buckets / tables — valeurs par défaut sûres
-const BUCKET_IMAGES  = process.env.BUCKET_IMAGES || "generated_images"; // sorties
-const TABLE_META     = process.env.TABLE_META || "photos_meta";
+const BUCKET_IMAGES = process.env.BUCKET_IMAGES || "generated_images"; // sorties
+const TABLE_META = process.env.TABLE_META || "photos_meta";
 
 // Sortie publique ou privée (signed URL)
-const OUTPUT_PUBLIC       = (process.env.OUTPUT_PUBLIC || "true") === "true";
-const OUTPUT_SIGNED_TTL_S = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7); // 7 jours
+const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC || "true") === "true";
+const OUTPUT_SIGNED_TTL_S = Number(
+  process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7
+); // 7 jours
 
 // ---------- Clients ----------
-const supabaseAuth = (SUPABASE_URL && ANON_KEY)
-  ? createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } })
-  : null;
+const supabaseAuth =
+  SUPABASE_URL && ANON_KEY
+    ? createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } })
+    : null;
 
-const supabaseAdmin = (SUPABASE_URL && SERVICE_ROLE)
-  ? createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } })
-  : null;
+const supabaseAdmin =
+  SUPABASE_URL && SERVICE_ROLE
+    ? createClient(SUPABASE_URL, SERVICE_ROLE, {
+        auth: { persistSession: false },
+      })
+    : null;
 
-const replicate = REPLICATE_API_TOKEN ? new Replicate({ auth: REPLICATE_API_TOKEN }) : null;
+const replicate = REPLICATE_API_TOKEN
+  ? new Replicate({ auth: REPLICATE_API_TOKEN })
+  : null;
 
 // ---------- Modèles ----------
 const MODEL_MAP = {
@@ -78,7 +88,7 @@ async function waitForPrediction(id, timeoutMs = 25000, intervalMs = 1200) {
 function pickExtFromContentType(ct) {
   if (!ct) return ".jpg";
   const v = ct.toLowerCase();
-  if (v.includes("png"))  return ".png";
+  if (v.includes("png")) return ".png";
   if (v.includes("webp")) return ".webp";
   if (v.includes("jpeg") || v.includes("jpg")) return ".jpg";
   return ".jpg";
@@ -93,7 +103,9 @@ async function downloadBuffer(url) {
 }
 
 async function uploadOutput(buffer, contentType, userId) {
-  const filename = `outputs/${userId}/${new Date().toISOString().slice(0,10)}/${randomUUID()}`;
+  const filename = `outputs/${userId}/${new Date()
+    .toISOString()
+    .slice(0, 10)}/${randomUUID()}`;
   const key = `${filename}${pickExtFromContentType(contentType)}`;
 
   const { error } = await supabaseAdmin.storage
@@ -124,7 +136,9 @@ async function safeDebitCredit({ user_id, amount = 1, op = "debit" }) {
     if (error && !/does not exist|not found/i.test(error.message)) {
       throw error;
     }
-  } catch { /* ignore in minimal setups */ }
+  } catch {
+    /* ignore in minimal setups */
+  }
 }
 
 async function insertPhotosMeta(row) {
@@ -140,10 +154,43 @@ async function insertPhotosMeta(row) {
 const ONE_BY_ONE_PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO4B2E0AAAAASUVORK5CYII=";
 
+// --- helpers refs ---
+function collectHttpRefs({
+  reference_images,
+  reference_tags,
+  image_urls,
+  image_url,
+  image,
+  images,
+}) {
+  const refs =
+    (Array.isArray(reference_images) ? reference_images : [])
+      .concat(Array.isArray(image_urls) ? image_urls : [])
+      .concat(typeof image_url === "string" ? [image_url] : [])
+      .concat(typeof image === "string" ? [image] : [])
+      .concat(Array.isArray(images) ? images : []);
+
+  const httpRefs = refs
+    .filter((u) => typeof u === "string" && /^https?:\/\//i.test(u))
+    .slice(0, 3);
+
+  // Tags : valides si alphanum, commencent par lettre, 3–15 chars
+  const validTags = Array.isArray(reference_tags)
+    ? reference_tags
+        .filter(
+          (t) => typeof t === "string" && /^[A-Za-z][A-Za-z0-9]{2,14}$/.test(t)
+        )
+        .slice(0, httpRefs.length)
+    : [];
+
+  return { httpRefs, validTags };
+}
+
 // ---------- HANDLER ----------
 export default async function handler(req, res) {
   setCORS(req, res);
-  if (req.method === "OPTIONS" || req.method === "HEAD") return res.status(204).end();
+  if (req.method === "OPTIONS" || req.method === "HEAD")
+    return res.status(204).end();
 
   // Health
   if (req.method === "GET") {
@@ -162,8 +209,10 @@ export default async function handler(req, res) {
     });
   }
 
-  if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
-  if (!supabaseAuth || !supabaseAdmin) return res.status(500).json({ error: "missing_env_supabase" });
+  if (req.method !== "POST")
+    return res.status(405).json({ error: "method_not_allowed" });
+  if (!supabaseAuth || !supabaseAdmin)
+    return res.status(500).json({ error: "missing_env_supabase" });
   if (!replicate) return res.status(500).json({ error: "missing_env_replicate" });
 
   try {
@@ -172,31 +221,38 @@ export default async function handler(req, res) {
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
     if (!token) return res.status(401).json({ error: "missing_bearer_token" });
 
-    const { data: userData, error: authErr } = await supabaseAuth.auth.getUser(token);
-    if (authErr || !userData?.user) return res.status(401).json({ error: "invalid_token" });
+    const { data: userData, error: authErr } =
+      await supabaseAuth.auth.getUser(token);
+    if (authErr || !userData?.user)
+      return res.status(401).json({ error: "invalid_token" });
     const user_id = userData.user.id;
 
     // ---- Payload ----
     const {
       // “mode” et “model” pilotent tout :
-      mode = "text2img",                               // "text2img" | "img2img"
-      model = "flux",                                   // "flux" | "gen4" | "gen4-turbo"
-      model_path,                                       // surclassement direct (optionnel)
+      mode = "text2img", // "text2img" | "img2img"
+      model = "flux", // "flux" | "gen4" | "gen4-turbo"
+      model_path, // surclassement direct (optionnel)
       // prompts
       prompt_final,
-      prompt,                                           // compat legacy
-      negative_prompt,                                  // pris en charge pour FLUX
-      // img2img
+      prompt, // compat legacy
+      negative_prompt, // pris en charge pour FLUX
+      // images & refs
       image_url,
-      prompt_strength,                                  // 0.0–1.0
+      image_urls, // alias
+      image, // alias string
+      images, // alias array
+      reference_images,
+      reference_tags,
+      prompt_strength, // 0.0–1.0 (Flux)
       // divers
       aspect_ratio = "1:1",
       seed,
       guidance,
       test_mode = false,
       extra = {},
-      source = "figma-admin"
-    } = (req.body || {});
+      source = "figma-admin",
+    } = req.body || {};
 
     if (!["text2img", "img2img"].includes(mode)) {
       return res.status(422).json({ error: "invalid_mode" });
@@ -204,9 +260,6 @@ export default async function handler(req, res) {
     const promptText = prompt_final || prompt || "";
     if (mode === "text2img" && !promptText) {
       return res.status(400).json({ error: "missing_prompt" });
-    }
-    if (mode === "img2img" && !image_url) {
-      return res.status(400).json({ error: "missing_image_url" });
     }
 
     const idempotencyKey =
@@ -243,7 +296,7 @@ export default async function handler(req, res) {
     // ---- Crédit: pré-débit (best-effort) ----
     await safeDebitCredit({ user_id, amount: 1, op: "debit" });
 
-    // ---- Choix modèle & inputs ----
+    // ---- Choix modèle & inputs communs ----
     const modelPath = model_path || MODEL_MAP[model] || model; // accepte slug explicite
     const input = {
       prompt: promptText,
@@ -253,17 +306,73 @@ export default async function handler(req, res) {
       ...extra,
     };
 
-    // Négatif: supporté par FLUX
-    if (negative_prompt && model.startsWith("flux")) {
+    // ----- Normalisation des références -----
+    const { httpRefs, validTags } = collectHttpRefs({
+      reference_images,
+      reference_tags,
+      image_urls,
+      image_url,
+      image,
+      images,
+    });
+
+    // ----- Négatif : supporté par FLUX uniquement -----
+    if (negative_prompt && model === "flux") {
       input.negative_prompt = negative_prompt;
     }
 
-    // img2img
-    if (mode === "img2img") {
-      input.image = image_url;           // Gen-4 / Flux acceptent "image"
-      input.image_url = image_url;       // compatibilité modèles acceptant image_url
-      if (typeof prompt_strength === "number") {
-        input.prompt_strength = prompt_strength;
+    // ----- Branching par modèle / mode -----
+    if (model === "gen4" || model === "gen4-turbo") {
+      // Gen-4 & Turbo : utilisent reference_images (+ reference_tags optionnels)
+      if (mode === "img2img" && httpRefs.length === 0) {
+        // En img2img, au moins 1 ref est nécessaire
+        await safeDebitCredit({ user_id, amount: 1, op: "credit" });
+        return res.status(400).json({ error: "missing_reference_images" });
+      }
+      if (model === "gen4-turbo" && httpRefs.length === 0) {
+        // Turbo : exige au moins 1 référence au global
+        await safeDebitCredit({ user_id, amount: 1, op: "credit" });
+        return res
+          .status(400)
+          .json({ error: "gen4_turbo_requires_reference_image" });
+      }
+      if (httpRefs.length > 0) {
+        input.reference_images = httpRefs.slice(0, 3);
+        if (validTags.length > 0) {
+          input.reference_tags = validTags.slice(0, input.reference_images.length);
+        }
+      }
+      // Pas de prompt_strength côté Runway
+      if ("prompt_strength" in input) delete input.prompt_strength;
+      // Ne PAS renseigner input.image/_url pour Runway refs
+      if ("image" in input) delete input.image;
+      if ("image_url" in input) delete input.image_url;
+    } else if (model === "flux") {
+      // FLUX : img2img classique = image unique
+      if (mode === "img2img") {
+        const first = httpRefs[0];
+        if (!first) {
+          await safeDebitCredit({ user_id, amount: 1, op: "credit" });
+          return res.status(400).json({ error: "missing_image_url" });
+        }
+        input.image = first;
+        input.image_url = first;
+        const effectiveStrength =
+          typeof prompt_strength === "number" ? prompt_strength : 0.6;
+        input.prompt_strength = effectiveStrength;
+      }
+      // (text2img Flux : rien de plus)
+    } else {
+      // Modèle inconnu : tentative générique
+      if (mode === "img2img") {
+        const first = httpRefs[0];
+        if (first) {
+          input.image = first;
+          input.image_url = first;
+        } else {
+          await safeDebitCredit({ user_id, amount: 1, op: "credit" });
+          return res.status(400).json({ error: "missing_image_url" });
+        }
       }
     }
 
@@ -275,7 +384,9 @@ export default async function handler(req, res) {
       // rollback crédit
       await safeDebitCredit({ user_id, amount: 1, op: "credit" });
       const msg = String(err?.message || err);
-      const tag = /401|unauthorized|auth/i.test(msg) ? "replicate_auth_error" : "replicate_model_error";
+      const tag = /401|unauthorized|auth/i.test(msg)
+        ? "replicate_auth_error"
+        : "replicate_model_error";
       return res.status(500).json({ error: tag, details: msg });
     }
 
@@ -289,7 +400,9 @@ export default async function handler(req, res) {
     }
 
     // ---- Récupération de la sortie (URL provider -> buffer) ----
-    const out = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
+    const out = Array.isArray(prediction.output)
+      ? prediction.output[0]
+      : prediction.output;
     if (!out) {
       await safeDebitCredit({ user_id, amount: 1, op: "credit" });
       return res.status(500).json({ error: "no_output_from_model" });
