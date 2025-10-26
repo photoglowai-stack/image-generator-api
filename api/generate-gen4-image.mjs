@@ -1,7 +1,7 @@
-// /api/generate-gen4-image.mjs — Générateur unifié (Flux 1.1 Pro & Runway Gen-4)
+// /api/generate-gen4-image.mjs — Générateur unifié (Flux 1.1 Pro & Runway Gen‑4/ Turbo)
 // • Modes: text2img | img2img
 // • Modèles: flux | gen4 | gen4-turbo  (surcharge possible via model_path)
-// • Flux: T2I = flux-1.1-pro, I2I = Kontext [pro]
+// • Flux: T2I = flux-1.1-pro, I2I = Kontext [pro] (via input_image)
 // • CORS Figma (Origin:null), idempotency, crédits, upload Supabase, insertion photos_meta
 // • Retour: URL Supabase (publique ou signée), jamais l’URL provider
 // • Runtime Node.js (Vercel): pas d’images en réponse (JSON léger)
@@ -71,7 +71,7 @@ const MODEL_MAP = {
 };
 // FLUX variantes
 const FLUX_T2I_MODEL = "black-forest-labs/flux-1.1-pro";
-const FLUX_I2I_MODEL = process.env.FLUX_I2I_MODEL || "black-forest-labs/flux-kontext-pro";
+const FLUX_I2I_MODEL = process.env.FLUX_I2I_MODEL || "black-forest-labs/flux-kontext-pro"; // Kontext pro
 
 const RUNWAY_ASPECT_RATIOS = new Set(["1:1", "16:9", "9:16", "3:2", "2:3", "4:5", "5:4"]);
 
@@ -106,11 +106,11 @@ async function downloadBuffer(url) {
   return { buf, ct, ext: pickExtFromContentType(ct) };
 }
 
-function normalizeAspectRatio(model, requested) {
+function normalizeAspectRatio(modelKind, requested) {
   const fallback = "1:1";
   if (typeof requested !== "string" || requested.trim() === "") return fallback;
   const trimmed = requested.trim();
-  if (model === "gen4" || model === "gen4-turbo") {
+  if (modelKind === "gen4" || modelKind === "gen4-turbo") {
     return RUNWAY_ASPECT_RATIOS.has(trimmed) ? trimmed : fallback;
   }
   return trimmed;
@@ -180,22 +180,31 @@ async function insertPhotosMeta(row) {
 const ONE_BY_ONE_PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO4B2E0AAAAASUVORK5CYII=";
 
-// --- Références : accepte http(s), data: (ignoré), supabase://, storage://, ou chemin brut ---
-function collectRefs({ reference_images, reference_tags, image_urls, image_url, image, images }) {
+// --- Références : accepte http(s), supabase://, storage://, chemin brut — ignore blob:/data: ---
+function collectRefs(input) {
+  const {
+    reference_images, reference_image, ref_images,
+    image_urls, image_url, input_image_url,
+    image, images, input_images
+  } = input || {};
+
   const refs = []
     .concat(Array.isArray(reference_images) ? reference_images : [])
+    .concat(Array.isArray(ref_images)        ? ref_images        : [])
+    .concat(reference_image ? [reference_image] : [])
     .concat(Array.isArray(image_urls)       ? image_urls       : [])
     .concat(typeof image_url === "string"   ? [image_url]      : [])
+    .concat(typeof input_image_url === "string" ? [input_image_url] : [])
     .concat(typeof image === "string"       ? [image]          : [])
-    .concat(Array.isArray(images)           ? images           : []);
+    .concat(Array.isArray(images)           ? images           : [])
+    .concat(Array.isArray(input_images)     ? input_images     : []);
 
   const normalized = refs
     .map((v) => {
       if (typeof v !== "string") return null;
       const trimmed = v.trim();
-      if (!trimmed) return null;
+      if (!trimmed || /^blob:|^data:/i.test(trimmed)) return null; // on ignore blob:/data:
       if (/^https?:\/\//i.test(trimmed))   return { kind: "http",    value: trimmed };
-      if (/^data:/i.test(trimmed))         return { kind: "data",    value: trimmed }; // ignoré
       if (/^supabase:\/\//i.test(trimmed)) return { kind: "storage", value: trimmed.slice("supabase://".length) };
       if (/^storage:\/\//i.test(trimmed))  return { kind: "storage", value: trimmed.slice("storage://".length) };
       return { kind: "storage", value: trimmed }; // chemin brut
@@ -203,8 +212,8 @@ function collectRefs({ reference_images, reference_tags, image_urls, image_url, 
     .filter(Boolean)
     .slice(0, 3);
 
-  const validTags = Array.isArray(reference_tags)
-    ? reference_tags
+  const validTags = Array.isArray(input?.reference_tags)
+    ? input.reference_tags
         .filter((t) => typeof t === "string" && /^[A-Za-z][A-Za-z0-9]{2,14}$/.test(t))
         .slice(0, normalized.length)
     : [];
@@ -292,7 +301,6 @@ async function resolveReferenceUrls(entries, userId) {
       const u = await resolveStorageReference(e, userId);
       if (u) out.push(u);
     }
-    // data: ignoré (Replicate attend des URLs distantes)
   }
   return out;
 }
@@ -340,7 +348,7 @@ export default async function handler(req, res) {
       // prompts
       prompt_final,
       prompt,                           // compat legacy
-      negative_prompt,                  // pris en charge pour FLUX
+      negative_prompt,                  // pris en charge pour FLUX (T2I uniquement)
       // images & refs
       image_url,
       image_urls,
@@ -373,14 +381,13 @@ export default async function handler(req, res) {
       const jobId = `test_${Date.now()}_${randomUUID()}`;
       const buf = Buffer.from(ONE_BY_ONE_PNG_BASE64, "base64");
       const url = await uploadOutput(buf, "image/png", user_id);
-      const normalizedAspect = normalizeAspectRatio(model, aspect_ratio);
 
       await insertPhotosMeta({
         user_id,
         mode,
         model: "test_mode_dummy",
         prompt: promptText || "(test)",
-        aspect_ratio: normalizedAspect,
+        aspect_ratio: "1:1",
         image_url: url,
         source,
         created_at: new Date().toISOString(),
@@ -404,8 +411,15 @@ export default async function handler(req, res) {
     await safeDebitCredit({ user_id, amount: 1, op: "debit" });
 
     // ---- Choix modèle & inputs communs ----
-    let modelPath         = model_path || MODEL_MAP[model] || model; // accepte slug explicite
-    const normalizedAspect= normalizeAspectRatio(model, aspect_ratio);
+    let modelPath = model_path || MODEL_MAP[model] || model; // accepte slug explicite
+    let modelKind = model; // 'flux' | 'gen4' | 'gen4-turbo'
+    if (model_path) {
+      if (/runwayml\\/gen4-image-turbo/i.test(model_path)) modelKind = "gen4-turbo";
+      else if (/runwayml\\/gen4-image/i.test(model_path))   modelKind = "gen4";
+      else if (/black-forest-labs\\/flux/i.test(model_path)) modelKind = "flux";
+    }
+
+    const normalizedAspect= normalizeAspectRatio(modelKind, aspect_ratio);
     const normalizedSeed  = normalizeSeed(seed);
     const guidanceValue   = normalizeGuidanceValue(guidance);
 
@@ -417,31 +431,29 @@ export default async function handler(req, res) {
     if (normalizedSeed !== undefined) input.seed = normalizedSeed;
 
     // ----- Normalisation / résolution des références -----
-    const { normalized: refEntries, validTags } = collectRefs({
-      reference_images, reference_tags, image_urls, image_url, image, images,
-    });
+    const { normalized: refEntries, validTags } = collectRefs(req.body || {});
     const resolvedRefs = await resolveReferenceUrls(refEntries, user_id);
 
     // -- Sélection finale du modèle FLUX en fonction du mode effectif (T2I vs I2I)
-    if (model === "flux") {
+    if (modelKind === "flux") {
       const hasRef = resolvedRefs.length > 0;
       const wantsI2I = (mode === "img2img") || (hasRef && mode === "text2img"); // auto i2i si ref fournie
       modelPath = wantsI2I ? FLUX_I2I_MODEL : FLUX_T2I_MODEL;
     }
 
-    // ----- Négatif : supporté par FLUX uniquement -----
-    if (negative_prompt && model === "flux") {
+    // ----- Négatif : supporté par FLUX T2I uniquement -----
+    if (negative_prompt && modelKind === "flux" && modelPath === FLUX_T2I_MODEL) {
       input.negative_prompt = negative_prompt;
     }
 
     // ----- Branching par modèle / mode -----
-    if (model === "gen4" || model === "gen4-turbo") {
+    if (modelKind === "gen4" || modelKind === "gen4-turbo") {
       // Runway : references[] (+ tags optionnels), pas de prompt_strength
       if (mode === "img2img" && resolvedRefs.length === 0) {
         await safeDebitCredit({ user_id, amount: 1, op: "credit" });
         return res.status(400).json({ error: "missing_reference_images" });
       }
-      if (model === "gen4-turbo" && resolvedRefs.length === 0) {
+      if (modelKind === "gen4-turbo" && resolvedRefs.length === 0) {
         await safeDebitCredit({ user_id, amount: 1, op: "credit" });
         return res.status(400).json({ error: "gen4_turbo_requires_reference_image" });
       }
@@ -457,8 +469,8 @@ export default async function handler(req, res) {
       delete input.image;
       delete input.image_url;
 
-    } else if (model === "flux") {
-      // FLUX : si img2img => route vers Kontext [pro] (image editing)
+    } else if (modelKind === "flux") {
+      // FLUX : si img2img => route Kontext [pro] (image editing)
       const first = resolvedRefs[0];
       const wantsI2I = mode === "img2img" || (!!first && mode === "text2img"); // auto-img2img si ref
       const effectiveMode = wantsI2I ? "img2img:auto" : mode;
@@ -469,17 +481,21 @@ export default async function handler(req, res) {
           await safeDebitCredit({ user_id, amount: 1, op: "credit" });
           return res.status(400).json({ error: "missing_image_url" });
         }
-        // Kontext attend `image` (pas `image_url`) et n'utilise pas prompt_strength
-        input.image = first;
+        // ✅ Kontext attend `input_image` (pas `image`/`image_url`) et n'utilise pas prompt_strength
+        input.input_image = first;
+        input.aspect_ratio = "match_input_image"; // recommandé pour l'édition
+        delete input.image;
         delete input.image_url;
         delete input.prompt_strength;
+        delete input.negative_prompt;
+        delete input.guidance_scale; // non pertinent ici
       } else {
         // FLUX T2I (flux-1.1-pro)
         delete input.image;
         delete input.image_url;
         delete input.prompt_strength;
+        if (guidanceValue !== undefined) input.guidance_scale = guidanceValue;
       }
-      if (guidanceValue !== undefined) input.guidance_scale = guidanceValue;
 
     } else {
       // Fallback générique (autres modèles Replicate)
@@ -531,7 +547,7 @@ export default async function handler(req, res) {
       mode,
       model: modelPath,
       prompt: promptText,
-      aspect_ratio: normalizedAspect,
+      aspect_ratio: input.aspect_ratio || normalizedAspect,
       seed: normalizedSeed,
       image_url: publicOrSignedUrl,
       source,
@@ -545,6 +561,7 @@ export default async function handler(req, res) {
       mode,
       model: modelPath,
       image_url: publicOrSignedUrl,
+      debug: { model_kind: modelKind, has_refs: resolvedRefs.length },
       test_mode: false,
       idempotency_key: idempotencyKey,
     });
