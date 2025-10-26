@@ -213,7 +213,6 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "method_not_allowed" });
   if (!supabaseAuth || !supabaseAdmin)
     return res.status(500).json({ error: "missing_env_supabase" });
-  if (!replicate) return res.status(500).json({ error: "missing_env_replicate" });
 
   try {
     // ---- Auth: Bearer Supabase JWT ----
@@ -266,7 +265,12 @@ export default async function handler(req, res) {
       req.headers["idempotency-key"] || req.headers["Idempotency-Key"] || null;
 
     // ---- test_mode: bypass sans appel provider ----
-    if (test_mode === true) {
+    const isTestMode = test_mode === true;
+
+    if (!replicate && !isTestMode)
+      return res.status(500).json({ error: "missing_env_replicate" });
+
+    if (isTestMode) {
       const jobId = `test_${Date.now()}_${randomUUID()}`;
       const buf = Buffer.from(ONE_BY_ONE_PNG_BASE64, "base64");
       const url = await uploadOutput(buf, "image/png", user_id);
