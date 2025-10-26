@@ -1,20 +1,17 @@
 {
   "version": 2,
+  "functions": {
+    "api/*.mjs": { "runtime": "nodejs20.x", "maxDuration": 60 },
+    "api/*.js":  { "runtime": "nodejs20.x", "maxDuration": 60 }
+  },
   "routes": [
-    {
-      "src": "/(v1|api)/(.*)",
-      "headers": {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET,POST,OPTIONS,HEAD",
-        "Access-Control-Allow-Headers": "content-type, authorization, idempotency-key, x-admin-token"
-      },
-      "continue": true
-    },
+    { "src": "/(v1|api)/(.*)", "continue": true },
 
     { "src": "/v1/jobs$", "dest": "/api/v1-jobs.mjs" },
     { "src": "/v1/jobs/(.*)", "dest": "/api/v1-jobs.mjs" },
 
     { "src": "/api/generate-gen4-image$", "dest": "/api/generate-gen4-image.mjs" },
-    { "src": "/api/credits$", "dest": "/api/credits.mjs" }
+    { "src": "/api/storage-signed-upload$", "dest": "/api/storage-signed-upload.js" },
+    { "src": "/api/system$", "dest": "/api/system.js" }
   ]
 }
