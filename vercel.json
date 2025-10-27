@@ -1,6 +1,12 @@
 {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
-  "functions": { "runtime": "nodejs22.x" },
+  "functions": {
+    "api/**/*.mjs": {
+      "maxDuration": 25,
+      "memory": 1024
+    }
+  },
   "routes": [
     { "src": "/v1/jobs$", "dest": "/api/v1-jobs.mjs" },
     { "src": "/v1/jobs/(.*)", "dest": "/api/v1-jobs.mjs" },
