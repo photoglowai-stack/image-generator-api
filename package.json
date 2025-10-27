@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "version": "1.0.0",
-  "engines": { "node": ">=20" },
+  "engines": { "node": "22.x" },  // ou "20.x" si tu préfères rester sur 20 LTS
   "dependencies": {
     "@supabase/supabase-js": "^2.44.2",
     "replicate": "^0.31.0"
