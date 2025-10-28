@@ -6,30 +6,18 @@
 
 export const config = { runtime: "nodejs" };
 
-import { createClient } from "@supabase/supabase-js";
 import { randomUUID } from "crypto";
 
+import { setCORS } from "../lib/http.mjs";
+import {
+  ensureSupabaseClient,
+  getSupabaseAnon,
+  getSupabaseEnv,
+  getSupabaseServiceRole,
+} from "../lib/supabase.mjs";
+
 // ---------- CORS ----------
-function setCORS(req, res) {
-  const allowNull = (process.env.ALLOW_NULL_ORIGIN || "true") === "true";
-  const reqOrigin = req.headers?.origin;
-  const front = process.env.FRONT_ORIGIN || "*";
-  const allowOrigin =
-    allowNull && (reqOrigin === "null" || reqOrigin === null) ? "null" : front;
-
-  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "content-type, authorization, idempotency-key, x-admin-token"
-  );
-  res.setHeader("Access-Control-Max-Age", "86400");
-}
-
 // ---------- ENV ----------
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE;
-const ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 
 // Buckets / tables
@@ -51,7 +39,7 @@ const UPLOAD_SIGNED_TTL_S = Number(process.env.UPLOAD_SIGNED_TTL_S || 60 * 15);
 // Modèles
 const FLUX_T2I_MODEL = "black-forest-labs/flux-1.1-pro";
 const FLUX_I2I_MODEL = process.env.FLUX_I2I_MODEL || "black-forest-labs/flux-kontext-pro";
-const MODEL_MAP = {
+export const MODEL_MAP = {
   flux: FLUX_T2I_MODEL,
   gen4: "runwayml/gen4-image",
   "gen4-turbo": "runwayml/gen4-image-turbo"
@@ -59,13 +47,8 @@ const MODEL_MAP = {
 const RUNWAY_AR = new Set(["1:1", "16:9", "9:16", "3:2", "2:3", "4:5", "5:4"]);
 
 // ---------- Clients ----------
-const supabaseAuth = (SUPABASE_URL && ANON_KEY)
-  ? createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } })
-  : null;
-
-const supabaseAdmin = (SUPABASE_URL && SERVICE_ROLE)
-  ? createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } })
-  : null;
+const supabaseAuth = getSupabaseAnon();
+const supabaseAdmin = getSupabaseServiceRole();
 
 // ---------- Utils ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -119,16 +102,6 @@ function normalizeGuidanceValue(value) {
   if (value === null || value === undefined || value === "") return undefined;
   const parsed = typeof value === "string" ? Number.parseFloat(value) : Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-// 0–1 or 0–100
-function normalizeStrength(v) {
-  if (v === null || v === undefined || v === "") return 0.6;
-  const n = typeof v === "string" ? parseFloat(v) : Number(v);
-  if (!Number.isFinite(n)) return 0.6;
-  const z = n > 1 ? n / 100 : n;
-  const c = Math.max(0, Math.min(z, 1));
-  return c <= 0.01 ? 0.6 : c;
 }
 
 async function uploadOutput(buffer, contentType, userId) {
@@ -277,13 +250,14 @@ export default async function handler(req, res) {
 
   // Health
   if (req.method === "GET") {
+    const env = getSupabaseEnv();
     return res.status(200).json({
       ok: true,
       endpoint: "generate-unified",
       has_env: {
-        SUPABASE_URL: !!SUPABASE_URL,
-        SERVICE_ROLE: !!SERVICE_ROLE,
-        ANON_KEY: !!ANON_KEY,
+        SUPABASE_URL: env.hasUrl,
+        SERVICE_ROLE: env.hasService,
+        ANON_KEY: env.hasAnon,
         REPLICATE_API_TOKEN: !!REPLICATE_API_TOKEN,
         BUCKET_IMAGES,
         TABLE_META,
@@ -294,6 +268,9 @@ export default async function handler(req, res) {
 
   if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
   if (!supabaseAuth || !supabaseAdmin) return res.status(500).json({ error: "missing_env_supabase" });
+
+  ensureSupabaseClient(supabaseAuth, "anon");
+  ensureSupabaseClient(supabaseAdmin, "service");
 
   try {
     // Auth (Bearer Supabase user)
@@ -353,7 +330,8 @@ export default async function handler(req, res) {
 
       return res.status(200).json({
         ok: true, job_id: jobId, mode, model: "test_mode_dummy",
-        image_url: url, test_mode: true, idempotency_key: idempotencyKey
+        image_url: url, test_mode: true, idempotency_key: idempotencyKey,
+        status: "succeeded",
       });
     }
 
@@ -410,7 +388,6 @@ export default async function handler(req, res) {
         }
       }
       if (guidanceValue !== undefined) input.cfg_scale = guidanceValue;
-      delete input.prompt_strength;
       delete input.image;
       delete input.image_url;
 
@@ -425,7 +402,6 @@ export default async function handler(req, res) {
       input.aspect_ratio = "match_input_image";
       delete input.image;
       delete input.image_url;
-      delete input.prompt_strength;
       if ("negative_prompt" in input) delete input.negative_prompt;
       if (guidanceValue !== undefined) input.guidance_scale = guidanceValue;
 
@@ -435,7 +411,6 @@ export default async function handler(req, res) {
       if (guidanceValue !== undefined) input.guidance_scale = guidanceValue;
       delete input.image;
       delete input.image_url;
-      delete input.prompt_strength;
 
     } else {
       // Autres
@@ -503,7 +478,8 @@ export default async function handler(req, res) {
       image_url: publicOrSignedUrl,
       debug: { has_refs: resolvedRefs.length },
       test_mode: false,
-      idempotency_key: idempotencyKey
+      idempotency_key: idempotencyKey,
+      status: prediction.status,
     });
   } catch (e) {
     return res.status(500).json({

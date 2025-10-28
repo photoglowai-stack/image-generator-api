@@ -2,29 +2,27 @@
 // Unique endpoint v1 : reçoit le payload standard, délègue à /api/generate-gen4-image.mjs,
 // gère CORS (Origin: null pour Figma) et renvoie un JSON stable {ok, job_id, status, image_url, meta}
 
-function setCORS(req, res) {
-  const origin = req.headers.origin || "";
-  const allowNull = process.env.ALLOW_NULL_ORIGIN === "true";
-  const front = process.env.FRONT_ORIGIN || "*";
-  const allowOrigin = (allowNull && origin === "null") ? "null" : front;
-  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key");
-  res.setHeader("Access-Control-Max-Age", "86400");
-}
+import unified, { MODEL_MAP } from "./generate-gen4-image.mjs";
+import { createInMemoryResponse, setCORS } from "../lib/http.mjs";
+
+const ALLOWED_MODES = new Set(["text2img", "img2img"]);
+const ALLOWED_MODELS = new Set(Object.keys(MODEL_MAP));
 
 export default async function handler(req, res) {
-  setCORS(req, res);
+  setCORS(req, res, {
+    allowMethods: "GET,POST,OPTIONS",
+    allowHeaders: "content-type, authorization, idempotency-key",
+  });
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST")   return res.status(405).json({ ok: false, error: "method_not_allowed" });
 
   try {
     const b = req.body || {};
     // Validation minimale (le front Figma valide déjà le reste)
-    if (!b?.mode || !["text2img","img2img"].includes(b.mode)) {
+    if (!b?.mode || !ALLOWED_MODES.has(b.mode)) {
       return res.status(422).json({ ok:false, error:"invalid_mode" });
     }
-    if (!b?.model || !["flux","gen4"].includes(b.model)) {
+    if (!b?.model || !ALLOWED_MODELS.has(b.model)) {
       return res.status(422).json({ ok:false, error:"invalid_model" });
     }
     if (!b?.prompt_final || typeof b.prompt_final !== "string" || b.prompt_final.length < 5) {
@@ -35,12 +33,6 @@ export default async function handler(req, res) {
     }
 
     // --------- Délégation à ta fonction unifiée existante ----------
-    // On appelle /api/generate-gen4-image.mjs (elle sait gérer flux OU gen4).
-    // On re-map juste les clés demandées.
-    const host = req.headers["x-forwarded-host"] || req.headers.host;
-    const proto = (req.headers["x-forwarded-proto"] || "https");
-    const url = `${proto}://${host}/api/generate-gen4-image`;
-
     const providerPayload = {
       mode: b.mode,                  // "text2img" | "img2img"
       model: b.model,                // "flux" | "gen4"  (le fichier interne mappe vers Replicate)
@@ -55,27 +47,19 @@ export default async function handler(req, res) {
       test_mode: !!b.test_mode
     };
 
-    const forwardedHeaders = {
-      "Content-Type": "application/json",
-    };
-    // On transmet le Bearer token au besoin (ton endpoint /api/generate-gen4-image le demande)
-    if (req.headers.authorization) forwardedHeaders["Authorization"] = req.headers.authorization;
-    if (req.headers["idempotency-key"]) forwardedHeaders["Idempotency-Key"] = req.headers["idempotency-key"];
+    const { res: memoryRes, result } = createInMemoryResponse();
+    const forwardReq = Object.create(req);
+    forwardReq.method = "POST";
+    forwardReq.body = providerPayload;
 
-    const r = await fetch(url, {
-      method: "POST",
-      headers: forwardedHeaders,
-      body: JSON.stringify(providerPayload)
-    });
+    await unified(forwardReq, memoryRes);
+    const { statusCode, payload } = await result;
 
-    const data = await r.json().catch(() => ({}));
-
-    if (!r.ok || !data?.ok) {
-      // Normalise l’erreur côté v1
-      return res.status(r.status || 500).json({
+    if (!payload?.ok) {
+      return res.status(statusCode || 500).json({
         ok: false,
-        error: data?.error || "provider_failed",
-        details: data
+        error: payload?.error || "provider_failed",
+        details: payload,
       });
     }
 
@@ -83,9 +67,9 @@ export default async function handler(req, res) {
     // 🔒 Toujours URL Supabase (jamais replicate.delivery) — ton endpoint interne le fait déjà.
     return res.status(200).json({
       ok: true,
-      job_id: data.job_id || null,
-      status: data.status || "succeeded",
-      image_url: data.image_url || null,
+      job_id: payload.job_id || null,
+      status: payload.status || "succeeded",
+      image_url: payload.image_url || null,
       meta: {
         prompt_final: b.prompt_final,
         prompt_negative: b.negative_prompt || null,

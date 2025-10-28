@@ -1,22 +1,11 @@
 // /api/v1-preview.mjs
 export const config = { runtime: "nodejs" };
 
-import { createClient } from "@supabase/supabase-js";
-
-/* ---------- CORS ---------- */
-function setCORS(req, res) {
-  const allowNull = (process.env.ALLOW_NULL_ORIGIN || "true") === "true";
-  const reqOrigin = req.headers.origin ?? null;
-  const front = process.env.FRONT_ORIGIN || "*";
-  const allowOrigin = allowNull && (reqOrigin === "null" || reqOrigin === null) ? "null" : front;
-  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "content-type, authorization, idempotency-key");
-  res.setHeader("Access-Control-Max-Age", "86400");
-}
+import { setCORS } from "../lib/http.mjs";
+import { ensureSupabaseClient, getSupabaseServiceRole } from "../lib/supabase.mjs";
 
 /* ---------- Supabase ---------- */
-const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const sb = getSupabaseServiceRole();
 
 /* ---------- ENV ---------- */
 const POL_TOKEN  = process.env.POLLINATIONS_TOKEN || "";
@@ -128,11 +117,16 @@ async function uploadToSupabase(path, bytes) {
 
 /* ---------- Handler ---------- */
 export default async function handler(req, res) {
-  setCORS(req, res);
+  setCORS(req, res, {
+    allowMethods: "GET,POST,OPTIONS",
+    allowHeaders: "content-type, authorization, idempotency-key",
+  });
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST")   return res.status(405).json({ ok:false, error:"method_not_allowed" });
 
   try {
+    if (!sb) return res.status(500).json({ ok:false, error:"missing_env_supabase" });
+    ensureSupabaseClient(sb, "service");
     const form = (req.body && typeof req.body === "object") ? req.body : {};
     const key  = exactKey(form);
     const seed = Number.isFinite(Number(form?.seed)) ? Math.max(0, Math.floor(Number(form.seed))) : DEFAULT_SEED;
