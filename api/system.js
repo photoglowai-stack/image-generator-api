@@ -1,55 +1,3 @@
-// /api/system.js
-// GET /api/system?ping  → {ok:true,msg:"pong"}
-// GET /api/system       → diagnostic JSON (DB + buckets)
-
-import {
-  getSupabaseAnon,
-  getSupabaseEnv,
-  getSupabaseServiceRole,
-} from "../lib/supabase.mjs";
-
-// --- Config buckets depuis ENV (avec valeurs par défaut) ---
-export const BUCKET_UPLOADS  = process.env.BUCKET_UPLOADS  || "photos";
-export const BUCKET_IMAGES   = process.env.BUCKET_IMAGES   || "generated_images";
-
-// --- Clients Supabase ---
-// Admin (service role) : nécessaire pour listBuckets / opérations serveur
-export const supabaseAdmin = getSupabaseServiceRole();
-
-// Public (anon) : lecture simple côté app
-export const supabaseAnon = getSupabaseAnon({ persistSession: true });
-
-// --- Helpers Storage réutilisables ailleurs (importables depuis ./api/system.js) ---
-export async function uploadBufferToBucket(bucket, path, buffer, contentType = "image/jpeg") {
-  const { data, error } = await supabaseAdmin
-    .storage
-    .from(bucket)
-    .upload(path, buffer, { contentType, upsert: true });
-  if (error) throw error;
-  return data; // { path, id }
-}
-
-export function getPublicUrl(bucket, path) {
-  const { data } = supabaseAdmin.storage.from(bucket).getPublicUrl(path);
-  return data.publicUrl;
-}
-
-export async function getSignedUrl(bucket, path, expiresInSec = 3600) {
-  const { data, error } = await supabaseAdmin
-    .storage
-    .from(bucket)
-    .createSignedUrl(path, expiresInSec);
-  if (error) throw error;
-  return data.signedUrl;
-}
-
-// Raccourcis projet
-export const uploadUserPhoto = (userId, filename, buffer) =>
-  uploadBufferToBucket(BUCKET_UPLOADS, `${userId}/raw/${filename}`, buffer);
-
-export const saveGeneratedImage = (userId, jobId, buffer) =>
-  uploadBufferToBucket(BUCKET_IMAGES, `${userId}/generated/${jobId}.png`, buffer);
-
 // --- Endpoint health/diagnostic ---
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -59,7 +7,11 @@ export default async function handler(req, res) {
   if (req.url.endsWith("/ping")) return res.status(200).json({ ok: true, msg: "pong" });
 
   try {
+    // Récupérer les informations d'environnement et valider les clients Supabase
     const env = getSupabaseEnv();
+    ensureSupabaseClient(supabaseAdmin, "service");
+    ensureSupabaseClient(supabaseAnon, "anon");
+
     const checks = [];
 
     // 1) DB read test (photos_meta)
@@ -74,7 +26,7 @@ export default async function handler(req, res) {
       checks.push({ key: "db_photos_meta", ok: false, error: "missing_supabase_anon_client" });
     }
 
-    // 2) Buckets: on liste via admin (service role), puis on vérifie les 2 noms ENV
+    // 2) Vérification des Buckets avec admin
     if (supabaseAdmin) {
       try {
         const { data: buckets, error } = await supabaseAdmin.storage.listBuckets();
@@ -99,6 +51,7 @@ export default async function handler(req, res) {
       checks.push({ key: "buckets_list", ok: false, error: "missing_supabase_service_client" });
     }
 
+    // Retourner la réponse avec le résultat de tous les checks
     const ok = checks.every(c => c.ok);
     const payload = {
       ok,
