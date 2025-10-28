@@ -8,34 +8,20 @@
 
 export const config = { runtime: "nodejs" };
 
-import { createClient } from "@supabase/supabase-js";
+import { setCORS } from "../lib/http.mjs";
+import {
+  ensureSupabaseClient,
+  getSupabaseAnon,
+  getSupabaseServiceRole,
+} from "../lib/supabase.mjs";
 
-// ---------- CORS ----------
-function setCORS(res) {
-  const origin = process.env.FRONT_ORIGIN || "*";
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "content-type, authorization, idempotency-key"
-  );
-}
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const ANON_KEY     = process.env.SUPABASE_ANON_KEY;
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
   .split(",")
   .map(s => s.trim().toLowerCase());
 
 // Clients Supabase
-const supabaseAuth = (SUPABASE_URL && ANON_KEY)
-  ? createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } })
-  : null;
-
-const supabaseAdmin = (SUPABASE_URL && SERVICE_ROLE)
-  ? createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } })
-  : null;
+const supabaseAuth = getSupabaseAnon();
+const supabaseAdmin = getSupabaseServiceRole();
 
 // Résoudre un user_id à partir d'un email (Admin API)
 async function resolveUserIdByEmail(email) {
@@ -48,7 +34,10 @@ async function resolveUserIdByEmail(email) {
 }
 
 export default async function handler(req, res) {
-  setCORS(res);
+  setCORS(req, res, {
+    allowMethods: "GET,POST,OPTIONS",
+    allowHeaders: "content-type, authorization, idempotency-key",
+  });
   if (req.method === "OPTIONS") return res.status(204).end();
   res.setHeader("Content-Type", "application/json; charset=utf-8");
 
@@ -57,9 +46,9 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       has_env: {
-        SUPABASE_URL: !!SUPABASE_URL,
-        SUPABASE_SERVICE_ROLE_KEY: !!SERVICE_ROLE,
-        SUPABASE_ANON_KEY: !!ANON_KEY
+        SUPABASE_URL: !!process.env.SUPABASE_URL,
+        SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY || !!process.env.SERVICE_ROLE,
+        SUPABASE_ANON_KEY: !!process.env.SUPABASE_ANON_KEY
       }
     });
   }
@@ -67,6 +56,9 @@ export default async function handler(req, res) {
   if (!supabaseAuth || !supabaseAdmin) {
     return res.status(500).json({ success: false, error: "missing_env" });
   }
+
+  ensureSupabaseClient(supabaseAuth, "anon");
+  ensureSupabaseClient(supabaseAdmin, "service");
 
   // --- Auth Bearer (utilisateur courant) ---
   const auth = req.headers.authorization || "";

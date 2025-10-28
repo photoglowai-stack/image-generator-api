@@ -2,7 +2,12 @@
 // GET /api/system?ping  → {ok:true,msg:"pong"}
 // GET /api/system       → diagnostic JSON (DB + buckets)
 
-import { createClient } from "@supabase/supabase-js";
+import {
+  ensureSupabaseClient,
+  getSupabaseAnon,
+  getSupabaseEnv,
+  getSupabaseServiceRole,
+} from "../lib/supabase.mjs";
 
 // --- Config buckets depuis ENV (avec valeurs par défaut) ---
 export const BUCKET_UPLOADS  = process.env.BUCKET_UPLOADS  || "photos";
@@ -10,18 +15,10 @@ export const BUCKET_IMAGES   = process.env.BUCKET_IMAGES   || "generated_images"
 
 // --- Clients Supabase ---
 // Admin (service role) : nécessaire pour listBuckets / opérations serveur
-export const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE,
-  { auth: { persistSession: false } }
-);
+export const supabaseAdmin = getSupabaseServiceRole();
 
 // Public (anon) : lecture simple côté app
-export const supabaseAnon = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY,
-  { auth: { persistSession: true } }
-);
+export const supabaseAnon = getSupabaseAnon({ persistSession: true });
 
 // --- Helpers Storage réutilisables ailleurs (importables depuis ./api/system.js) ---
 export async function uploadBufferToBucket(bucket, path, buffer, contentType = "image/jpeg") {
@@ -63,6 +60,9 @@ export default async function handler(req, res) {
   if (req.url.endsWith("/ping")) return res.status(200).json({ ok: true, msg: "pong" });
 
   try {
+    const env = getSupabaseEnv();
+    ensureSupabaseClient(supabaseAdmin, "service");
+    ensureSupabaseClient(supabaseAnon, "anon");
     const checks = [];
 
     // 1) DB read test (photos_meta)
@@ -96,7 +96,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ok: checks.every(c => c.ok),
-      env: { BUCKET_UPLOADS, BUCKET_IMAGES },
+      env: { BUCKET_UPLOADS, BUCKET_IMAGES, supabase: env },
       checks
     });
   } catch (e) {
