@@ -1,12 +1,15 @@
 // /api/presets.js
 // Lecture READ-ONLY des catégories + presets
-import { createClient } from "@supabase/supabase-js";
+import { ensureSupabaseClient, getSupabaseAnon } from "../lib/supabase.mjs";
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, { auth: { persistSession: false } });
+const supabase = getSupabaseAnon();
 
 export default async function handler(req, res) {
   try {
     if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
+
+    if (!supabase) return res.status(500).json({ error: "missing_env_supabase" });
+    ensureSupabaseClient(supabase, "anon");
 
     const { data: cats, error: e1 } = await supabase
       .from("categories")
