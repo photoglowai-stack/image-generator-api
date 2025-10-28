@@ -3,7 +3,7 @@ export const config = { runtime: "nodejs" };
 
 import { createClient } from "@supabase/supabase-js";
 
-// ---------- CORS ----------
+/* ---------- CORS ---------- */
 function setCORS(req, res) {
   const allowNull = (process.env.ALLOW_NULL_ORIGIN || "true") === "true";
   const reqOrigin = req.headers.origin ?? null;
@@ -15,9 +15,10 @@ function setCORS(req, res) {
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 
+/* ---------- Supabase ---------- */
 const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
-// ---------- ENV ----------
+/* ---------- ENV ---------- */
 const POL_TOKEN  = process.env.POLLINATIONS_TOKEN || "";
 const BUCKET     = process.env.PREVIEW_BUCKET || "generated_images";
 const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC || "true") === "true";
@@ -25,49 +26,88 @@ const SIGNED_TTL_S  = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7
 const CACHE_CONTROL = String(process.env.PREVIEW_CACHE_CONTROL_S || 31536000);
 const DEFAULT_SEED  = Number(process.env.PREVIEW_SEED || 777);
 
-// ---------- Helpers ----------
+/* ---------- Helpers & vocab ---------- */
 const ok = (v) => typeof v === "string" && v.trim().length > 0;
 const clamp = (v, arr, d = 0) => (ok(v) && arr.includes(v) ? v : arr[d]);
 
 const BG = ["studio","office","city","nature"];
-const OUTFIT = ["blazer","shirt","tee"];
+const OUTFIT = ["blazer","shirt","tee","athleisure"];
 const MOOD = ["warm","neutral","cool"];
 const RATIO = ["1:1","3:4"];
 const SKIN = ["light","fair","medium","tan","deep"];
-const HAIR = ["black","brown","blonde","red","gray"];
+const HAIR_COLOR = ["black","brown","blonde","red","gray"];
+const HAIR_LEN = ["short","medium","long"];
+const EYE = ["brown","blue","green","hazel","gray"];
+const BODY = ["slim","athletic","average","curvy","muscular"];
 
 const SIZE = { "1:1": [640, 640], "3:4": [720, 960] };
 
+/* ---------- Cache key (discrétisée) ---------- */
 function exactKey(form) {
-  const gender = clamp(form?.gender, ["woman", "man"], 0);
+  const gender = clamp(form?.gender, ["woman","man"], 0);
   const preset = clamp(form?.preset, ["linkedin_pro","ceo_office","lifestyle_warm","speaker_press"]);
   const bg     = clamp(form?.background, BG);
   const outfit = clamp(form?.outfit, OUTFIT);
   const mood   = clamp(form?.mood, MOOD, 1);
   const ratio  = clamp(form?.aspect_ratio, RATIO);
-  const skin   = clamp(form?.skin, SKIN, 2);
-  const hair   = clamp(form?.hair, HAIR, 1);
-  return `${gender}|${preset}|${bg}|${outfit}|${mood}|${ratio}|${skin}|${hair}`;
+  const skin   = clamp(form?.skin_tone ?? form?.skin, SKIN, 2);
+  const hairC  = clamp(form?.hair_color ?? form?.hair, HAIR_COLOR, 1);
+  const hairL  = clamp(form?.hair_length ?? form?.hairLen, HAIR_LEN, 2);
+  const eyes   = clamp(form?.eye_color ?? form?.eyes, EYE, 0);
+  const body   = clamp(form?.body_type, BODY, 2); // average par défaut
+  // Inclut body_type pour 3:4 ; inoffensif pour 1:1
+  return `${gender}|${preset}|${bg}|${outfit}|${mood}|${ratio}|${skin}|${hairC}|${hairL}|${eyes}|${body}`;
 }
 
+/* ---------- Prompt universelle ---------- */
+function subjectFromGender(g) {
+  return g === "man" ? "portrait of an adult man" : "portrait of an adult woman";
+}
+function outfitLabel(outfit, gender) {
+  if (outfit === "athleisure") {
+    return gender === "man"
+      ? "fitted athletic t-shirt (athleisure look)"
+      : "neutral sports bra and athleisure look";
+  }
+  return { blazer:"navy blazer and white shirt", shirt:"smart shirt", tee:"clean crew-neck tee" }[outfit];
+}
 function buildPrompt(form) {
   const gender = clamp(form?.gender, ["woman","man"], 0);
-  const subject = gender === "woman" ? "portrait of an adult woman" : "portrait of an adult man";
-  const bgMap = { studio:"neutral seamless light-gray studio background", office:"modern office bokeh background", city:"city bokeh background", nature:"subtle green foliage bokeh background" };
-  const outfitMap = { blazer:"navy blazer and white shirt", shirt:"smart shirt", tee:"clean crew-neck tee" };
-  const moodMap = { warm:"warm approachable mood", neutral:"confident approachable mood", cool:"calm professional mood" };
+  const subject = subjectFromGender(gender);
 
-  return [
+  const bgMap = {
+    studio:"neutral seamless light-gray studio background",
+    office:"modern office bokeh background",
+    city:"city bokeh background",
+    nature:"subtle green foliage bokeh background",
+  };
+  const bg = bgMap[clamp(form?.background, BG)];
+  const outfit = outfitLabel(clamp(form?.outfit, OUTFIT), gender);
+  const mood = { warm:"warm approachable mood", neutral:"confident approachable mood", cool:"calm professional mood" }[clamp(form?.mood, MOOD, 1)];
+
+  const skin   = clamp(form?.skin_tone ?? form?.skin, SKIN, 2);
+  const hairC  = clamp(form?.hair_color ?? form?.hair, HAIR_COLOR, 1);
+  const hairL  = clamp(form?.hair_length ?? form?.hairLen, HAIR_LEN, 2);
+  const eyes   = clamp(form?.eye_color ?? form?.eyes, EYE, 0);
+  const ratio  = clamp(form?.aspect_ratio, RATIO, 0);
+  const body   = clamp(form?.body_type, BODY, 2);
+
+  const parts = [
     subject,
     "professional studio headshot, head-and-shoulders",
     "soft diffused light, 85mm portrait look, shallow depth of field",
-    bgMap[clamp(form?.background, BG)],
-    outfitMap[clamp(form?.outfit, OUTFIT)],
-    moodMap[clamp(form?.mood, MOOD, 1)],
-    "natural realistic skin texture, sharp eyes, photo-realistic"
-  ].join(", ");
+    bg,
+    outfit,
+    mood,
+    // body type discret uniquement si 3:4 (buste visible)
+    ...(ratio === "3:4" ? [`subtle ${body} build`] : []),
+    `natural ${skin} skin tone, ${hairL}-length ${hairC} hair, ${eyes} eyes`,
+    "natural realistic skin texture, sharp eyes, photo-realistic",
+  ];
+  return parts.join(", ");
 }
 
+/* ---------- Upload Supabase ---------- */
 async function uploadToSupabase(path, bytes) {
   const up = await sb.storage.from(BUCKET).upload(path, bytes, {
     contentType: "image/jpeg",
@@ -86,6 +126,7 @@ async function uploadToSupabase(path, bytes) {
   }
 }
 
+/* ---------- Handler ---------- */
 export default async function handler(req, res) {
   setCORS(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
