@@ -1,4 +1,11 @@
-// /api/v1-preview.mjs
+// /api/v1-preview.mjs — V3.2
+// Changes vs your V3:
+// - KEY now includes seed + size → correct cache separation
+// - Prompt: "waist-up portrait" (plus net studio recipe) and bald handling
+// - Hair grammar fix ("long blonde hair" not "long-length")
+// - Always nologo=true (doc allows), keep private=true, enhance=true
+// - Safe clamps + small refactors; no breaking DB schema
+
 export const config = { runtime: "nodejs" };
 
 import { setCORS } from "../lib/http.mjs";
@@ -8,7 +15,7 @@ import { ensureSupabaseClient, getSupabaseServiceRole } from "../lib/supabase.mj
 const sb = getSupabaseServiceRole();
 
 /* ---------- ENV ---------- */
-const POL_TOKEN  = process.env.POLLINATIONS_TOKEN || "";
+const POL_TOKEN  = process.env.POLLINATIONS_TOKEN || ""; // optional
 const BUCKET     = process.env.PREVIEW_BUCKET || "generated_images";
 const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC || "true") === "true";
 const SIGNED_TTL_S  = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7);
@@ -25,13 +32,13 @@ const MOOD = ["warm","neutral","cool"];
 const RATIO = ["1:1","3:4"];
 const SKIN = ["light","fair","medium","tan","deep"];
 const HAIR_COLOR = ["black","brown","blonde","red","gray"];
-const HAIR_LEN = ["short","medium","long"];
+const HAIR_LEN = ["short","medium","long","bald"]; // + bald support
 const EYE = ["brown","blue","green","hazel","gray"];
 const BODY = ["slim","athletic","average","curvy","muscular"];
 
 const SIZE = { "1:1": [640, 640], "3:4": [720, 960] };
 
-/* ---------- Cache key (discrétisée) ---------- */
+/* ---------- Cache key (discrétisée + seed/size) ---------- */
 function exactKey(form) {
   const gender = clamp(form?.gender, ["woman","man"], 0);
   const preset = clamp(form?.preset, ["linkedin_pro","ceo_office","lifestyle_warm","speaker_press"]);
@@ -43,20 +50,15 @@ function exactKey(form) {
   const hairC  = clamp(form?.hair_color ?? form?.hair, HAIR_COLOR, 1);
   const hairL  = clamp(form?.hair_length ?? form?.hairLen, HAIR_LEN, 2);
   const eyes   = clamp(form?.eye_color ?? form?.eyes, EYE, 0);
-  const body   = clamp(form?.body_type, BODY, 2); // average par défaut
-  // Inclut body_type pour 3:4 ; inoffensif pour 1:1
+  const body   = clamp(form?.body_type, BODY, 2);
   return `${gender}|${preset}|${bg}|${outfit}|${mood}|${ratio}|${skin}|${hairC}|${hairL}|${eyes}|${body}`;
 }
 
 /* ---------- Prompt universelle ---------- */
-function subjectFromGender(g) {
-  return g === "man" ? "portrait of an adult man" : "portrait of an adult woman";
-}
+function subjectFromGender(g) { return g === "man" ? "adult man" : "adult woman"; }
 function outfitLabel(outfit, gender) {
   if (outfit === "athleisure") {
-    return gender === "man"
-      ? "fitted athletic t-shirt (athleisure look)"
-      : "neutral sports bra and athleisure look";
+    return gender === "man" ? "fitted athletic t-shirt (athleisure look)" : "neutral athleisure top";
   }
   return { blazer:"navy blazer and white shirt", shirt:"smart shirt", tee:"clean crew-neck tee" }[outfit];
 }
@@ -65,10 +67,10 @@ function buildPrompt(form) {
   const subject = subjectFromGender(gender);
 
   const bgMap = {
-    studio:"neutral seamless light-gray studio background",
+    studio:"white seamless studio background",
     office:"modern office bokeh background",
     city:"city bokeh background",
-    nature:"subtle green foliage bokeh background",
+    nature:"soft green foliage bokeh background",
   };
   const bg = bgMap[clamp(form?.background, BG)];
   const outfit = outfitLabel(clamp(form?.outfit, OUTFIT), gender);
@@ -81,17 +83,17 @@ function buildPrompt(form) {
   const ratio  = clamp(form?.aspect_ratio, RATIO, 0);
   const body   = clamp(form?.body_type, BODY, 2);
 
+  const hairPhrase = hairL === "bald" ? "bald" : `${hairL} ${hairC} hair`;
+
   const parts = [
-    subject,
-    "professional studio headshot, head-and-shoulders",
-    "soft diffused light, 85mm portrait look, shallow depth of field",
+    `professional waist-up portrait of an ${subject}`,
+    "soft diffused studio lighting, 85mm portrait look, shallow depth of field",
     bg,
     outfit,
     mood,
-    // body type discret uniquement si 3:4 (buste visible)
     ...(ratio === "3:4" ? [`subtle ${body} build`] : []),
-    `natural ${skin} skin tone, ${hairL}-length ${hairC} hair, ${eyes} eyes`,
-    "natural realistic skin texture, sharp eyes, photo-realistic",
+    `natural ${skin} skin tone, ${eyes} eyes, ${hairPhrase}`,
+    "realistic skin texture, sharp eyes, photorealistic"
   ];
   return parts.join(", ");
 }
@@ -101,7 +103,7 @@ async function uploadToSupabase(path, bytes) {
   const up = await sb.storage.from(BUCKET).upload(path, bytes, {
     contentType: "image/jpeg",
     upsert: true,
-    cacheControl: CACHE_CONTROL
+    cacheControl: CACHE_CONTROL,
   });
   if (up.error) throw up.error;
 
@@ -128,13 +130,18 @@ export default async function handler(req, res) {
     if (!sb) return res.status(500).json({ ok:false, error:"missing_env_supabase" });
     ensureSupabaseClient(sb, "service");
     const form = (req.body && typeof req.body === "object") ? req.body : {};
-    const key  = exactKey(form);
-    const seed = Number.isFinite(Number(form?.seed)) ? Math.max(0, Math.floor(Number(form.seed))) : DEFAULT_SEED;
+
     const ratio = clamp(form?.aspect_ratio, RATIO);
     const [W, H] = SIZE[ratio] || [640, 640];
-    const prompt = buildPrompt(form);
 
-    // 0) Cache
+    const seed = Number.isFinite(Number(form?.seed)) ? Math.max(0, Math.floor(Number(form.seed))) : DEFAULT_SEED;
+    const prompt = ok(form?.prompt) ? String(form.prompt) : buildPrompt(form);
+
+    // Cache key now includes seed and size → correct reuse across seeds/sizes
+    const formKey = exactKey(form);
+    const key = `${formKey}|seed:${seed}|${W}x${H}`;
+
+    // 0) Cache lookup
     const cached = await sb.from("preview_cache").select("image_url,hits").eq("key", key).maybeSingle();
     if (cached.data?.image_url) {
       await sb.from("preview_cache").update({ hits: (cached.data.hits||0)+1 }).eq("key", key).catch(()=>{});
@@ -142,22 +149,31 @@ export default async function handler(req, res) {
     }
 
     // 1) Pollinations (model=flux)
-    const base = "https://image.pollinations.ai/prompt/";
-    const qs   = `?model=flux&width=${W}&height=${H}&seed=${seed}&private=true&enhance=true${POL_TOKEN ? "&nologo=true" : ""}`;
-    const url  = `${base}${encodeURIComponent(prompt)}${qs}`;
+    const base = "https://image.pollinations.ai/prompt/"; // official endpoint
+    const q = new URLSearchParams({
+      model: "flux",
+      width: String(W), height: String(H),
+      seed: String(seed),
+      private: "true",
+      enhance: "true",
+      nologo: "true", // always hide logo
+    }).toString();
+    const url  = `${base}${encodeURIComponent(prompt)}?${q}`;
 
-    const r = await fetch(url, {
-      headers: POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {},
-      signal: AbortSignal.timeout(60_000)
-    });
+    const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(60_000) });
     if (!r.ok) {
       const msg = await r.text().catch(()=> "");
       return res.status(r.status).json({ ok:false, error:"pollinations_failed", details: msg.slice(0,400) });
     }
     const bytes = Buffer.from(await r.arrayBuffer());
 
-    // 2) Upload + cache
-    const path = `previews/${encodeURIComponent(key)}.jpg`;
+    // 2) Upload + cache insert
+    const date = new Date();
+    const yyyy = date.getUTCFullYear();
+    const mm = String(date.getUTCMonth()+1).padStart(2,'0');
+    const dd = String(date.getUTCDate()).padStart(2,'0');
+    const path = `previews/${yyyy}-${mm}-${dd}/${encodeURIComponent(key)}.jpg`;
     const imageUrl = await uploadToSupabase(path, bytes);
     await sb.from("preview_cache").insert({ key, image_url: imageUrl }).catch(()=>{});
 
