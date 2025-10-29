@@ -1,11 +1,11 @@
-// /api/v1-preview.mjs — Final V3.7 (beauty_v2)
+// /api/v1-preview.mjs — Final V3.8 (sexy_sfw_fast)
 // 🧯 Self-contained CORS (no http.mjs)
 // 🔐 Cold-start safe: dynamic import of supabase.mjs inside POST only
 // ✅ GET health-check (200) even with missing ENV
 // ✅ Robust body parsing (string → JSON), prompt fallback if missing
-// ✅ Beauty-tuned prompt (young adult, studio beauty lighting, catchlights)
-// ✅ Seed & size in cache key + STYLE_VERSION for cache-bust
-// ✅ Accepts camelCase + snake_case (Figma compat)
+// ✅ Beauty/Glam prompt (SFW) for man & woman
+// ✅ Versioned cache key (STYLE_VERSION) + seed + size
+// ✅ FAST MODE: set body.fast=true (or "1") → smaller size ⇒ faster
 // ✅ Pollinations: nologo=true, private=true, enhance=true
 // ✅ Fallback timeout when AbortSignal.timeout is unavailable
 
@@ -30,6 +30,7 @@ const DEFAULT_SEED   = Number(process.env.PREVIEW_SEED || 777);
 /* ---------- Helpers & vocab ---------- */
 const ok = (v) => typeof v === "string" && v.trim().length > 0;
 const clamp = (v, arr, d = 0) => (ok(v) && arr.includes(v) ? v : arr[d]);
+const toBool = (v) => v === true || v === "true" || v === "1" || v === 1;
 
 const BG = ["studio","office","city","nature"];
 const OUTFIT = ["blazer","shirt","tee","athleisure"];
@@ -41,19 +42,23 @@ const HAIR_LEN = ["short","medium","long","bald"]; // bald support
 const EYE = ["brown","blue","green","hazel","gray"];
 const BODY = ["slim","athletic","average","curvy","muscular"];
 
-/* ↑ Légère montée de résolution pour plus de netteté */
-const SIZE = { "1:1": [768, 768], "3:4": [768, 1024] };
+/* ---------- Render sizes ---------- */
+/* Quality mode (par défaut) – net et vendeur */
+const SIZE_HQ = { "1:1": [896, 896], "3:4": [896, 1152] };
+/* Fast mode – plus petit ⇒ plus rapide pour la prévisualisation */
+const SIZE_FAST = { "1:1": [640, 640], "3:4": [672, 896] };
 
-/* ---------- Cache key ---------- */
-const STYLE_VERSION = "beauty_v2"; // change this to bust the preview cache
+/* ---------- Cache version ---------- */
+const STYLE_VERSION = "sexy_sfw_v1";
 
+/* ---------- Cache key (discretized + seed/size) ---------- */
 function exactKey(form) {
   const gender = clamp(form?.gender, ["woman","man"], 0);
   const preset = clamp(form?.preset, ["linkedin_pro","ceo_office","lifestyle_warm","speaker_press"]);
   const bg     = clamp(form?.background, BG);
   const outfit = clamp(form?.outfit, OUTFIT);
   const mood   = clamp(form?.mood, MOOD, 1);
-  const ratio  = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO);
+  const ratio  = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
   const skin   = clamp(form?.skin_tone ?? form?.skinTone ?? form?.skin, SKIN, 2);
   const hairC  = clamp(form?.hair_color ?? form?.hairColor ?? form?.hair, HAIR_COLOR, 1);
   const hairL  = clamp(form?.hair_length ?? form?.hairLength ?? form?.hairLen, HAIR_LEN, 2);
@@ -62,12 +67,30 @@ function exactKey(form) {
   return `${gender}|${preset}|${bg}|${outfit}|${mood}|${ratio}|${skin}|${hairC}|${hairL}|${eyes}|${body}`;
 }
 
-/* ---------- Prompt (beauty) ---------- */
-function subjectFromGender(g) { return g === "man" ? "young adult man (mid-20s to early-30s)" : "young adult woman (mid-20s to early-30s)"; }
-function outfitLabel(outfit, gender) {
-  if (outfit === "athleisure") return gender === "man" ? "fitted athletic t-shirt (athleisure look)" : "neutral athleisure top";
-  return { blazer:"navy blazer and white shirt", shirt:"smart shirt", tee:"clean crew-neck tee" }[outfit];
+/* ---------- Prompt (sexy SFW) ---------- */
+function subjectFromGender(g) {
+  return g === "man"
+    ? "young adult man (mid-20s to early-30s)"
+    : "young adult woman (mid-20s to early-30s)";
 }
+function outfitLabel(outfit, gender) {
+  // SFW mais plus "vendeur" (fitted / fashion-commercial)
+  if (outfit === "athleisure") {
+    return gender === "man"
+      ? "sleek fitted athletic tee (athleisure)"
+      : "form-fitting athleisure top";
+  }
+  return {
+    blazer: gender === "man"
+      ? "tailored navy blazer over fitted shirt"
+      : "tailored blazer over fitted top",
+    shirt: gender === "man"
+      ? "well-fitted dark dress shirt, top button open"
+      : "fitted smart shirt or top",
+    tee: "clean fitted crew-neck tee",
+  }[outfit];
+}
+
 function buildPrompt(form) {
   const gender = clamp(form?.gender, ["woman","man"], 0);
   const subject = subjectFromGender(gender);
@@ -78,39 +101,39 @@ function buildPrompt(form) {
     city:"city bokeh background",
     nature:"soft green foliage bokeh background",
   };
-  const bg = bgMap[clamp(form?.background, BG)];
+  const bg     = bgMap[clamp(form?.background, BG)];
   const outfit = outfitLabel(clamp(form?.outfit, OUTFIT), gender);
-  const mood = { warm:"warm approachable mood", neutral:"confident approachable mood", cool:"calm professional mood" }[clamp(form?.mood, MOOD, 1)];
+  const mood   = { warm:"warm welcoming mood", neutral:"confident approachable mood", cool:"cool stylish mood" }[clamp(form?.mood, MOOD, 1)];
 
-  const skin   = clamp(form?.skin_tone ?? form?.skinTone ?? form?.skin, SKIN, 2);
-  const hairC  = clamp(form?.hair_color ?? form?.hairColor ?? form?.hair, HAIR_COLOR, 1);
-  const hairL  = clamp(form?.hair_length ?? form?.hairLength ?? form?.hairLen, HAIR_LEN, 2);
-  const eyes   = clamp(form?.eye_color ?? form?.eyeColor ?? form?.eyes, EYE, 0);
-  const ratio  = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
-  const body   = clamp(form?.body_type ?? form?.bodyType, BODY, 2);
+  const skin  = clamp(form?.skin_tone ?? form?.skinTone ?? form?.skin, SKIN, 2);
+  const hairC = clamp(form?.hair_color ?? form?.hairColor ?? form?.hair, HAIR_COLOR, 1);
+  const hairL = clamp(form?.hair_length ?? form?.hairLength ?? form?.hairLen, HAIR_LEN, 2);
+  const eyes  = clamp(form?.eye_color ?? form?.eyeColor ?? form?.eyes, EYE, 0);
+  const ratio = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
+  const body  = clamp(form?.body_type ?? form?.bodyType, BODY, 2);
 
-  const hairPhrase = hairL === "bald" ? "bald" : `healthy ${hairL} ${hairC} hair`;
+  const hairPhrase = hairL === "bald" ? "clean bald" : `healthy ${hairL} ${hairC} hair`;
 
-  const beautyCommon = [
-    "high-end editorial beauty photo, face-centered composition, eyes to camera",
-    "studio beauty lighting with large octabox key and subtle rim light, bright catchlights",
-    "youthful fresh look, even luminous skin with gentle highlights",
-    "subtle professional skin retouch, pore-level detail preserved, flattering but realistic",
-    "crisp sharp eyes, clean color balance, smooth tonal transitions"
+  const sexyCommon = [
+    "fashion-commercial portrait, slight three-quarter angle, relaxed confident posture",
+    "studio beauty lighting: large octabox key plus soft rim light, bright catchlights",
+    "youthful fresh look, luminous skin glow, even tone",
+    "very subtle professional skin retouch (no plastic look), refined highlights",
+    "defined cheekbones, flattering jawline, crisp sharp eyes",
+    "high-end editorial quality, photorealistic, clean background"
   ];
-  const beautyGender = gender === "woman"
-    ? ["soft glam natural makeup, defined eyes and brows, hydrated lips, subtle blush"]
-    : ["clean shave or neat light stubble, groomed brows, natural matte skin finish"];
+  const sexyGender = gender === "woman"
+    ? ["soft glam natural makeup, defined eyes and brows, hydrated lips"]
+    : ["light neat stubble or clean shave, groomed brows, healthy matte finish"];
 
   return [
-    `professional waist-up portrait of a ${subject}`,
+    `waist-up portrait of a ${subject}, camera-facing with a subtle inviting smile`,
     "85mm portrait look, shallow depth of field",
     bg, outfit, mood,
     ...(ratio === "3:4" ? [`subtle ${body} build`] : []),
     `natural ${skin} skin tone, ${eyes} eyes, ${hairPhrase}`,
-    ...beautyCommon,
-    ...beautyGender,
-    "award-winning editorial quality, photorealistic, clean background"
+    ...sexyCommon,
+    ...sexyGender
   ].join(", ");
 }
 
@@ -125,7 +148,7 @@ export default async function handler(req, res) {
   if (req.method === "GET")     return res.status(200).json({ ok:true, ready:true, endpoint:"/api/v1-preview" });
   if (req.method !== "POST")    return res.status(405).json({ ok:false, error:"method_not_allowed" });
 
-  // 🔌 Dynamic import to avoid cold-start crashes when ENV are missing on GET
+  // Import dynamique (évite les crashs de cold-start si ENV manquants sur GET)
   let ensureSupabaseClient, getSupabaseServiceRole, sb;
   try {
     ({ ensureSupabaseClient, getSupabaseServiceRole } = await import("../supabase.mjs"));
@@ -147,19 +170,20 @@ export default async function handler(req, res) {
     if (!ok(form?.prompt)) form.prompt = buildPrompt(form);
 
     // --- render settings ---
-    const ratio = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO);
-    const [W, H] = SIZE[ratio] || [768, 768];
+    const fast = toBool(form?.fast); // ⇢ active le mode rapide
+    const ratio = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
+    const [W, H] = (fast ? SIZE_FAST : SIZE_HQ)[ratio] || (fast ? [640,640] : [896,896]);
     const seed = Number.isFinite(Number(form?.seed)) ? Math.max(0, Math.floor(Number(form.seed))) : DEFAULT_SEED;
     const prompt = String(form.prompt);
 
-    // --- cache key (versioned) ---
-    const key = `${STYLE_VERSION}|${exactKey(form)}|seed:${seed}|${W}x${H}`;
+    // --- cache key (versioned + fast flag) ---
+    const key = `${STYLE_VERSION}${fast ? "|fast" : ""}|${exactKey(form)}|seed:${seed}|${W}x${H}`;
 
     // 0) Cache lookup
     const cached = await sb.from("preview_cache").select("image_url,hits").eq("key", key).maybeSingle();
     if (cached.data?.image_url) {
       await sb.from("preview_cache").update({ hits: (cached.data.hits||0)+1 }).eq("key", key).catch(()=>{});
-      return res.status(200).json({ ok:true, image_url: cached.data.image_url, provider:"cache", seed, key });
+      return res.status(200).json({ ok:true, image_url: cached.data.image_url, provider:"cache", seed, key, fast: !!fast });
     }
 
     // 1) Generation (Pollinations FLUX)
@@ -176,10 +200,10 @@ export default async function handler(req, res) {
 
     let r;
     if (typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal) {
-      r = await fetch(url, { headers, signal: AbortSignal.timeout(60_000) });
+      r = await fetch(url, { headers, signal: AbortSignal.timeout(fast ? 30_000 : 60_000) });
     } else {
       const ac = new AbortController();
-      const t = setTimeout(() => ac.abort('timeout'), 60_000);
+      const t = setTimeout(() => ac.abort('timeout'), fast ? 30_000 : 60_000);
       try { r = await fetch(url, { headers, signal: ac.signal }); }
       finally { clearTimeout(t); }
     }
@@ -217,7 +241,7 @@ export default async function handler(req, res) {
     }
 
     await sb.from("preview_cache").insert({ key, image_url: imageUrl }).catch(()=>{});
-    return res.status(200).json({ ok:true, image_url: imageUrl, provider:"pollinations", seed, key });
+    return res.status(200).json({ ok:true, image_url: imageUrl, provider:"pollinations", seed, key, fast: !!fast });
   } catch (e) {
     return res.status(500).json({ ok:false, error:"server_error", details: String(e).slice(0,400) });
   }
