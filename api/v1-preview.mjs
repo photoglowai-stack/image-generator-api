@@ -8,8 +8,8 @@
 
 export const config = { runtime: "nodejs" };
 
-import { setCORS } from "../lib/http.mjs";
-import { ensureSupabaseClient, getSupabaseServiceRole } from "../lib/supabase.mjs";
+import { setCORS } from "../http.mjs";
+import { ensureSupabaseClient, getSupabaseServiceRole } from "../supabase.mjs";
 
 /* ---------- Supabase ---------- */
 const sb = getSupabaseServiceRole();
