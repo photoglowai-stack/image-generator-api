@@ -1,23 +1,22 @@
-// /api/v1-preview.mjs — Final V3.6
+// /api/v1-preview.mjs — Final V3.7 (beauty_v2)
 // 🧯 Self-contained CORS (no http.mjs)
-// 🔐 Crash‑proof cold start: dynamic import of supabase.mjs inside POST only
+// 🔐 Cold-start safe: dynamic import of supabase.mjs inside POST only
 // ✅ GET health-check (200) even with missing ENV
-// ✅ Seed & size in cache key
-// ✅ Prompt tuned for waist‑up studio portrait, 85mm, bald handling
-// ✅ camelCase + snake_case accepted (Figma compat)
-// ✅ nologo=true, private=true, enhance=true
+// ✅ Robust body parsing (string → JSON), prompt fallback if missing
+// ✅ Beauty-tuned prompt (young adult, studio beauty lighting, catchlights)
+// ✅ Seed & size in cache key + STYLE_VERSION for cache-bust
+// ✅ Accepts camelCase + snake_case (Figma compat)
+// ✅ Pollinations: nologo=true, private=true, enhance=true
 // ✅ Fallback timeout when AbortSignal.timeout is unavailable
 
 export const config = { runtime: "nodejs" };
 
-/* ---------- CORS (inline, minimal & safe) ---------- */
+/* ---------- CORS (inline) ---------- */
 function setCORS(req, res, opts = {}) {
-  const allowMethods = opts.allowMethods || "GET,POST,OPTIONS";
-  const allowHeaders = opts.allowHeaders || "content-type, authorization, idempotency-key";
   res.setHeader("access-control-allow-origin", "*"); // Figma (Origin: null) OK
-  res.setHeader("access-control-allow-methods", allowMethods);
-  res.setHeader("access-control-allow-headers", allowHeaders);
-  res.setHeader("access-control-max-age", "86400"); // 24h preflight
+  res.setHeader("access-control-allow-methods", opts.allowMethods || "GET,POST,OPTIONS");
+  res.setHeader("access-control-allow-headers", opts.allowHeaders || "content-type, authorization, idempotency-key");
+  res.setHeader("access-control-max-age", "86400");
 }
 
 /* ---------- ENV ---------- */
@@ -42,9 +41,12 @@ const HAIR_LEN = ["short","medium","long","bald"]; // bald support
 const EYE = ["brown","blue","green","hazel","gray"];
 const BODY = ["slim","athletic","average","curvy","muscular"];
 
-const SIZE = { "1:1": [640, 640], "3:4": [720, 960] };
+/* ↑ Légère montée de résolution pour plus de netteté */
+const SIZE = { "1:1": [768, 768], "3:4": [768, 1024] };
 
-/* ---------- Cache key (discretized + seed/size) ---------- */
+/* ---------- Cache key ---------- */
+const STYLE_VERSION = "beauty_v2"; // change this to bust the preview cache
+
 function exactKey(form) {
   const gender = clamp(form?.gender, ["woman","man"], 0);
   const preset = clamp(form?.preset, ["linkedin_pro","ceo_office","lifestyle_warm","speaker_press"]);
@@ -56,16 +58,14 @@ function exactKey(form) {
   const hairC  = clamp(form?.hair_color ?? form?.hairColor ?? form?.hair, HAIR_COLOR, 1);
   const hairL  = clamp(form?.hair_length ?? form?.hairLength ?? form?.hairLen, HAIR_LEN, 2);
   const eyes   = clamp(form?.eye_color ?? form?.eyeColor ?? form?.eyes, EYE, 0);
-  const body   = clamp(form?.body_type ?? form?.bodyType, BODY, 2); // average by default
+  const body   = clamp(form?.body_type ?? form?.bodyType, BODY, 2);
   return `${gender}|${preset}|${bg}|${outfit}|${mood}|${ratio}|${skin}|${hairC}|${hairL}|${eyes}|${body}`;
 }
 
-/* ---------- Prompt ---------- */
-function subjectFromGender(g) { return g === "man" ? "adult man" : "adult woman"; }
+/* ---------- Prompt (beauty) ---------- */
+function subjectFromGender(g) { return g === "man" ? "young adult man (mid-20s to early-30s)" : "young adult woman (mid-20s to early-30s)"; }
 function outfitLabel(outfit, gender) {
-  if (outfit === "athleisure") {
-    return gender === "man" ? "fitted athletic t-shirt (athleisure look)" : "neutral athleisure top";
-  }
+  if (outfit === "athleisure") return gender === "man" ? "fitted athletic t-shirt (athleisure look)" : "neutral athleisure top";
   return { blazer:"navy blazer and white shirt", shirt:"smart shirt", tee:"clean crew-neck tee" }[outfit];
 }
 function buildPrompt(form) {
@@ -89,19 +89,29 @@ function buildPrompt(form) {
   const ratio  = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
   const body   = clamp(form?.body_type ?? form?.bodyType, BODY, 2);
 
-  const hairPhrase = hairL === "bald" ? "bald" : `${hairL} ${hairC} hair`;
+  const hairPhrase = hairL === "bald" ? "bald" : `healthy ${hairL} ${hairC} hair`;
 
-  const parts = [
-    `professional waist-up portrait of an ${subject}`,
-    "soft diffused studio lighting, 85mm portrait look, shallow depth of field",
-    bg,
-    outfit,
-    mood,
+  const beautyCommon = [
+    "high-end editorial beauty photo, face-centered composition, eyes to camera",
+    "studio beauty lighting with large octabox key and subtle rim light, bright catchlights",
+    "youthful fresh look, even luminous skin with gentle highlights",
+    "subtle professional skin retouch, pore-level detail preserved, flattering but realistic",
+    "crisp sharp eyes, clean color balance, smooth tonal transitions"
+  ];
+  const beautyGender = gender === "woman"
+    ? ["soft glam natural makeup, defined eyes and brows, hydrated lips, subtle blush"]
+    : ["clean shave or neat light stubble, groomed brows, natural matte skin finish"];
+
+  return [
+    `professional waist-up portrait of a ${subject}`,
+    "85mm portrait look, shallow depth of field",
+    bg, outfit, mood,
     ...(ratio === "3:4" ? [`subtle ${body} build`] : []),
     `natural ${skin} skin tone, ${eyes} eyes, ${hairPhrase}`,
-    "realistic skin texture, sharp eyes, photorealistic"
-  ];
-  return parts.join(", ");
+    ...beautyCommon,
+    ...beautyGender,
+    "award-winning editorial quality, photorealistic, clean background"
+  ].join(", ");
 }
 
 /* ---------- Handler ---------- */
@@ -115,7 +125,7 @@ export default async function handler(req, res) {
   if (req.method === "GET")     return res.status(200).json({ ok:true, ready:true, endpoint:"/api/v1-preview" });
   if (req.method !== "POST")    return res.status(405).json({ ok:false, error:"method_not_allowed" });
 
-  // 🔌 Dynamic import of Supabase helpers (prevents cold-start crash if ENV are missing)
+  // 🔌 Dynamic import to avoid cold-start crashes when ENV are missing on GET
   let ensureSupabaseClient, getSupabaseServiceRole, sb;
   try {
     ({ ensureSupabaseClient, getSupabaseServiceRole } = await import("../supabase.mjs"));
@@ -128,17 +138,22 @@ export default async function handler(req, res) {
     catch { return res.status(500).json({ ok:false, error:"missing_env_supabase" }); }
     ensureSupabaseClient(sb, "service");
 
-    const form = (req.body && typeof req.body === "object") ? req.body : {};
+    // --- tolerant body parsing + prompt fallback ---
+    let body = req.body;
+    if (typeof body === "string") {
+      try { body = JSON.parse(body); } catch { body = {}; }
+    }
+    const form = (body && typeof body === "object") ? body : {};
+    if (!ok(form?.prompt)) form.prompt = buildPrompt(form);
 
+    // --- render settings ---
     const ratio = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO);
-    const [W, H] = SIZE[ratio] || [640, 640];
-
+    const [W, H] = SIZE[ratio] || [768, 768];
     const seed = Number.isFinite(Number(form?.seed)) ? Math.max(0, Math.floor(Number(form.seed))) : DEFAULT_SEED;
-    const prompt = ok(form?.prompt) ? String(form.prompt) : buildPrompt(form);
+    const prompt = String(form.prompt);
 
-    // Cache key includes seed and size
-    const formKey = exactKey(form);
-    const key = `${formKey}|seed:${seed}|${W}x${H}`;
+    // --- cache key (versioned) ---
+    const key = `${STYLE_VERSION}|${exactKey(form)}|seed:${seed}|${W}x${H}`;
 
     // 0) Cache lookup
     const cached = await sb.from("preview_cache").select("image_url,hits").eq("key", key).maybeSingle();
@@ -147,8 +162,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok:true, image_url: cached.data.image_url, provider:"cache", seed, key });
     }
 
-    // 1) Pollinations (model=flux)
-    const base = "https://image.pollinations.ai/prompt/";
+    // 1) Generation (Pollinations FLUX)
     const q = new URLSearchParams({
       model: "flux",
       width: String(W), height: String(H),
@@ -157,8 +171,7 @@ export default async function handler(req, res) {
       enhance: "true",
       nologo: "true",
     }).toString();
-    const url  = `${base}${encodeURIComponent(prompt)}?${q}`;
-
+    const url  = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
     const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
 
     let r;
@@ -170,7 +183,6 @@ export default async function handler(req, res) {
       try { r = await fetch(url, { headers, signal: ac.signal }); }
       finally { clearTimeout(t); }
     }
-
     if (!r.ok) {
       const msg = await r.text().catch(()=> "");
       return res.status(r.status).json({ ok:false, error:"pollinations_failed", details: msg.slice(0,400) });
@@ -181,13 +193,17 @@ export default async function handler(req, res) {
     const { data: pub } = await sb.storage.getBucket(BUCKET);
     if (!pub) return res.status(500).json({ ok:false, error:"bucket_not_found", bucket: BUCKET });
 
-    const date = new Date();
-    const yyyy = date.getUTCFullYear();
-    const mm = String(date.getUTCMonth()+1).padStart(2,'0');
-    const dd = String(date.getUTCDate()).padStart(2,'0');
+    const d = new Date();
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth()+1).padStart(2,'0');
+    const dd = String(d.getUTCDate()).padStart(2,'0');
     const path = `previews/${yyyy}-${mm}-${dd}/${encodeURIComponent(key)}.jpg`;
 
-    const up = await sb.storage.from(BUCKET).upload(path, bytes, { contentType: "image/jpeg", upsert: true, cacheControl: CACHE_CONTROL });
+    const up = await sb.storage.from(BUCKET).upload(path, bytes, {
+      contentType: "image/jpeg",
+      upsert: true,
+      cacheControl: CACHE_CONTROL,
+    });
     if (up.error) return res.status(500).json({ ok:false, error:"upload_failed", details: String(up.error).slice(0,200) });
 
     let imageUrl;
@@ -201,7 +217,6 @@ export default async function handler(req, res) {
     }
 
     await sb.from("preview_cache").insert({ key, image_url: imageUrl }).catch(()=>{});
-
     return res.status(200).json({ ok:true, image_url: imageUrl, provider:"pollinations", seed, key });
   } catch (e) {
     return res.status(500).json({ ok:false, error:"server_error", details: String(e).slice(0,400) });
