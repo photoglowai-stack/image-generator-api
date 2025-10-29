@@ -1,22 +1,18 @@
-// /api/v1-preview.mjs — Final V3.4
-// ✅ Health-check GET (200)
-// ✅ Seed & size in cache key
-// ✅ Prompt: waist-up studio portrait, 85mm, bald handling, grammar fix
-// ✅ Reads snake_case & camelCase (Figma compat)
-// ✅ Always nologo=true, private=true, enhance=true
-// ✅ Safe timeout fallback if AbortSignal.timeout is unavailable
-// ✅ Lazy Supabase init (évite FUNCTION_INVOCATION_FAILED si ENV manquantes)
+// /api/v1-preview.mjs — Final V3.5
+// 🔐 Crash‑proof cold start: dynamic import de supabase.mjs dans le handler
+// ✅ Health‑check GET (200)
+// ✅ Seed & size dans la cache key
+// ✅ Prompt: waist‑up studio portrait, 85mm, bald handling
+// ✅ camelCase + snake_case (compat Figma)
+// ✅ nologo=true, private=true, enhance=true
+// ✅ Fallback timeout si AbortSignal.timeout indisponible
 
 export const config = { runtime: "nodejs" };
 
-import { setCORS } from "../http.mjs";
-import { ensureSupabaseClient, getSupabaseServiceRole } from "../supabase.mjs";
-
-/* ---------- Supabase (lazy) ---------- */
-let sb = null; // sera initialisé dans le handler
+import { setCORS } from "../http.mjs"; // léger, safe à importer au top‑level
 
 /* ---------- ENV ---------- */
-const POL_TOKEN   = process.env.POLLINATIONS_TOKEN || ""; // optional
+const POL_TOKEN   = process.env.POLLINATIONS_TOKEN || ""; // optionnel
 const BUCKET      = process.env.PREVIEW_BUCKET || "generated_images";
 const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC || "true") === "true";
 const SIGNED_TTL_S  = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7);
@@ -60,7 +56,7 @@ function subjectFromGender(g) { return g === "man" ? "adult man" : "adult woman"
 function outfitLabel(outfit, gender) {
   if (outfit === "athleisure") {
     return gender === "man" ? "fitted athletic t-shirt (athleisure look)" : "neutral athleisure top";
-    }
+  }
   return { blazer:"navy blazer and white shirt", shirt:"smart shirt", tee:"clean crew-neck tee" }[outfit];
 }
 function buildPrompt(form) {
@@ -99,25 +95,6 @@ function buildPrompt(form) {
   return parts.join(", ");
 }
 
-/* ---------- Upload Supabase ---------- */
-async function uploadToSupabase(path, bytes) {
-  const up = await sb.storage.from(BUCKET).upload(path, bytes, {
-    contentType: "image/jpeg",
-    upsert: true,
-    cacheControl: CACHE_CONTROL,
-  });
-  if (up.error) throw up.error;
-
-  if (OUTPUT_PUBLIC) {
-    const { data } = sb.storage.from(BUCKET).getPublicUrl(path);
-    return data.publicUrl;
-  } else {
-    const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(path, SIGNED_TTL_S);
-    if (error) throw error;
-    return data.signedUrl;
-  }
-}
-
 /* ---------- Handler ---------- */
 export default async function handler(req, res) {
   setCORS(req, res, {
@@ -128,12 +105,17 @@ export default async function handler(req, res) {
   if (req.method === "GET")     return res.status(200).json({ ok:true, ready:true, endpoint:"/api/v1-preview" });
   if (req.method !== "POST")    return res.status(405).json({ ok:false, error:"method_not_allowed" });
 
+  // ⚠️ Import dynamique de supabase.mjs pour éviter un crash au cold start
+  let ensureSupabaseClient, getSupabaseServiceRole, sb;
   try {
-    // Init Supabase ici (lazy) pour éviter un crash top-level si ENV manquantes
-    if (!sb) {
-      try { sb = getSupabaseServiceRole(); }
-      catch { return res.status(500).json({ ok:false, error:"missing_env_supabase" }); }
-    }
+    ({ ensureSupabaseClient, getSupabaseServiceRole } = await import("../supabase.mjs"));
+  } catch (e) {
+    return res.status(500).json({ ok:false, error:"supabase_module_load_failed", details: String(e).slice(0,200) });
+  }
+
+  try {
+    try { sb = getSupabaseServiceRole(); }
+    catch { return res.status(500).json({ ok:false, error:"missing_env_supabase" }); }
     ensureSupabaseClient(sb, "service");
 
     const form = (req.body && typeof req.body === "object") ? req.body : {};
@@ -156,7 +138,7 @@ export default async function handler(req, res) {
     }
 
     // 1) Pollinations (model=flux)
-    const base = "https://image.pollinations.ai/prompt/"; // endpoint officiel
+    const base = "https://image.pollinations.ai/prompt/";
     const q = new URLSearchParams({
       model: "flux",
       width: String(W), height: String(H),
@@ -185,13 +167,29 @@ export default async function handler(req, res) {
     }
     const bytes = Buffer.from(await r.arrayBuffer());
 
-    // 2) Upload + cache insert
+    // 2) Upload + cache insert (Supabase Storage)
+    const { data: pub } = await sb.storage.getBucket(BUCKET);
+    if (!pub) return res.status(500).json({ ok:false, error:"bucket_not_found", bucket: BUCKET });
+
     const date = new Date();
     const yyyy = date.getUTCFullYear();
     const mm = String(date.getUTCMonth()+1).padStart(2,'0');
     const dd = String(date.getUTCDate()).padStart(2,'0');
     const path = `previews/${yyyy}-${mm}-${dd}/${encodeURIComponent(key)}.jpg`;
-    const imageUrl = await uploadToSupabase(path, bytes);
+
+    const up = await sb.storage.from(BUCKET).upload(path, bytes, { contentType: "image/jpeg", upsert: true, cacheControl: CACHE_CONTROL });
+    if (up.error) return res.status(500).json({ ok:false, error:"upload_failed", details: String(up.error).slice(0,200) });
+
+    let imageUrl;
+    if (OUTPUT_PUBLIC) {
+      const { data } = sb.storage.from(BUCKET).getPublicUrl(path);
+      imageUrl = data.publicUrl;
+    } else {
+      const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(path, SIGNED_TTL_S);
+      if (error) return res.status(500).json({ ok:false, error:"signed_url_failed", details: String(error).slice(0,200) });
+      imageUrl = data.signedUrl;
+    }
+
     await sb.from("preview_cache").insert({ key, image_url: imageUrl }).catch(()=>{});
 
     return res.status(200).json({ ok:true, image_url: imageUrl, provider:"pollinations", seed, key });
