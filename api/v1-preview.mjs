@@ -1,10 +1,10 @@
-// /api/v1-preview.mjs — V3.2
-// Changes vs your V3:
-// - KEY now includes seed + size → correct cache separation
-// - Prompt: "waist-up portrait" (plus net studio recipe) and bald handling
-// - Hair grammar fix ("long blonde hair" not "long-length")
-// - Always nologo=true (doc allows), keep private=true, enhance=true
-// - Safe clamps + small refactors; no breaking DB schema
+// /api/v1-preview.mjs — Final V3.3
+// - Health-check GET (200)
+// - Seed & size included in cache key
+// - Prompt: waist-up studio portrait, 85mm, bald handling, grammar fix
+// - Reads both snake_case and camelCase form keys (Figma compatible)
+// - Always nologo=true, private=true, enhance=true
+// - Safe timeout fallback if AbortSignal.timeout is unavailable
 
 export const config = { runtime: "nodejs" };
 
@@ -45,12 +45,12 @@ function exactKey(form) {
   const bg     = clamp(form?.background, BG);
   const outfit = clamp(form?.outfit, OUTFIT);
   const mood   = clamp(form?.mood, MOOD, 1);
-  const ratio  = clamp(form?.aspect_ratio, RATIO);
-  const skin   = clamp(form?.skin_tone ?? form?.skin, SKIN, 2);
-  const hairC  = clamp(form?.hair_color ?? form?.hair, HAIR_COLOR, 1);
-  const hairL  = clamp(form?.hair_length ?? form?.hairLen, HAIR_LEN, 2);
-  const eyes   = clamp(form?.eye_color ?? form?.eyes, EYE, 0);
-  const body   = clamp(form?.body_type, BODY, 2);
+  const ratio  = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO);
+  const skin   = clamp(form?.skin_tone ?? form?.skinTone ?? form?.skin, SKIN, 2);
+  const hairC  = clamp(form?.hair_color ?? form?.hairColor ?? form?.hair, HAIR_COLOR, 1);
+  const hairL  = clamp(form?.hair_length ?? form?.hairLength ?? form?.hairLen, HAIR_LEN, 2);
+  const eyes   = clamp(form?.eye_color ?? form?.eyeColor ?? form?.eyes, EYE, 0);
+  const body   = clamp(form?.body_type ?? form?.bodyType, BODY, 2); // average par défaut
   return `${gender}|${preset}|${bg}|${outfit}|${mood}|${ratio}|${skin}|${hairC}|${hairL}|${eyes}|${body}`;
 }
 
@@ -76,12 +76,12 @@ function buildPrompt(form) {
   const outfit = outfitLabel(clamp(form?.outfit, OUTFIT), gender);
   const mood = { warm:"warm approachable mood", neutral:"confident approachable mood", cool:"calm professional mood" }[clamp(form?.mood, MOOD, 1)];
 
-  const skin   = clamp(form?.skin_tone ?? form?.skin, SKIN, 2);
-  const hairC  = clamp(form?.hair_color ?? form?.hair, HAIR_COLOR, 1);
-  const hairL  = clamp(form?.hair_length ?? form?.hairLen, HAIR_LEN, 2);
-  const eyes   = clamp(form?.eye_color ?? form?.eyes, EYE, 0);
-  const ratio  = clamp(form?.aspect_ratio, RATIO, 0);
-  const body   = clamp(form?.body_type, BODY, 2);
+  const skin   = clamp(form?.skin_tone ?? form?.skinTone ?? form?.skin, SKIN, 2);
+  const hairC  = clamp(form?.hair_color ?? form?.hairColor ?? form?.hair, HAIR_COLOR, 1);
+  const hairL  = clamp(form?.hair_length ?? form?.hairLength ?? form?.hairLen, HAIR_LEN, 2);
+  const eyes   = clamp(form?.eye_color ?? form?.eyeColor ?? form?.eyes, EYE, 0);
+  const ratio  = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
+  const body   = clamp(form?.body_type ?? form?.bodyType, BODY, 2);
 
   const hairPhrase = hairL === "bald" ? "bald" : `${hairL} ${hairC} hair`;
 
@@ -124,20 +124,21 @@ export default async function handler(req, res) {
     allowHeaders: "content-type, authorization, idempotency-key",
   });
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST")   return res.status(405).json({ ok:false, error:"method_not_allowed" });
+  if (req.method === "GET")     return res.status(200).json({ ok:true, ready:true, endpoint:"/api/v1-preview" });
+  if (req.method !== "POST")    return res.status(405).json({ ok:false, error:"method_not_allowed" });
 
   try {
     if (!sb) return res.status(500).json({ ok:false, error:"missing_env_supabase" });
     ensureSupabaseClient(sb, "service");
     const form = (req.body && typeof req.body === "object") ? req.body : {};
 
-    const ratio = clamp(form?.aspect_ratio, RATIO);
+    const ratio = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO);
     const [W, H] = SIZE[ratio] || [640, 640];
 
     const seed = Number.isFinite(Number(form?.seed)) ? Math.max(0, Math.floor(Number(form.seed))) : DEFAULT_SEED;
     const prompt = ok(form?.prompt) ? String(form.prompt) : buildPrompt(form);
 
-    // Cache key now includes seed and size → correct reuse across seeds/sizes
+    // Cache key includes seed and size
     const formKey = exactKey(form);
     const key = `${formKey}|seed:${seed}|${W}x${H}`;
 
@@ -149,19 +150,29 @@ export default async function handler(req, res) {
     }
 
     // 1) Pollinations (model=flux)
-    const base = "https://image.pollinations.ai/prompt/"; // official endpoint
+    const base = "https://image.pollinations.ai/prompt/";
     const q = new URLSearchParams({
       model: "flux",
       width: String(W), height: String(H),
       seed: String(seed),
       private: "true",
       enhance: "true",
-      nologo: "true", // always hide logo
+      nologo: "true",
     }).toString();
     const url  = `${base}${encodeURIComponent(prompt)}?${q}`;
 
     const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
-    const r = await fetch(url, { headers, signal: AbortSignal.timeout(60_000) });
+
+    let r;
+    if (typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal) {
+      r = await fetch(url, { headers, signal: AbortSignal.timeout(60_000) });
+    } else {
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort('timeout'), 60_000);
+      try { r = await fetch(url, { headers, signal: ac.signal }); }
+      finally { clearTimeout(t); }
+    }
+
     if (!r.ok) {
       const msg = await r.text().catch(()=> "");
       return res.status(r.status).json({ ok:false, error:"pollinations_failed", details: msg.slice(0,400) });
