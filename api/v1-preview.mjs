@@ -1,22 +1,23 @@
-// /api/v1-preview.mjs — Final V3.3
-// - Health-check GET (200)
-// - Seed & size included in cache key
-// - Prompt: waist-up studio portrait, 85mm, bald handling, grammar fix
-// - Reads both snake_case and camelCase form keys (Figma compatible)
-// - Always nologo=true, private=true, enhance=true
-// - Safe timeout fallback if AbortSignal.timeout is unavailable
+// /api/v1-preview.mjs — Final V3.4
+// ✅ Health-check GET (200)
+// ✅ Seed & size in cache key
+// ✅ Prompt: waist-up studio portrait, 85mm, bald handling, grammar fix
+// ✅ Reads snake_case & camelCase (Figma compat)
+// ✅ Always nologo=true, private=true, enhance=true
+// ✅ Safe timeout fallback if AbortSignal.timeout is unavailable
+// ✅ Lazy Supabase init (évite FUNCTION_INVOCATION_FAILED si ENV manquantes)
 
 export const config = { runtime: "nodejs" };
 
 import { setCORS } from "../http.mjs";
 import { ensureSupabaseClient, getSupabaseServiceRole } from "../supabase.mjs";
 
-/* ---------- Supabase ---------- */
-const sb = getSupabaseServiceRole();
+/* ---------- Supabase (lazy) ---------- */
+let sb = null; // sera initialisé dans le handler
 
 /* ---------- ENV ---------- */
-const POL_TOKEN  = process.env.POLLINATIONS_TOKEN || ""; // optional
-const BUCKET     = process.env.PREVIEW_BUCKET || "generated_images";
+const POL_TOKEN   = process.env.POLLINATIONS_TOKEN || ""; // optional
+const BUCKET      = process.env.PREVIEW_BUCKET || "generated_images";
 const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC || "true") === "true";
 const SIGNED_TTL_S  = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7);
 const CACHE_CONTROL = String(process.env.PREVIEW_CACHE_CONTROL_S || 31536000);
@@ -59,7 +60,7 @@ function subjectFromGender(g) { return g === "man" ? "adult man" : "adult woman"
 function outfitLabel(outfit, gender) {
   if (outfit === "athleisure") {
     return gender === "man" ? "fitted athletic t-shirt (athleisure look)" : "neutral athleisure top";
-  }
+    }
   return { blazer:"navy blazer and white shirt", shirt:"smart shirt", tee:"clean crew-neck tee" }[outfit];
 }
 function buildPrompt(form) {
@@ -128,8 +129,13 @@ export default async function handler(req, res) {
   if (req.method !== "POST")    return res.status(405).json({ ok:false, error:"method_not_allowed" });
 
   try {
-    if (!sb) return res.status(500).json({ ok:false, error:"missing_env_supabase" });
+    // Init Supabase ici (lazy) pour éviter un crash top-level si ENV manquantes
+    if (!sb) {
+      try { sb = getSupabaseServiceRole(); }
+      catch { return res.status(500).json({ ok:false, error:"missing_env_supabase" }); }
+    }
     ensureSupabaseClient(sb, "service");
+
     const form = (req.body && typeof req.body === "object") ? req.body : {};
 
     const ratio = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO);
@@ -150,7 +156,7 @@ export default async function handler(req, res) {
     }
 
     // 1) Pollinations (model=flux)
-    const base = "https://image.pollinations.ai/prompt/";
+    const base = "https://image.pollinations.ai/prompt/"; // endpoint officiel
     const q = new URLSearchParams({
       model: "flux",
       width: String(W), height: String(H),
