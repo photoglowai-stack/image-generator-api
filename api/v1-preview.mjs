@@ -1,23 +1,32 @@
-// /api/v1-preview.mjs — Final V3.5
-// 🔐 Crash‑proof cold start: dynamic import de supabase.mjs dans le handler
-// ✅ Health‑check GET (200)
-// ✅ Seed & size dans la cache key
-// ✅ Prompt: waist‑up studio portrait, 85mm, bald handling
-// ✅ camelCase + snake_case (compat Figma)
+// /api/v1-preview.mjs — Final V3.6
+// 🧯 Self-contained CORS (no http.mjs)
+// 🔐 Crash‑proof cold start: dynamic import of supabase.mjs inside POST only
+// ✅ GET health-check (200) even with missing ENV
+// ✅ Seed & size in cache key
+// ✅ Prompt tuned for waist‑up studio portrait, 85mm, bald handling
+// ✅ camelCase + snake_case accepted (Figma compat)
 // ✅ nologo=true, private=true, enhance=true
-// ✅ Fallback timeout si AbortSignal.timeout indisponible
+// ✅ Fallback timeout when AbortSignal.timeout is unavailable
 
 export const config = { runtime: "nodejs" };
 
-import { setCORS } from "../http.mjs"; // léger, safe à importer au top‑level
+/* ---------- CORS (inline, minimal & safe) ---------- */
+function setCORS(req, res, opts = {}) {
+  const allowMethods = opts.allowMethods || "GET,POST,OPTIONS";
+  const allowHeaders = opts.allowHeaders || "content-type, authorization, idempotency-key";
+  res.setHeader("access-control-allow-origin", "*"); // Figma (Origin: null) OK
+  res.setHeader("access-control-allow-methods", allowMethods);
+  res.setHeader("access-control-allow-headers", allowHeaders);
+  res.setHeader("access-control-max-age", "86400"); // 24h preflight
+}
 
 /* ---------- ENV ---------- */
-const POL_TOKEN   = process.env.POLLINATIONS_TOKEN || ""; // optionnel
-const BUCKET      = process.env.PREVIEW_BUCKET || "generated_images";
-const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC || "true") === "true";
-const SIGNED_TTL_S  = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7);
-const CACHE_CONTROL = String(process.env.PREVIEW_CACHE_CONTROL_S || 31536000);
-const DEFAULT_SEED  = Number(process.env.PREVIEW_SEED || 777);
+const POL_TOKEN      = process.env.POLLINATIONS_TOKEN || ""; // optional
+const BUCKET         = process.env.PREVIEW_BUCKET || "generated_images";
+const OUTPUT_PUBLIC  = (process.env.OUTPUT_PUBLIC || "true") === "true";
+const SIGNED_TTL_S   = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7);
+const CACHE_CONTROL  = String(process.env.PREVIEW_CACHE_CONTROL_S || 31536000);
+const DEFAULT_SEED   = Number(process.env.PREVIEW_SEED || 777);
 
 /* ---------- Helpers & vocab ---------- */
 const ok = (v) => typeof v === "string" && v.trim().length > 0;
@@ -29,13 +38,13 @@ const MOOD = ["warm","neutral","cool"];
 const RATIO = ["1:1","3:4"];
 const SKIN = ["light","fair","medium","tan","deep"];
 const HAIR_COLOR = ["black","brown","blonde","red","gray"];
-const HAIR_LEN = ["short","medium","long","bald"]; // + bald support
+const HAIR_LEN = ["short","medium","long","bald"]; // bald support
 const EYE = ["brown","blue","green","hazel","gray"];
 const BODY = ["slim","athletic","average","curvy","muscular"];
 
 const SIZE = { "1:1": [640, 640], "3:4": [720, 960] };
 
-/* ---------- Cache key (discrétisée + seed/size) ---------- */
+/* ---------- Cache key (discretized + seed/size) ---------- */
 function exactKey(form) {
   const gender = clamp(form?.gender, ["woman","man"], 0);
   const preset = clamp(form?.preset, ["linkedin_pro","ceo_office","lifestyle_warm","speaker_press"]);
@@ -47,11 +56,11 @@ function exactKey(form) {
   const hairC  = clamp(form?.hair_color ?? form?.hairColor ?? form?.hair, HAIR_COLOR, 1);
   const hairL  = clamp(form?.hair_length ?? form?.hairLength ?? form?.hairLen, HAIR_LEN, 2);
   const eyes   = clamp(form?.eye_color ?? form?.eyeColor ?? form?.eyes, EYE, 0);
-  const body   = clamp(form?.body_type ?? form?.bodyType, BODY, 2); // average par défaut
+  const body   = clamp(form?.body_type ?? form?.bodyType, BODY, 2); // average by default
   return `${gender}|${preset}|${bg}|${outfit}|${mood}|${ratio}|${skin}|${hairC}|${hairL}|${eyes}|${body}`;
 }
 
-/* ---------- Prompt universelle ---------- */
+/* ---------- Prompt ---------- */
 function subjectFromGender(g) { return g === "man" ? "adult man" : "adult woman"; }
 function outfitLabel(outfit, gender) {
   if (outfit === "athleisure") {
@@ -101,11 +110,12 @@ export default async function handler(req, res) {
     allowMethods: "GET,POST,OPTIONS",
     allowHeaders: "content-type, authorization, idempotency-key",
   });
+
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method === "GET")     return res.status(200).json({ ok:true, ready:true, endpoint:"/api/v1-preview" });
   if (req.method !== "POST")    return res.status(405).json({ ok:false, error:"method_not_allowed" });
 
-  // ⚠️ Import dynamique de supabase.mjs pour éviter un crash au cold start
+  // 🔌 Dynamic import of Supabase helpers (prevents cold-start crash if ENV are missing)
   let ensureSupabaseClient, getSupabaseServiceRole, sb;
   try {
     ({ ensureSupabaseClient, getSupabaseServiceRole } = await import("../supabase.mjs"));
