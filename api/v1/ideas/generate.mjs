@@ -1,20 +1,21 @@
-// /api/v1/ideas/generate.mjs — Ideas Generator (Pollinations-aligned)
+// /api/v1/ideas/generate.mjs — Ideas Generator (Pollinations-aligned, robust import)
 export const config = { runtime: "nodejs" };
 
-/* ---------- CORS (inline) ---------- */
+/* ---------- CORS ---------- */
 function setCORS(req, res, opts = {}) {
-  res.setHeader("access-control-allow-origin", "*"); // Figma (Origin: null) OK
+  res.setHeader("access-control-allow-origin", "*");
   res.setHeader("access-control-allow-methods", opts.allowMethods || "GET,POST,OPTIONS");
   res.setHeader("access-control-allow-headers", opts.allowHeaders || "content-type, authorization, idempotency-key");
   res.setHeader("access-control-max-age", "86400");
 }
 
-/* ---------- ENV (mêmes patterns que v1-preview) ---------- */
-const POL_TOKEN      = process.env.POLLINATIONS_TOKEN || ""; // optionnel
-const BUCKET         = process.env.BUCKET_IMAGES || "generated"; // (ta capture montre "generated_images")
-const OUTPUT_PUBLIC  = (process.env.OUTPUT_PUBLIC || "true") === "true";
-const SIGNED_TTL_S   = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
-const CACHE_CONTROL  = String(process.env.IDEAS_CACHE_CONTROL_S || 31536000);
+/* ---------- ENV ---------- */
+const POL_TOKEN     = process.env.POLLINATIONS_TOKEN || "";
+// Aligne-toi sur le preview qui utilise PREVIEW_BUCKET par défaut
+const BUCKET        = process.env.PREVIEW_BUCKET || process.env.BUCKET_IMAGES || "generated_images";
+const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC || "true") === "true";
+const SIGNED_TTL_S  = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
+const CACHE_CONTROL = String(process.env.IDEAS_CACHE_CONTROL_S || 31536000);
 
 /* ---------- Helpers ---------- */
 const sanitize = (s) => String(s).toLowerCase().replace(/[^a-z0-9\-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
@@ -44,10 +45,27 @@ async function bufferFromPollinations({ prompt, width = 1024, height = 1024, mod
   }
   const bytes = Buffer.from(await r.arrayBuffer());
   const ctype = r.headers.get('content-type') || '';
-  if (!/image\/(jpeg|jpg|png|webp)/i.test(ctype)) {
-    throw new Error(`unexpected_content_type ${ctype}`);
-  }
+  if (!/image\/(jpeg|jpg|png|webp)/i.test(ctype)) throw new Error(`unexpected_content_type ${ctype}`);
   return bytes;
+}
+
+/* ---------- Robust dynamic import of supabase.mjs ---------- */
+async function loadSupabaseModule() {
+  // Essayons d’abord 3 niveaux (repo racine), puis 2 niveaux (si supabase.mjs est sous /api)
+  const candidates = [
+    '../../../supabase.mjs', // racine (depuis /api/v1/ideas/)
+    '../../supabase.mjs',    // si supabase.mjs a été placé dans /api/
+  ];
+  let lastErr;
+  for (const rel of candidates) {
+    try {
+      const mod = await import(new URL(rel, import.meta.url));
+      if (mod?.getSupabaseServiceRole && mod?.ensureSupabaseClient) return mod;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(`supabase_module_load_failed: ${String(lastErr).slice(0,200)}`);
 }
 
 /* ---------- Handler ---------- */
@@ -58,12 +76,12 @@ export default async function handler(req, res) {
   });
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  // ✅ Debug : vérifie au runtime que l'import et les ENV sont OK
+  // Debug: vérifie qu’on voit bien les ENV via supabase.mjs (sans dévoiler les secrets)
   if (req.method === "GET" && req.query?.debug === "1") {
     try {
-      const mod = await import("../../../supabase.mjs"); // 👈 CORRIGÉ (3 niveaux)
-      const sb = mod?.getSupabaseServiceRole?.();
-      mod?.ensureSupabaseClient?.(sb, "service");
+      const { ensureSupabaseClient, getSupabaseServiceRole } = await loadSupabaseModule();
+      const sb = getSupabaseServiceRole(); // lit SUPABASE_URL + SERVICE_ROLE
+      ensureSupabaseClient(sb, "service");
       return res.status(200).json({
         ok: true, endpoint: "/api/v1/ideas/generate",
         has_supabase_url: true, has_service_role: true, bucket: BUCKET, output_public: OUTPUT_PUBLIC
@@ -80,10 +98,10 @@ export default async function handler(req, res) {
     return res.status(405).json({ success:false, error:"method_not_allowed" });
   }
 
-  // Import dynamique (même pattern que v1-preview)
+  // Import dynamique du client Supabase (comme v1-preview)
   let sb;
   try {
-    const { ensureSupabaseClient, getSupabaseServiceRole } = await import("../../../supabase.mjs"); // 👈 CORRIGÉ
+    const { ensureSupabaseClient, getSupabaseServiceRole } = await loadSupabaseModule();
     sb = getSupabaseServiceRole();
     ensureSupabaseClient(sb, "service");
   } catch (e) {
@@ -119,7 +137,7 @@ export default async function handler(req, res) {
     });
     if (up.error) return res.status(500).json({ success:false, error:"upload_failed", details: String(up.error).slice(0,200) });
 
-    // 3) URL
+    // 3) URL publique / signée
     let imageUrl;
     if (OUTPUT_PUBLIC) {
       const { data } = sb.storage.from(BUCKET).getPublicUrl(path);
