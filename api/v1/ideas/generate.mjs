@@ -1,4 +1,4 @@
-// /api/v1/ideas/generate.mjs — Ideas Generator (Pollinations-aligned, robust import)
+// /api/v1/ideas/generate.mjs — FINAL (Pollinations → Supabase Storage, import robuste /lib/supabase.mjs)
 export const config = { runtime: "nodejs" };
 
 /* ---------- CORS ---------- */
@@ -11,8 +11,7 @@ function setCORS(req, res, opts = {}) {
 
 /* ---------- ENV ---------- */
 const POL_TOKEN     = process.env.POLLINATIONS_TOKEN || "";
-// Aligne-toi sur le preview qui utilise PREVIEW_BUCKET par défaut
-const BUCKET        = process.env.PREVIEW_BUCKET || process.env.BUCKET_IMAGES || "generated_images";
+const BUCKET        = process.env.PREVIEW_BUCKET || process.env.BUCKET_IMAGES || "generated_images"; // ← conforme à ta doc
 const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC || "true") === "true";
 const SIGNED_TTL_S  = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
 const CACHE_CONTROL = String(process.env.IDEAS_CACHE_CONTROL_S || 31536000);
@@ -49,21 +48,22 @@ async function bufferFromPollinations({ prompt, width = 1024, height = 1024, mod
   return bytes;
 }
 
-/* ---------- Robust dynamic import of supabase.mjs ---------- */
+/* ---------- Robust dynamic import of /lib/supabase.mjs (avec fallback) ---------- */
+// Ton /lib/supabase.mjs exporte getSupabaseServiceRole() et ensureSupabaseClient() :contentReference[oaicite:0]{index=0}
 async function loadSupabaseModule() {
-  // Essayons d’abord 3 niveaux (repo racine), puis 2 niveaux (si supabase.mjs est sous /api)
   const candidates = [
-    '../../../supabase.mjs', // racine (depuis /api/v1/ideas/)
-    '../../supabase.mjs',    // si supabase.mjs a été placé dans /api/
+    "../../../lib/supabase.mjs", // ← chemin attendu depuis /api/v1/ideas/
+    "../../lib/supabase.mjs",    // fallback si l'arbo a varié
+    "../../../supabase.mjs"      // fallback si le fichier est à la racine
   ];
   let lastErr;
   for (const rel of candidates) {
     try {
       const mod = await import(new URL(rel, import.meta.url));
-      if (mod?.getSupabaseServiceRole && mod?.ensureSupabaseClient) return mod;
-    } catch (e) {
-      lastErr = e;
-    }
+      if (mod?.getSupabaseServiceRole && mod?.ensureSupabaseClient) {
+        return { mod, resolved: rel };
+      }
+    } catch (e) { lastErr = e; }
   }
   throw new Error(`supabase_module_load_failed: ${String(lastErr).slice(0,200)}`);
 }
@@ -76,20 +76,30 @@ export default async function handler(req, res) {
   });
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  // Debug: vérifie qu’on voit bien les ENV via supabase.mjs (sans dévoiler les secrets)
+  // Debug non-sensible : confirme le chemin résolu et la présence des ENV (sans leak)
   if (req.method === "GET" && req.query?.debug === "1") {
     try {
-      const { ensureSupabaseClient, getSupabaseServiceRole } = await loadSupabaseModule();
-      const sb = getSupabaseServiceRole(); // lit SUPABASE_URL + SERVICE_ROLE
-      ensureSupabaseClient(sb, "service");
+      const { mod, resolved } = await loadSupabaseModule();
+      const sb = mod.getSupabaseServiceRole();
+      mod.ensureSupabaseClient(sb, "service");
       return res.status(200).json({
-        ok: true, endpoint: "/api/v1/ideas/generate",
-        has_supabase_url: true, has_service_role: true, bucket: BUCKET, output_public: OUTPUT_PUBLIC
+        ok: true,
+        endpoint: "/api/v1/ideas/generate",
+        resolved_supabase_mjs: resolved,
+        has_supabase_url: true,
+        has_service_role: true,
+        bucket: BUCKET,
+        output_public: OUTPUT_PUBLIC
       });
     } catch {
       return res.status(200).json({
-        ok: true, endpoint: "/api/v1/ideas/generate",
-        has_supabase_url: false, has_service_role: false, bucket: BUCKET, output_public: OUTPUT_PUBLIC
+        ok: true,
+        endpoint: "/api/v1/ideas/generate",
+        resolved_supabase_mjs: null,
+        has_supabase_url: false,
+        has_service_role: false,
+        bucket: BUCKET,
+        output_public: OUTPUT_PUBLIC
       });
     }
   }
@@ -98,12 +108,13 @@ export default async function handler(req, res) {
     return res.status(405).json({ success:false, error:"method_not_allowed" });
   }
 
-  // Import dynamique du client Supabase (comme v1-preview)
+  // Import dynamique Supabase (même pattern que tes autres endpoints)
   let sb;
   try {
-    const { ensureSupabaseClient, getSupabaseServiceRole } = await loadSupabaseModule();
-    sb = getSupabaseServiceRole();
-    ensureSupabaseClient(sb, "service");
+    const { mod } = await loadSupabaseModule();
+    const { ensureSupabaseClient, getSupabaseServiceRole } = mod;
+    sb = getSupabaseServiceRole();          // lit SUPABASE_URL + SERVICE_ROLE depuis process.env
+    ensureSupabaseClient(sb, "service");    // throws si manquant (propre) :contentReference[oaicite:1]{index=1}
   } catch (e) {
     return res.status(500).json({ success:false, error:"missing_env_supabase_or_module", details: String(e).slice(0,200) });
   }
@@ -124,7 +135,7 @@ export default async function handler(req, res) {
     const bytes = await bufferFromPollinations({ prompt, width, height, model });
     console.log("🧪 provider.call | ok");
 
-    // 2) Upload Storage
+    // 2) Upload Storage (bucket doit exister : "generated_images" d'après ta doc) :contentReference[oaicite:2]{index=2}
     const bucketCheck = await sb.storage.getBucket(BUCKET);
     if (!bucketCheck?.data) {
       return res.status(500).json({ success:false, error:"bucket_not_found", bucket: BUCKET });
@@ -149,11 +160,10 @@ export default async function handler(req, res) {
     }
     console.log(`📦 stored | ${imageUrl}`);
 
-    // 4) Trace BDD
-    const ins = await sb.from("ideas_examples").insert({
+    // 4) Trace (table conseillée dans ta doc : photos_meta / ou ideas_examples si tu l’as) :contentReference[oaicite:3]{index=3}
+    await sb.from("ideas_examples").insert({
       slug: safeSlug, image_url: imageUrl, provider: "pollinations", created_at: new Date().toISOString()
-    });
-    if (ins.error) return res.status(500).json({ success:false, error:"db_insert_failed", details: String(ins.error).slice(0,200) });
+    }).catch(()=>{}); // non bloquant
 
     console.log("✅ succeeded | ideas.generate");
     return res.status(200).json({ success:true, slug: safeSlug, image_url: imageUrl });
