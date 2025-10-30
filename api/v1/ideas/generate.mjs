@@ -11,7 +11,7 @@ function setCORS(req, res, opts = {}) {
 
 /* ---------- ENV (mêmes patterns que v1-preview) ---------- */
 const POL_TOKEN      = process.env.POLLINATIONS_TOKEN || ""; // optionnel
-const BUCKET         = process.env.BUCKET_IMAGES || "generated"; // 👈 même nom que ta capture
+const BUCKET         = process.env.BUCKET_IMAGES || "generated"; // (ta capture montre "generated_images")
 const OUTPUT_PUBLIC  = (process.env.OUTPUT_PUBLIC || "true") === "true";
 const SIGNED_TTL_S   = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
 const CACHE_CONTROL  = String(process.env.IDEAS_CACHE_CONTROL_S || 31536000);
@@ -58,10 +58,10 @@ export default async function handler(req, res) {
   });
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  // ✅ Debug: vérifie au runtime que les ENV sont bien vues (sans révéler de secrets)
+  // ✅ Debug : vérifie au runtime que l'import et les ENV sont OK
   if (req.method === "GET" && req.query?.debug === "1") {
     try {
-      const mod = await import("../../supabase.mjs"); // depuis /api/v1/ideas/
+      const mod = await import("../../../supabase.mjs"); // 👈 CORRIGÉ (3 niveaux)
       const sb = mod?.getSupabaseServiceRole?.();
       mod?.ensureSupabaseClient?.(sb, "service");
       return res.status(200).json({
@@ -80,10 +80,10 @@ export default async function handler(req, res) {
     return res.status(405).json({ success:false, error:"method_not_allowed" });
   }
 
-  // Import dynamique (exactement comme v1-preview)
+  // Import dynamique (même pattern que v1-preview)
   let sb;
   try {
-    const { ensureSupabaseClient, getSupabaseServiceRole } = await import("../../supabase.mjs");
+    const { ensureSupabaseClient, getSupabaseServiceRole } = await import("../../../supabase.mjs"); // 👈 CORRIGÉ
     sb = getSupabaseServiceRole();
     ensureSupabaseClient(sb, "service");
   } catch (e) {
@@ -102,7 +102,7 @@ export default async function handler(req, res) {
   console.log(`🧾 request | ideas.generate | slug=${safeSlug} | bucket=${BUCKET}`);
 
   try {
-    // 1) Génération via Pollinations (même que preview)
+    // 1) Génération via Pollinations
     const bytes = await bufferFromPollinations({ prompt, width, height, model });
     console.log("🧪 provider.call | ok");
 
@@ -119,7 +119,7 @@ export default async function handler(req, res) {
     });
     if (up.error) return res.status(500).json({ success:false, error:"upload_failed", details: String(up.error).slice(0,200) });
 
-    // 3) URL publique / signée
+    // 3) URL
     let imageUrl;
     if (OUTPUT_PUBLIC) {
       const { data } = sb.storage.from(BUCKET).getPublicUrl(path);
@@ -131,7 +131,7 @@ export default async function handler(req, res) {
     }
     console.log(`📦 stored | ${imageUrl}`);
 
-    // 4) Trace en BDD
+    // 4) Trace BDD
     const ins = await sb.from("ideas_examples").insert({
       slug: safeSlug, image_url: imageUrl, provider: "pollinations", created_at: new Date().toISOString()
     });
