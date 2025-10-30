@@ -10,20 +10,23 @@ function setCORS(req, res, opts = {}) {
   res.setHeader("access-control-allow-methods", opts.allowMethods || "GET,POST,OPTIONS");
   res.setHeader("access-control-allow-headers", opts.allowHeaders || "content-type, authorization, idempotency-key");
   res.setHeader("access-control-max-age", "86400");
+  res.setHeader("content-type", "application/json");
 }
 
 /* ---------- ENV (server) ---------- */
-const SUPABASE_URL              = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-const BUCKET                    = process.env.BUCKET_IMAGES || process.env.PREVIEW_BUCKET || "generated_images";
-const POL_TOKEN                 = process.env.POLLINATIONS_TOKEN || "";
-const OUTPUT_PUBLIC             = (process.env.OUTPUT_PUBLIC || "true") === "true";
-const SIGNED_TTL_S              = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
-const CACHE_CONTROL             = String(process.env.IDEAS_CACHE_CONTROL_S || 31536000);
+const SUPABASE_URL                = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+const SUPABASE_SERVICE_ROLE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const BUCKET                      = process.env.BUCKET_IMAGES || process.env.PREVIEW_BUCKET || "generated_images";
+const POL_TOKEN                   = process.env.POLLINATIONS_TOKEN || "";
+const OUTPUT_PUBLIC               = (process.env.OUTPUT_PUBLIC || "true") === "true";
+const SIGNED_TTL_S                = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
+const CACHE_CONTROL               = String(process.env.IDEAS_CACHE_CONTROL_S || 31536000);
 
 /* ---------- Helpers ---------- */
-const sanitize = (s) => String(s).toLowerCase().replace(/[^a-z0-9\-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+const sanitize = (s) =>
+  String(s).toLowerCase().replace(/[^a-z0-9\-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
 const today = () => new Date().toISOString().slice(0, 10);
+const clamp = (n, min, max) => Math.max(min, Math.min(max, Math.floor(n || 0)));
 
 async function fetchWithTimeout(url, init, ms) {
   if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
@@ -36,21 +39,34 @@ async function fetchWithTimeout(url, init, ms) {
 }
 
 async function bufferFromPollinations({ prompt, width = 1024, height = 1024, model = "flux", timeoutMs = 60000 }) {
+  // borne les tailles pour éviter les abus / erreurs provider
+  const W = clamp(width, 64, 1792);
+  const H = clamp(height, 64, 1792);
+
   const q = new URLSearchParams({
-    model, width: String(width), height: String(height),
+    model, width: String(W), height: String(H),
     private: "true", enhance: "true", nologo: "true"
   }).toString();
+
   const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
   const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
   const r = await fetchWithTimeout(url, { headers }, timeoutMs);
+
   if (!r.ok) {
     const msg = await r.text().catch(() => "");
     throw new Error(`pollinations_failed ${r.status} ${r.statusText} | ${msg.slice(0,200)}`);
   }
+
+  const ctype = (r.headers.get("content-type") || "").toLowerCase();
+  if (!/image\/(jpeg|jpg|png|webp)/i.test(ctype)) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`unexpected_content_type ${ctype || "(empty)"} | ${msg.slice(0,200)}`);
+  }
+
   const bytes = Buffer.from(await r.arrayBuffer());
-  const ctype = r.headers.get("content-type") || "";
-  if (!/image\/(jpeg|jpg|png|webp)/i.test(ctype)) throw new Error(`unexpected_content_type ${ctype}`);
-  return bytes;
+  return { bytes, ctype: /image\/(jpeg|jpg)/i.test(ctype) ? "image/jpeg" :
+                         /image\/png/i.test(ctype) ? "image/png" :
+                         /image\/webp/i.test(ctype) ? "image/webp" : "application/octet-stream" };
 }
 
 function getSb() {
@@ -87,6 +103,7 @@ export default async function handler(req, res) {
   // Body tolérant
   let body = req.body;
   if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+
   const { slug, prompt, width = 1024, height = 1024, model = "flux" } = body || {};
   if (!slug || !prompt) return res.status(400).json({ success: false, error: "missing_slug_or_prompt" });
 
@@ -102,7 +119,7 @@ export default async function handler(req, res) {
 
   try {
     // 1) Génération via Pollinations
-    const bytes = await bufferFromPollinations({ prompt, width, height, model });
+    const { bytes, ctype } = await bufferFromPollinations({ prompt, width, height, model });
     console.log("🧪 provider.call | ok");
 
     // 2) Upload Storage
@@ -112,11 +129,13 @@ export default async function handler(req, res) {
     }
 
     const up = await sb.storage.from(BUCKET).upload(keyPath, bytes, {
-      contentType: "image/jpeg",
+      contentType: ctype || "image/jpeg",
       upsert: true,
       cacheControl: CACHE_CONTROL
     });
-    if (up.error) return res.status(500).json({ success: false, error: "upload_failed", details: String(up.error).slice(0,200) });
+    if (up.error) {
+      return res.status(500).json({ success: false, error: "upload_failed", details: String(up.error).slice(0,200) });
+    }
 
     // 3) URL publique / signée
     let imageUrl;
@@ -130,10 +149,17 @@ export default async function handler(req, res) {
     }
     console.log(`📦 stored | ${imageUrl}`);
 
-    // 4) Trace (non bloquant)
-    await sb.from("ideas_examples").insert({
-      slug: safeSlug, image_url: imageUrl, provider: "pollinations", created_at: new Date().toISOString()
-    }).catch(() => {});
+    // 4) Trace (non bloquant) — v2: pas de .catch() chainé
+    const ins = await sb.from("ideas_examples").insert({
+      slug: safeSlug,
+      image_url: imageUrl,
+      provider: "pollinations",
+      created_at: new Date().toISOString()
+    });
+    if (ins?.error) {
+      // on log seulement; n'empêche pas le succès de la génération
+      console.warn("db_insert_failed", ins.error);
+    }
 
     console.log("✅ succeeded | ideas.generate");
     return res.status(200).json({ success: true, slug: safeSlug, image_url: imageUrl });
