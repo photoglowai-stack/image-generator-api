@@ -3,11 +3,7 @@ import { createClient } from '@supabase/supabase-js'
 
 // ---------- Utils ----------
 const sanitize = (s) =>
-  String(s)
-    .toLowerCase()
-    .replace(/[^a-z0-9\-]/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
+  String(s).toLowerCase().replace(/[^a-z0-9\-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
 const today = () => new Date().toISOString().slice(0, 10) // YYYY-MM-DD
 
 function getSupabase() {
@@ -26,8 +22,7 @@ async function fetchWithTimeout(url, init, timeoutMs) {
   const controller = new AbortController()
   const id = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const res = await fetch(url, { ...init, signal: controller.signal })
-    return res
+    return await fetch(url, { ...init, signal: controller.signal })
   } finally {
     clearTimeout(id)
   }
@@ -51,18 +46,13 @@ async function validateAndBuffer(res) {
   return Buffer.from(ab)
 }
 
-/**
- * Génère une image (Buffer binaire) avec Pollinations.
- * POST prioritaire, fallback GET. Taille bornée.
- */
 async function generateWithPollinations({ prompt, width = 1024, height = 1024, model = 'flux', negative, timeoutMs = 25000 }) {
   if (!prompt || typeof prompt !== 'string') throw new Error('generateWithPollinations: prompt is required')
-
   const maxSide = 1792
   width = Math.min(Math.max(64, Math.floor(width)), maxSide)
   height = Math.min(Math.max(64, Math.floor(height)), maxSide)
 
-  // Tentative POST
+  // POST prioritaire
   try {
     const res = await fetchWithTimeout(
       POLLINATIONS_POST,
@@ -88,7 +78,6 @@ async function generateWithPollinations({ prompt, width = 1024, height = 1024, m
     `?width=${width}&height=${height}` +
     (model ? `&model=${encodeURIComponent(model)}` : '') +
     (negative ? `&negative=${encodeURIComponent(negative)}` : '')
-
   const res = await fetchWithTimeout(
     getUrl,
     { method: 'GET', headers: { 'Accept': 'image/jpeg,image/png;q=0.9,*/*;q=0.8', 'User-Agent': 'Photoglow-API/ideas-generator' } },
@@ -109,6 +98,9 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
   res.setHeader('Content-Type', 'application/json')
+
+  // Sanity log pour vérifier la bonne version
+  console.log('IDEAS_INLINE_V3')
 
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' })
@@ -139,22 +131,22 @@ export default async function handler(req, res) {
     const buffer = await generateWithPollinations({ prompt, width, height, model })
     console.log('🧪 provider.call | ok')
 
-    // 2) Upload Storage (clé = KEY, bucket = BUCKET)
+    // 2) Upload Storage
     const { error: uploadError } = await supabase.storage
       .from(BUCKET)
       .upload(KEY, buffer, { contentType: 'image/jpeg', upsert: true })
     if (uploadError) { console.error('❌ upload', uploadError); throw uploadError }
 
-    // 3) URL publique (si bucket public)
+    // 3) URL publique (ou signée si privé)
     const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(KEY)
     let imageUrl = pub?.publicUrl
-    // Si bucket privé :
+    // Privé :
     // const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(KEY, 60*60*24*30)
     // imageUrl = signed?.signedUrl
 
     console.log(`📦 stored   | ${imageUrl}`)
 
-    // 4) DB insert (trace)
+    // 4) DB insert
     const { error: insertError } = await supabase.from('ideas_examples').insert({
       slug: safeSlug,
       image_url: imageUrl,
