@@ -6,12 +6,20 @@ const sanitize = (s) =>
   String(s).toLowerCase().replace(/[^a-z0-9\-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
 const today = () => new Date().toISOString().slice(0, 10) // YYYY-MM-DD
 
-function getSupabase() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
-  if (!url || !serviceKey) {
-    throw new Error('Missing env: NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY')
+function getConfig() {
+  // ✅ accepte SUPABASE_URL (serveur) ou NEXT_PUBLIC_SUPABASE_URL (client)
+  const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
+  const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
+  const BUCKET = process.env.BUCKET_IMAGES || 'generated'
+  const POLLINATIONS_TOKEN = process.env.POLLINATIONS_TOKEN || '' // optionnel
+
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Missing env: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) or SUPABASE_SERVICE_ROLE_KEY')
   }
+  return { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, BUCKET, POLLINATIONS_TOKEN }
+}
+
+function getSupabase(url, serviceKey) {
   return createClient(url, serviceKey)
 }
 
@@ -28,9 +36,7 @@ async function fetchWithTimeout(url, init, timeoutMs) {
   }
 }
 
-async function safeText(res) {
-  try { return await res.text() } catch { return '' }
-}
+async function safeText(res) { try { return await res.text() } catch { return '' } }
 
 async function validateAndBuffer(res) {
   if (!res.ok) {
@@ -46,25 +52,24 @@ async function validateAndBuffer(res) {
   return Buffer.from(ab)
 }
 
-async function generateWithPollinations({ prompt, width = 1024, height = 1024, model = 'flux', negative, timeoutMs = 25000 }) {
+async function generateWithPollinations({ prompt, width = 1024, height = 1024, model = 'flux', negative, timeoutMs = 25000, token = '' }) {
   if (!prompt || typeof prompt !== 'string') throw new Error('generateWithPollinations: prompt is required')
   const maxSide = 1792
   width = Math.min(Math.max(64, Math.floor(width)), maxSide)
   height = Math.min(Math.max(64, Math.floor(height)), maxSide)
 
+  const baseHeaders = {
+    'Content-Type': 'application/json',
+    'Accept': 'image/jpeg,image/png;q=0.9,*/*;q=0.8',
+    'User-Agent': 'Photoglow-API/ideas-generator'
+  }
+  if (token) baseHeaders['Authorization'] = `Bearer ${token}`
+
   // POST prioritaire
   try {
     const res = await fetchWithTimeout(
       POLLINATIONS_POST,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'image/jpeg,image/png;q=0.9,*/*;q=0.8',
-          'User-Agent': 'Photoglow-API/ideas-generator'
-        },
-        body: JSON.stringify({ prompt, width, height, model, negative })
-      },
+      { method: 'POST', headers: baseHeaders, body: JSON.stringify({ prompt, width, height, model, negative }) },
       timeoutMs
     )
     return await validateAndBuffer(res)
@@ -78,9 +83,10 @@ async function generateWithPollinations({ prompt, width = 1024, height = 1024, m
     `?width=${width}&height=${height}` +
     (model ? `&model=${encodeURIComponent(model)}` : '') +
     (negative ? `&negative=${encodeURIComponent(negative)}` : '')
+
   const res = await fetchWithTimeout(
     getUrl,
-    { method: 'GET', headers: { 'Accept': 'image/jpeg,image/png;q=0.9,*/*;q=0.8', 'User-Agent': 'Photoglow-API/ideas-generator' } },
+    { method: 'GET', headers: { ...baseHeaders } },
     timeoutMs
   )
   return await validateAndBuffer(res)
@@ -99,36 +105,27 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
   res.setHeader('Content-Type', 'application/json')
 
-  // Sanity log pour vérifier la bonne version
-  console.log('IDEAS_INLINE_V3')
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' })
-  }
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
   // Body peut être string selon le runtime
   let body = req.body
-  if (typeof body === 'string') {
-    try { body = JSON.parse(body) } catch { /* ignore */ }
-  }
+  if (typeof body === 'string') { try { body = JSON.parse(body) } catch {} }
 
   const { slug, prompt, width = 1024, height = 1024, model = 'flux' } = body || {}
-  if (!slug || !prompt) {
-    return res.status(400).json({ error: 'Missing slug or prompt' })
-  }
+  if (!slug || !prompt) return res.status(400).json({ error: 'Missing slug or prompt' })
+
+  const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, BUCKET, POLLINATIONS_TOKEN } = getConfig()
+  const supabase = getSupabase(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
   const safeSlug = sanitize(slug)
-  const BUCKET = 'generated' // ← remplace si ton bucket a un autre nom
   const now = Date.now()
   const KEY = `ideas/${safeSlug}/${today()}/${now}.jpg`
 
-  console.log(`🧾 request  | ideas.generate | slug=${safeSlug}`)
+  console.log(`🧾 request  | ideas.generate | slug=${safeSlug} | bucket=${BUCKET}`)
 
   try {
-    const supabase = getSupabase()
-
-    // 1) Génération provider
-    const buffer = await generateWithPollinations({ prompt, width, height, model })
+    // 1) Génération provider (via Pollinations) — oui, on passe bien par leur API
+    const buffer = await generateWithPollinations({ prompt, width, height, model, token: POLLINATIONS_TOKEN })
     console.log('🧪 provider.call | ok')
 
     // 2) Upload Storage
