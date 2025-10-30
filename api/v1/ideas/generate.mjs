@@ -1,161 +1,146 @@
-// api/v1/ideas/generate.mjs
-import { createClient } from '@supabase/supabase-js'
+// /api/v1/ideas/generate.mjs — Ideas Generator (Pollinations-aligned)
+export const config = { runtime: "nodejs" };
 
-// ---------- Utils ----------
-const sanitize = (s) =>
-  String(s).toLowerCase().replace(/[^a-z0-9\-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
-const today = () => new Date().toISOString().slice(0, 10) // YYYY-MM-DD
-
-function getConfig() {
-  // ✅ accepte SUPABASE_URL (serveur) ou NEXT_PUBLIC_SUPABASE_URL (client)
-  const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
-  const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
-  const BUCKET = process.env.BUCKET_IMAGES || 'generated'
-  const POLLINATIONS_TOKEN = process.env.POLLINATIONS_TOKEN || '' // optionnel
-
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error('Missing env: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) or SUPABASE_SERVICE_ROLE_KEY')
-  }
-  return { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, BUCKET, POLLINATIONS_TOKEN }
+/* ---------- CORS (inline) ---------- */
+function setCORS(req, res, opts = {}) {
+  res.setHeader("access-control-allow-origin", "*"); // Figma (Origin: null) OK
+  res.setHeader("access-control-allow-methods", opts.allowMethods || "GET,POST,OPTIONS");
+  res.setHeader("access-control-allow-headers", opts.allowHeaders || "content-type, authorization, idempotency-key");
+  res.setHeader("access-control-max-age", "86400");
 }
 
-function getSupabase(url, serviceKey) {
-  return createClient(url, serviceKey)
+/* ---------- ENV (mêmes patterns que v1-preview) ---------- */
+const POL_TOKEN      = process.env.POLLINATIONS_TOKEN || ""; // optionnel
+const BUCKET         = process.env.BUCKET_IMAGES || "generated"; // 👈 même nom que ta capture
+const OUTPUT_PUBLIC  = (process.env.OUTPUT_PUBLIC || "true") === "true";
+const SIGNED_TTL_S   = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
+const CACHE_CONTROL  = String(process.env.IDEAS_CACHE_CONTROL_S || 31536000);
+
+/* ---------- Helpers ---------- */
+const sanitize = (s) => String(s).toLowerCase().replace(/[^a-z0-9\-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+const today = () => new Date().toISOString().slice(0,10);
+
+async function fetchWithTimeout(url, init, ms) {
+  if (typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal) {
+    return fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
+  }
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort('timeout'), ms);
+  try { return await fetch(url, { ...init, signal: ac.signal }); }
+  finally { clearTimeout(t); }
 }
 
-// ---------- Pollinations (inline) ----------
-const POLLINATIONS_POST = 'https://image.pollinations.ai/prompt'
-
-async function fetchWithTimeout(url, init, timeoutMs) {
-  const controller = new AbortController()
-  const id = setTimeout(() => controller.abort(), timeoutMs)
-  try {
-    return await fetch(url, { ...init, signal: controller.signal })
-  } finally {
-    clearTimeout(id)
+async function bufferFromPollinations({ prompt, width = 1024, height = 1024, model = "flux", timeoutMs = 60000 }) {
+  const q = new URLSearchParams({
+    model, width: String(width), height: String(height),
+    private: "true", enhance: "true", nologo: "true",
+  }).toString();
+  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
+  const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
+  const r = await fetchWithTimeout(url, { headers }, timeoutMs);
+  if (!r.ok) {
+    const msg = await r.text().catch(()=> "");
+    throw new Error(`pollinations_failed ${r.status} ${r.statusText} | ${msg.slice(0,200)}`);
   }
-}
-
-async function safeText(res) { try { return await res.text() } catch { return '' } }
-
-async function validateAndBuffer(res) {
-  if (!res.ok) {
-    const txt = await safeText(res)
-    throw new Error(`Provider ${res.status} ${res.statusText}${txt ? ` | ${txt.slice(0,160)}` : ''}`)
-  }
-  const ctype = res.headers.get('content-type') || ''
+  const bytes = Buffer.from(await r.arrayBuffer());
+  const ctype = r.headers.get('content-type') || '';
   if (!/image\/(jpeg|jpg|png|webp)/i.test(ctype)) {
-    const txt = await safeText(res)
-    throw new Error(`Unexpected content-type: "${ctype}"${txt ? ` | ${txt.slice(0,160)}` : ''}`)
+    throw new Error(`unexpected_content_type ${ctype}`);
   }
-  const ab = await res.arrayBuffer()
-  return Buffer.from(ab)
+  return bytes;
 }
 
-async function generateWithPollinations({ prompt, width = 1024, height = 1024, model = 'flux', negative, timeoutMs = 25000, token = '' }) {
-  if (!prompt || typeof prompt !== 'string') throw new Error('generateWithPollinations: prompt is required')
-  const maxSide = 1792
-  width = Math.min(Math.max(64, Math.floor(width)), maxSide)
-  height = Math.min(Math.max(64, Math.floor(height)), maxSide)
-
-  const baseHeaders = {
-    'Content-Type': 'application/json',
-    'Accept': 'image/jpeg,image/png;q=0.9,*/*;q=0.8',
-    'User-Agent': 'Photoglow-API/ideas-generator'
-  }
-  if (token) baseHeaders['Authorization'] = `Bearer ${token}`
-
-  // POST prioritaire
-  try {
-    const res = await fetchWithTimeout(
-      POLLINATIONS_POST,
-      { method: 'POST', headers: baseHeaders, body: JSON.stringify({ prompt, width, height, model, negative }) },
-      timeoutMs
-    )
-    return await validateAndBuffer(res)
-  } catch (e) {
-    console.warn('[pollinations] POST failed → fallback GET:', e?.message || e)
-  }
-
-  // Fallback GET
-  const getUrl =
-    `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}` +
-    `?width=${width}&height=${height}` +
-    (model ? `&model=${encodeURIComponent(model)}` : '') +
-    (negative ? `&negative=${encodeURIComponent(negative)}` : '')
-
-  const res = await fetchWithTimeout(
-    getUrl,
-    { method: 'GET', headers: { ...baseHeaders } },
-    timeoutMs
-  )
-  return await validateAndBuffer(res)
-}
-
-// ---------- Handler ----------
+/* ---------- Handler ---------- */
 export default async function handler(req, res) {
-  // CORS / preflight
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
-    return res.status(204).end()
+  setCORS(req, res, {
+    allowMethods: "GET,POST,OPTIONS",
+    allowHeaders: "content-type, authorization, idempotency-key",
+  });
+  if (req.method === "OPTIONS") return res.status(204).end();
+
+  // ✅ Debug: vérifie au runtime que les ENV sont bien vues (sans révéler de secrets)
+  if (req.method === "GET" && req.query?.debug === "1") {
+    try {
+      const mod = await import("../../supabase.mjs"); // depuis /api/v1/ideas/
+      const sb = mod?.getSupabaseServiceRole?.();
+      mod?.ensureSupabaseClient?.(sb, "service");
+      return res.status(200).json({
+        ok: true, endpoint: "/api/v1/ideas/generate",
+        has_supabase_url: true, has_service_role: true, bucket: BUCKET, output_public: OUTPUT_PUBLIC
+      });
+    } catch {
+      return res.status(200).json({
+        ok: true, endpoint: "/api/v1/ideas/generate",
+        has_supabase_url: false, has_service_role: false, bucket: BUCKET, output_public: OUTPUT_PUBLIC
+      });
+    }
   }
-  res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
-  res.setHeader('Content-Type', 'application/json')
 
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+  if (req.method !== "POST") {
+    return res.status(405).json({ success:false, error:"method_not_allowed" });
+  }
 
-  // Body peut être string selon le runtime
-  let body = req.body
-  if (typeof body === 'string') { try { body = JSON.parse(body) } catch {} }
+  // Import dynamique (exactement comme v1-preview)
+  let sb;
+  try {
+    const { ensureSupabaseClient, getSupabaseServiceRole } = await import("../../supabase.mjs");
+    sb = getSupabaseServiceRole();
+    ensureSupabaseClient(sb, "service");
+  } catch (e) {
+    return res.status(500).json({ success:false, error:"missing_env_supabase_or_module", details: String(e).slice(0,200) });
+  }
 
-  const { slug, prompt, width = 1024, height = 1024, model = 'flux' } = body || {}
-  if (!slug || !prompt) return res.status(400).json({ error: 'Missing slug or prompt' })
+  // Body tolérant
+  let body = req.body;
+  if (typeof body === "string") { try { body = JSON.parse(body) } catch { body = {} } }
+  const { slug, prompt, width = 1024, height = 1024, model = "flux" } = body || {};
+  if (!slug || !prompt) return res.status(400).json({ success:false, error:"missing_slug_or_prompt" });
 
-  const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, BUCKET, POLLINATIONS_TOKEN } = getConfig()
-  const supabase = getSupabase(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+  const safeSlug = sanitize(slug);
+  const path = `ideas/${safeSlug}/${today()}/${Date.now()}.jpg`;
 
-  const safeSlug = sanitize(slug)
-  const now = Date.now()
-  const KEY = `ideas/${safeSlug}/${today()}/${now}.jpg`
-
-  console.log(`🧾 request  | ideas.generate | slug=${safeSlug} | bucket=${BUCKET}`)
+  console.log(`🧾 request | ideas.generate | slug=${safeSlug} | bucket=${BUCKET}`);
 
   try {
-    // 1) Génération provider (via Pollinations) — oui, on passe bien par leur API
-    const buffer = await generateWithPollinations({ prompt, width, height, model, token: POLLINATIONS_TOKEN })
-    console.log('🧪 provider.call | ok')
+    // 1) Génération via Pollinations (même que preview)
+    const bytes = await bufferFromPollinations({ prompt, width, height, model });
+    console.log("🧪 provider.call | ok");
 
     // 2) Upload Storage
-    const { error: uploadError } = await supabase.storage
-      .from(BUCKET)
-      .upload(KEY, buffer, { contentType: 'image/jpeg', upsert: true })
-    if (uploadError) { console.error('❌ upload', uploadError); throw uploadError }
+    const bucketCheck = await sb.storage.getBucket(BUCKET);
+    if (!bucketCheck?.data) {
+      return res.status(500).json({ success:false, error:"bucket_not_found", bucket: BUCKET });
+    }
 
-    // 3) URL publique (ou signée si privé)
-    const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(KEY)
-    let imageUrl = pub?.publicUrl
-    // Privé :
-    // const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(KEY, 60*60*24*30)
-    // imageUrl = signed?.signedUrl
+    const up = await sb.storage.from(BUCKET).upload(path, bytes, {
+      contentType: "image/jpeg",
+      upsert: true,
+      cacheControl: CACHE_CONTROL,
+    });
+    if (up.error) return res.status(500).json({ success:false, error:"upload_failed", details: String(up.error).slice(0,200) });
 
-    console.log(`📦 stored   | ${imageUrl}`)
+    // 3) URL publique / signée
+    let imageUrl;
+    if (OUTPUT_PUBLIC) {
+      const { data } = sb.storage.from(BUCKET).getPublicUrl(path);
+      imageUrl = data.publicUrl;
+    } else {
+      const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(path, SIGNED_TTL_S);
+      if (error) return res.status(500).json({ success:false, error:"signed_url_failed", details: String(error).slice(0,200) });
+      imageUrl = data.signedUrl;
+    }
+    console.log(`📦 stored | ${imageUrl}`);
 
-    // 4) DB insert
-    const { error: insertError } = await supabase.from('ideas_examples').insert({
-      slug: safeSlug,
-      image_url: imageUrl,
-      provider: 'pollinations',
-      created_at: new Date().toISOString()
-    })
-    if (insertError) { console.error('❌ db.insert', insertError); throw insertError }
+    // 4) Trace en BDD
+    const ins = await sb.from("ideas_examples").insert({
+      slug: safeSlug, image_url: imageUrl, provider: "pollinations", created_at: new Date().toISOString()
+    });
+    if (ins.error) return res.status(500).json({ success:false, error:"db_insert_failed", details: String(ins.error).slice(0,200) });
 
-    console.log('✅ succeeded | ideas.generate')
-    return res.status(200).json({ success: true, slug: safeSlug, image_url: imageUrl })
-  } catch (err) {
-    console.error('❌ failed   | ideas.generate', err)
-    return res.status(500).json({ success: false, error: String(err?.message || err) })
+    console.log("✅ succeeded | ideas.generate");
+    return res.status(200).json({ success:true, slug: safeSlug, image_url: imageUrl });
+  } catch (e) {
+    console.error("❌ failed | ideas.generate", e);
+    return res.status(500).json({ success:false, error:String(e).slice(0,200) });
   }
 }
