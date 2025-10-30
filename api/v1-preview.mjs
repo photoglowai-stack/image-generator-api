@@ -1,12 +1,13 @@
-// /api/v1-preview.mjs — Final V3.8 (sexy_sfw_fast)
+// /api/v1-preview.mjs — Commercial Photoreal Preview (V4)
 // 🧯 Self-contained CORS (no http.mjs)
 // 🔐 Cold-start safe: dynamic import of supabase.mjs inside POST only
 // ✅ GET health-check (200) even with missing ENV
 // ✅ Robust body parsing (string → JSON), prompt fallback if missing
-// ✅ Beauty/Glam prompt (SFW) for man & woman
+// ✅ Compact commercial prompt (≤ ~180–200 chars), SFW, photoreal
+// ✅ Deterministic variations (framing/lens/light) from seed
 // ✅ Versioned cache key (STYLE_VERSION) + seed + size
 // ✅ FAST MODE: set body.fast=true (or "1") → smaller size ⇒ faster
-// ✅ Pollinations: nologo=true, private=true, enhance=true
+// ✅ Pollinations: nologo=true, private=true, enhance=false, negative=anti-cartoon
 // ✅ Fallback timeout when AbortSignal.timeout is unavailable
 
 export const config = { runtime: "nodejs" };
@@ -20,12 +21,16 @@ function setCORS(req, res, opts = {}) {
 }
 
 /* ---------- ENV ---------- */
-const POL_TOKEN      = process.env.POLLINATIONS_TOKEN || ""; // optional
-const BUCKET         = process.env.PREVIEW_BUCKET || "generated_images";
-const OUTPUT_PUBLIC  = (process.env.OUTPUT_PUBLIC || "true") === "true";
-const SIGNED_TTL_S   = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7);
-const CACHE_CONTROL  = String(process.env.PREVIEW_CACHE_CONTROL_S || 31536000);
-const DEFAULT_SEED   = Number(process.env.PREVIEW_SEED || 777);
+const POL_TOKEN       = process.env.POLLINATIONS_TOKEN || ""; // optional
+const BUCKET          = process.env.PREVIEW_BUCKET || "generated_images";
+const OUTPUT_PUBLIC   = (process.env.OUTPUT_PUBLIC || "true") === "true";
+const SIGNED_TTL_S    = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7);
+const CACHE_CONTROL   = String(process.env.PREVIEW_CACHE_CONTROL_S || 31536000);
+const DEFAULT_SEED    = Number(process.env.PREVIEW_SEED || 777);
+const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true"; // default OFF to avoid stylized look
+const PREVIEW_NEGATIVE =
+  process.env.PREVIEW_NEGATIVE ||
+  "cartoon, illustration, anime, cgi, 3d render, doll, mannequin, plastic skin, waxy skin, over-smooth, unrealistic, deformed, extra fingers, watermark, text, logo, lowres";
 
 /* ---------- Helpers & vocab ---------- */
 const ok = (v) => typeof v === "string" && v.trim().length > 0;
@@ -49,92 +54,89 @@ const SIZE_HQ = { "1:1": [896, 896], "3:4": [896, 1152] };
 const SIZE_FAST = { "1:1": [640, 640], "3:4": [672, 896] };
 
 /* ---------- Cache version ---------- */
-const STYLE_VERSION = "sexy_sfw_v1";
+const STYLE_VERSION = "commercial_photo_v2";
 
-/* ---------- Cache key (discretized + seed/size) ---------- */
-function exactKey(form) {
+/* ---------- Small utils ---------- */
+const hash = (s) => {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h + (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24)) >>> 0;
+  }
+  return h >>> 0;
+};
+const pick = (arr, h) => arr[h % arr.length];
+
+/* ---------- Prompt (commercial, photoreal, compact) ---------- */
+function buildPrompt(form) {
+  // Normalize inputs
   const gender = clamp(form?.gender, ["woman","man"], 0);
-  const preset = clamp(form?.preset, ["linkedin_pro","ceo_office","lifestyle_warm","speaker_press"]);
-  const bg     = clamp(form?.background, BG);
-  const outfit = clamp(form?.outfit, OUTFIT);
-  const mood   = clamp(form?.mood, MOOD, 1);
-  const ratio  = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
+  const bgKey  = clamp(form?.background, BG, 0);
+  const outfitKey = clamp(form?.outfit, OUTFIT, 1);
   const skin   = clamp(form?.skin_tone ?? form?.skinTone ?? form?.skin, SKIN, 2);
   const hairC  = clamp(form?.hair_color ?? form?.hairColor ?? form?.hair, HAIR_COLOR, 1);
   const hairL  = clamp(form?.hair_length ?? form?.hairLength ?? form?.hairLen, HAIR_LEN, 2);
   const eyes   = clamp(form?.eye_color ?? form?.eyeColor ?? form?.eyes, EYE, 0);
-  const body   = clamp(form?.body_type ?? form?.bodyType, BODY, 2);
-  return `${gender}|${preset}|${bg}|${outfit}|${mood}|${ratio}|${skin}|${hairC}|${hairL}|${eyes}|${body}`;
-}
 
-/* ---------- Prompt (sexy SFW) ---------- */
-function subjectFromGender(g) {
-  return g === "man"
-    ? "young adult man (mid-20s to early-30s)"
-    : "young adult woman (mid-20s to early-30s)";
-}
-function outfitLabel(outfit, gender) {
-  // SFW mais plus "vendeur" (fitted / fashion-commercial)
-  if (outfit === "athleisure") {
-    return gender === "man"
-      ? "sleek fitted athletic tee (athleisure)"
-      : "form-fitting athleisure top";
-  }
-  return {
-    blazer: gender === "man"
-      ? "tailored navy blazer over fitted shirt"
-      : "tailored blazer over fitted top",
-    shirt: gender === "man"
-      ? "well-fitted dark dress shirt, top button open"
-      : "fitted smart shirt or top",
-    tee: "clean fitted crew-neck tee",
-  }[outfit];
-}
-
-function buildPrompt(form) {
-  const gender = clamp(form?.gender, ["woman","man"], 0);
-  const subject = subjectFromGender(gender);
-
-  const bgMap = {
-    studio:"white seamless studio background",
-    office:"modern office bokeh background",
-    city:"city bokeh background",
-    nature:"soft green foliage bokeh background",
+  // Mappings (concise, commercial)
+  const BG_MAP = {
+    studio: "white studio background",
+    office: "office background",
+    city:   "city background",
+    nature: "nature background",
   };
-  const bg     = bgMap[clamp(form?.background, BG)];
-  const outfit = outfitLabel(clamp(form?.outfit, OUTFIT), gender);
-  const mood   = { warm:"warm welcoming mood", neutral:"confident approachable mood", cool:"cool stylish mood" }[clamp(form?.mood, MOOD, 1)];
+  const OUTFIT_W = { blazer:"tailored blazer", shirt:"fitted top", tee:"crew-neck tee", athleisure:"athleisure top" };
+  const OUTFIT_M = { blazer:"tailored blazer", shirt:"fitted shirt", tee:"crew-neck tee", athleisure:"athletic tee" };
 
-  const skin  = clamp(form?.skin_tone ?? form?.skinTone ?? form?.skin, SKIN, 2);
-  const hairC = clamp(form?.hair_color ?? form?.hairColor ?? form?.hair, HAIR_COLOR, 1);
-  const hairL = clamp(form?.hair_length ?? form?.hairLength ?? form?.hairLen, HAIR_LEN, 2);
-  const eyes  = clamp(form?.eye_color ?? form?.eyeColor ?? form?.eyes, EYE, 0);
-  const ratio = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
-  const body  = clamp(form?.body_type ?? form?.bodyType, BODY, 2);
+  const outfit = gender === "woman" ? OUTFIT_W[outfitKey] : OUTFIT_M[outfitKey];
+  const hairPhrase = hairL === "bald" ? "bald" : `${hairL} ${hairC} hair`;
 
-  const hairPhrase = hairL === "bald" ? "clean bald" : `healthy ${hairL} ${hairC} hair`;
+  // Deterministic variations (framing / lens / lighting)
+  const FRAMING = ["portrait","close-up portrait","headshot"];
+  const LENSES  = ["85mm f/1.8","50mm f/1.4","135mm f/2"];
+  const LIGHTS  = ["soft beauty lighting","natural window light","studio lighting"];
 
-  const sexyCommon = [
-    "fashion-commercial portrait, slight three-quarter angle, relaxed confident posture",
-    "studio beauty lighting: large octabox key plus soft rim light, bright catchlights",
-    "youthful fresh look, luminous skin glow, even tone",
-    "very subtle professional skin retouch (no plastic look), refined highlights",
-    "defined cheekbones, flattering jawline, crisp sharp eyes",
-    "high-end editorial quality, photorealistic, clean background"
+  const seedStr = String(form?.seed ?? `${gender}|${bgKey}|${outfitKey}|${skin}|${hairC}|${hairL}|${eyes}`);
+  const h = hash(seedStr);
+  const framing  = pick(FRAMING, h);
+  const lens     = pick(LENSES,  h >> 4);
+  const lighting = pick(LIGHTS,  h >> 8);
+
+  // Prompt short (~150–190 chars). Pure photo vocabulary, zero duplicates.
+  const parts = [
+    `professional ${framing} of ${gender === "woman" ? "woman" : "man"}`,
+    BG_MAP[bgKey],
+    outfit,
+    hairPhrase,
+    `${skin} skin`,
+    `${eyes} eyes`,
+    lens,
+    lighting,
+    gender === "woman" ? "natural makeup" : "neat grooming",
+    "photorealistic",
+    "commercial"
   ];
-  const sexyGender = gender === "woman"
-    ? ["soft glam natural makeup, defined eyes and brows, hydrated lips"]
-    : ["light neat stubble or clean shave, groomed brows, healthy matte finish"];
 
-  return [
-    `waist-up portrait of a ${subject}, camera-facing with a subtle inviting smile`,
-    "85mm portrait look, shallow depth of field",
-    bg, outfit, mood,
-    ...(ratio === "3:4" ? [`subtle ${body} build`] : []),
-    `natural ${skin} skin tone, ${eyes} eyes, ${hairPhrase}`,
-    ...sexyCommon,
-    ...sexyGender
-  ].join(", ");
+  let prompt = parts.join(", ");
+  // Safety belt: reduce length if >200 chars
+  if (prompt.length > 200) {
+    prompt = parts.filter(p => p !== (gender === "woman" ? "natural makeup" : "neat grooming")).join(", ");
+  }
+  if (prompt.length > 200) {
+    prompt = parts.filter(p => p !== lens).join(", ");
+  }
+  return prompt;
+}
+
+/* ---------- HTTP helpers ---------- */
+async function fetchWithTimeout(url, init, ms) {
+  if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
+    return fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
+  }
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort("timeout"), ms);
+  try { return await fetch(url, { ...init, signal: ac.signal }); }
+  finally { clearTimeout(t); }
 }
 
 /* ---------- Handler ---------- */
@@ -177,7 +179,7 @@ export default async function handler(req, res) {
     const prompt = String(form.prompt);
 
     // --- cache key (versioned + fast flag) ---
-    const key = `${STYLE_VERSION}${fast ? "|fast" : ""}|${exactKey(form)}|seed:${seed}|${W}x${H}`;
+    const key = `${STYLE_VERSION}${fast ? "|fast" : ""}|${prompt}|seed:${seed}|${W}x${H}`;
 
     // 0) Cache lookup
     const cached = await sb.from("preview_cache").select("image_url,hits").eq("key", key).maybeSingle();
@@ -186,14 +188,16 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok:true, image_url: cached.data.image_url, provider:"cache", seed, key, fast: !!fast });
     }
 
-    // 1) Generation (Pollinations FLUX)
+    // 1) Generation (Pollinations FLUX) — photoreal anti-cartoon
     const q = new URLSearchParams({
       model: "flux",
-      width: String(W), height: String(H),
+      width: String(W),
+      height: String(H),
       seed: String(seed),
       private: "true",
-      enhance: "true",
+      enhance: PREVIEW_ENHANCE ? "true" : "false",
       nologo: "true",
+      negative: PREVIEW_NEGATIVE
     }).toString();
     const url  = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
     const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
