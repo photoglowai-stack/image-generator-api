@@ -25,6 +25,36 @@ const SIGNED_TTL_S    = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 *
 const CACHE_CONTROL   = String(process.env.PREVIEW_CACHE_CONTROL_S || 31536000);
 const DEFAULT_SEED    = Number(process.env.PREVIEW_SEED || 777);
 const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true"; // OFF par défaut pour éviter le look stylisé
+const MEMORY_CACHE_TTL_MS = Number(process.env.PREVIEW_MEMORY_CACHE_TTL_MS || 2 * 60 * 1000); // 2 minutes par défaut
+const MEMORY_CACHE_MAX = Number(process.env.PREVIEW_MEMORY_CACHE_MAX || 32);
+
+const memoryCache = new Map();
+const inflightRenders = new Map();
+
+function trimCacheIfNeeded() {
+  if (!Number.isFinite(MEMORY_CACHE_MAX) || MEMORY_CACHE_MAX <= 0) return;
+  while (memoryCache.size > MEMORY_CACHE_MAX) {
+    const oldestKey = memoryCache.keys().next().value;
+    if (!oldestKey) break;
+    memoryCache.delete(oldestKey);
+  }
+}
+
+function setMemoryCache(key, payload) {
+  if (!Number.isFinite(MEMORY_CACHE_TTL_MS) || MEMORY_CACHE_TTL_MS <= 0) return;
+  memoryCache.set(key, { payload, expires: Date.now() + MEMORY_CACHE_TTL_MS });
+  trimCacheIfNeeded();
+}
+
+function getMemoryCache(key) {
+  const entry = memoryCache.get(key);
+  if (!entry) return null;
+  if (entry.expires <= Date.now()) {
+    memoryCache.delete(key);
+    return null;
+  }
+  return entry.payload;
+}
 
 /* ---------- Helpers ---------- */
 const ok    = (v) => typeof v === "string" && v.trim().length > 0;
@@ -172,62 +202,132 @@ export default async function handler(req, res) {
 
     // Cache key
     const key = `${STYLE_VERSION}${fast ? "|fast" : ""}|${prompt}|seed:${seed}|${W}x${H}`;
+    const safeKey = Buffer.from(key).toString("base64url").slice(0, 120);
+
+    const mem = getMemoryCache(key);
+    if (mem) {
+      return res.status(200).json({ ...mem, cache_level: "memory" });
+    }
 
     // Cache lookup
     const cached = await sb.from("preview_cache").select("image_url,hits").eq("key", key).maybeSingle();
     if (cached.data?.image_url) {
       try { await sb.from("preview_cache").update({ hits:(cached.data.hits||0)+1 }).eq("key", key); } catch {}
-      return res.status(200).json({ ok:true, image_url: cached.data.image_url, provider:"cache", seed, key, fast: !!fast });
+      const payload = { ok:true, image_url: cached.data.image_url, provider:"cache", seed, key, fast: !!fast };
+      setMemoryCache(key, payload);
+      return res.status(200).json(payload);
     }
 
-    // Pollinations call (GET image bytes)
-    const params = new URLSearchParams({
-      model: "flux",
-      width: String(W),
-      height: String(H),
-      seed: String(seed),
-      private: "true",
-      nologo: "true",
-      enhance: PREVIEW_ENHANCE ? "true" : "false",
-      safe
-    }).toString();
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
-    const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
-
-    const r = await fetchPollinations(url, headers, /*tries*/ 3, /*baseDelay*/ 600, /*timeout*/ fast ? 30000 : 60000);
-    const bytes = Buffer.from(await r.arrayBuffer());
-
-    // Supabase upload
-    const bucketExists = await sb.storage.getBucket(BUCKET);
-    if (!bucketExists?.data) return res.status(500).json({ ok:false, error:"bucket_not_found", bucket: BUCKET });
-
-    const d = new Date();
-    const yyyy = d.getUTCFullYear();
-    const mm   = String(d.getUTCMonth()+1).padStart(2,'0');
-    const dd   = String(d.getUTCDate()).padStart(2,'0');
-    const path = `previews/${yyyy}-${mm}-${dd}/${encodeURIComponent(key)}.jpg`;
-
-    const up = await sb.storage.from(BUCKET).upload(path, bytes, {
-      contentType: "image/jpeg",
-      upsert: true,
-      cacheControl: CACHE_CONTROL
-    });
-    if (up.error) return res.status(500).json({ ok:false, error:"upload_failed", details:String(up.error).slice(0,200) });
-
-    let imageUrl;
-    if (OUTPUT_PUBLIC) {
-      const { data } = sb.storage.from(BUCKET).getPublicUrl(path);
-      imageUrl = data.publicUrl;
-    } else {
-      const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(path, SIGNED_TTL_S);
-      if (error) return res.status(500).json({ ok:false, error:"signed_url_failed", details:String(error).slice(0,200) });
-      imageUrl = data.signedUrl;
+    const pending = inflightRenders.get(key);
+    if (pending) {
+      const payload = await pending;
+      return res.status(200).json({ ...payload, cache_level: payload.cache_level || "dedup" });
     }
 
-    try { await sb.from("preview_cache").insert({ key, image_url: imageUrl }); } catch {}
+    const renderPromise = (async () => {
+      // Pollinations call (GET image bytes)
+      const params = new URLSearchParams({
+        model: "flux",
+        width: String(W),
+        height: String(H),
+        seed: String(seed),
+        private: "true",
+        nologo: "true",
+        enhance: PREVIEW_ENHANCE ? "true" : "false",
+        safe
+      }).toString();
+      const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
+      const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
 
-    return res.status(200).json({ ok:true, image_url: imageUrl, provider:"pollinations", seed, key, fast: !!fast });
+      const r = await fetchPollinations(url, headers, /*tries*/ 3, /*baseDelay*/ 600, /*timeout*/ fast ? 25000 : 60000);
+      const arrayBuffer = await r.arrayBuffer();
+      const bytes = Buffer.from(arrayBuffer);
+
+      const rawContentType = r.headers?.get?.("content-type") || "";
+      const normalized = rawContentType.split(";")[0].trim().toLowerCase();
+      let uploadContentType = "image/jpeg";
+      let extension = "jpg";
+      if (normalized.includes("png")) {
+        uploadContentType = "image/png";
+        extension = "png";
+      } else if (normalized.includes("webp")) {
+        uploadContentType = "image/webp";
+        extension = "webp";
+      } else if (normalized.includes("jpeg") || normalized.includes("jpg")) {
+        uploadContentType = "image/jpeg";
+        extension = "jpg";
+      } else if (normalized) {
+        uploadContentType = normalized;
+        const guessed = normalized.split("/")[1];
+        if (guessed) extension = guessed.replace(/[^a-z0-9]/g, "") || "jpg";
+      }
+
+      const d = new Date();
+      const yyyy = d.getUTCFullYear();
+      const mm   = String(d.getUTCMonth()+1).padStart(2,'0');
+      const dd   = String(d.getUTCDate()).padStart(2,'0');
+      const path = `previews/${yyyy}-${mm}-${dd}/${safeKey}.${extension}`;
+
+      const up = await sb.storage.from(BUCKET).upload(path, bytes, {
+        contentType: uploadContentType,
+        upsert: true,
+        cacheControl: CACHE_CONTROL
+      });
+      if (up.error) {
+        throw Object.assign(new Error("upload_failed"), { cause: up.error });
+      }
+
+      let imageUrl;
+      if (OUTPUT_PUBLIC) {
+        const { data } = sb.storage.from(BUCKET).getPublicUrl(path);
+        imageUrl = data.publicUrl;
+      } else {
+        const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(path, SIGNED_TTL_S);
+        if (error) {
+          throw Object.assign(new Error("signed_url_failed"), { cause: error });
+        }
+        imageUrl = data.signedUrl;
+      }
+
+      try {
+        await sb.from("preview_cache").insert({ key, image_url: imageUrl });
+      } catch (err) {
+        console.warn("preview_cache_insert_failed", err?.message || err);
+      }
+
+      const payload = {
+        ok: true,
+        image_url: imageUrl,
+        provider: "pollinations",
+        seed,
+        key,
+        fast: !!fast,
+        width: W,
+        height: H,
+        content_type: uploadContentType,
+      };
+      setMemoryCache(key, payload);
+      return payload;
+    })();
+
+    inflightRenders.set(key, renderPromise);
+    try {
+      const payload = await renderPromise;
+      return res.status(200).json(payload);
+    } finally {
+      inflightRenders.delete(key);
+    }
   } catch (e) {
+    if (e?.message === "upload_failed" && e?.cause) {
+      const cause = e.cause;
+      const detail = cause?.message || cause?.error || cause?.name || JSON.stringify(cause);
+      return res.status(500).json({ ok:false, error:"upload_failed", details:String(detail).slice(0,200) });
+    }
+    if (e?.message === "signed_url_failed" && e?.cause) {
+      const cause = e.cause;
+      const detail = cause?.message || cause?.error || cause?.name || JSON.stringify(cause);
+      return res.status(500).json({ ok:false, error:"signed_url_failed", details:String(detail).slice(0,200) });
+    }
     return res.status(500).json({ ok:false, error:"server_error", details:String(e).slice(0,400) });
   }
 }
