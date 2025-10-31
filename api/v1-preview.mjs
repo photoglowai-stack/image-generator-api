@@ -31,6 +31,7 @@ const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true"; // 
 const MAX_FUNCTION_S   = Number(process.env.MAX_FUNCTION_S || 25);
 const SAFETY_MARGIN_S  = Number(process.env.SAFETY_MARGIN_S || 3);
 const TIME_BUDGET_MS   = Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000); // ~22s si 25s
+const POLLINATIONS_TIMEOUT_MS = Math.max(4000, Math.min(TIME_BUDGET_MS - 1500, 18000));
 
 /* ---------- Helpers ---------- */
 const ok    = (v) => typeof v === "string" && v.trim().length > 0;
@@ -100,28 +101,81 @@ function buildPrompt(form) {
   return prompt;
 }
 
-/* ---------- Pollinations fetch with retry/backoff ---------- */
-async function fetchPollinations(url, headers, tries = 1, baseDelayMs = 600, timeoutMs = TIME_BUDGET_MS) {
-  // NB: tries=1 par défaut pour garantir la réponse < maxDuration
-  let lastErr;
-  for (let i = 0; i < tries; i++) {
-    try {
-      let r;
-      if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
-        r = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-      } else {
-        const ac = new AbortController(); const t = setTimeout(() => ac.abort("timeout"), timeoutMs);
-        try { r = await fetch(url, { headers, signal: ac.signal }); } finally { clearTimeout(t); }
-      }
-      if (r.ok) return r;
-      if (![429,502,503].includes(r.status)) {
-        const txt = await r.text().catch(()=> "");
-        throw new Error(`HTTP ${r.status} ${txt.slice(0,200)}`);
-      }
-    } catch (e) { lastErr = e; }
-    await new Promise(s => setTimeout(s, baseDelayMs * (2 ** i))); // 600ms → 1200ms → 2400ms …
+/* ---------- Pollinations fetch (POST prioritaire, fallback GET) ---------- */
+const POLLINATIONS_ENDPOINT = "https://image.pollinations.ai/prompt";
+
+async function fetchWithTimeout(url, init = {}, timeoutMs = POLLINATIONS_TIMEOUT_MS) {
+  if (timeoutMs <= 0) throw new Error("invalid_timeout");
+  if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
   }
-  throw new Error(`pollinations_failed_after_retries: ${String(lastErr || "unknown")}`);
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort("timeout"), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readImageResponse(res) {
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`pollinations_http_${res.status}_${txt.slice(0,160)}`);
+  }
+  const ctype = (res.headers.get("content-type") || "").toLowerCase();
+  const ab = await res.arrayBuffer();
+  const bytes = Buffer.from(ab);
+  if (!/image\/(jpeg|jpg|png|webp)/i.test(ctype) && bytes.length < 64 * 1024) {
+    const preview = bytes.toString("utf8", 0, Math.min(bytes.length, 160));
+    throw new Error(`pollinations_unexpected_payload_${ctype || "unknown"}_${preview}`);
+  }
+  return { bytes, ctype: ctype || "image/jpeg" };
+}
+
+async function fetchPollinationsBinary({ prompt, width, height, seed, safe }) {
+  const baseHeaders = {
+    Accept: "image/jpeg,image/png;q=0.9,*/*;q=0.8",
+    "User-Agent": "Photoglow-Preview/1.0",
+  };
+  if (POL_TOKEN) baseHeaders.Authorization = `Bearer ${POL_TOKEN}`;
+
+  const body = JSON.stringify({
+    prompt,
+    width,
+    height,
+    seed,
+    model: "flux",
+    private: true,
+    nologo: true,
+    enhance: PREVIEW_ENHANCE,
+    safe: safe === "true",
+  });
+
+  try {
+    const res = await fetchWithTimeout(POLLINATIONS_ENDPOINT, {
+      method: "POST",
+      headers: { ...baseHeaders, "Content-Type": "application/json" },
+      body,
+    });
+    return await readImageResponse(res);
+  } catch (err) {
+    console.warn("[preview] pollinations POST failed:", err?.message || err);
+  }
+
+  const params = new URLSearchParams({
+    model: "flux",
+    width: String(width),
+    height: String(height),
+    seed: String(seed),
+    private: "true",
+    nologo: "true",
+    enhance: PREVIEW_ENHANCE ? "true" : "false",
+    safe,
+  });
+  const url = `${POLLINATIONS_ENDPOINT}/${encodeURIComponent(prompt)}?${params.toString()}`;
+  const res = await fetchWithTimeout(url, { method: "GET", headers: baseHeaders });
+  return await readImageResponse(res);
 }
 
 /* ---------- Handler ---------- */
@@ -189,26 +243,13 @@ export default async function handler(req, res) {
     }
 
     // Pollinations call (1 essai, timeout budgeté)
-    const params = new URLSearchParams({
-      model: "flux",
-      width: String(W),
-      height: String(H),
-      seed: String(seed),
-      private: "true",
-      nologo: "true",
-      enhance: PREVIEW_ENHANCE ? "true" : "false",
-      safe
-    }).toString();
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
-    const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
-
-    const r = await fetchPollinations(url, headers, /*tries*/ 1, /*baseDelay*/ 600, /*timeout*/ TIME_BUDGET_MS);
-    const ctype = (r.headers.get("content-type") || "").toLowerCase();
-    const bytes = Buffer.from(await r.arrayBuffer());
-    if (!/image\/(jpeg|jpg|png|webp)/i.test(ctype) && bytes.length < 64 * 1024) {
-      // garde-fou si le provider renvoie un petit payload texte
-      return res.status(502).json({ ok:false, error:"pollinations_unexpected_response" });
+    let result;
+    try {
+      result = await fetchPollinationsBinary({ prompt, width: W, height: H, seed, safe });
+    } catch (err) {
+      return res.status(502).json({ ok:false, error:"pollinations_failed", details:String(err).slice(0,200) });
     }
+    const { bytes, ctype } = result;
 
     // Supabase upload — clé COURTE & SAFE : v2[-fast]-s{seed}-{W}x{H}-{hash}.jpg
     const d = new Date();
@@ -218,11 +259,13 @@ export default async function handler(req, res) {
 
     const hval   = hash(cacheKey + (POL_TOKEN ? "|auth" : "|noauth"));
     const suffix = hval.toString(16).padStart(8,"0");
-    const fileKey = `${STYLE_VERSION}${fast?'-fast':''}-s${seed}-${W}x${H}-${suffix}.jpg`;
+    const ext    = ctype.includes("png") ? "png" : ctype.includes("webp") ? "webp" : "jpg";
+    const uploadContentType = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+    const fileKey = `${STYLE_VERSION}${fast?'-fast':''}-s${seed}-${W}x${H}-${suffix}.${ext}`;
     const path = `previews/${yyyy}-${mm}-${dd}/${fileKey}`;
 
     const up = await sb.storage.from(BUCKET).upload(path, bytes, {
-      contentType: "image/jpeg",
+      contentType: uploadContentType,
       upsert: true,
       cacheControl: CACHE_CONTROL
     });
