@@ -52,6 +52,45 @@ const SIZE_FAST = { "1:1": [576, 576], "3:4": [576, 768] };
 
 const STYLE_VERSION = "commercial_photo_v2";
 
+/* ---------- Normalisation form & seeds ---------- */
+function normalizeForm(rawForm) {
+  const form = rawForm && typeof rawForm === "object" ? rawForm : {};
+
+  const gender = clamp(form.gender ?? form.sex, ["woman", "man"], 0);
+  const background = clamp(form.background ?? form.bg ?? form.scene, BG, 0);
+  const outfitKey = clamp(form.outfit ?? form.outfitKey ?? form.style, OUTFIT, 1);
+  const ratio = clamp(form.aspect_ratio ?? form.aspectRatio ?? form.ratio, RATIO, 0);
+  const skin = clamp(form.skin_tone ?? form.skinTone ?? form.skin, SKIN, 2);
+  const hairLength = clamp(form.hair_length ?? form.hairLength ?? form.hairLen, HAIR_LEN, 2);
+  const eyeColor = clamp(form.eye_color ?? form.eyeColor ?? form.eyes, EYE, 0);
+
+  let hairColor = clamp(form.hair_color ?? form.hairColor ?? form.hair, HAIR_COLOR, 1);
+  if (hairLength === "bald") hairColor = "none";
+
+  const styleKey = `${background}|${outfitKey}|${skin}|${hairLength}|${hairColor}|${eyeColor}`;
+
+  return {
+    gender,
+    background,
+    outfitKey,
+    ratio,
+    skin,
+    hairColor,
+    hairLength,
+    eyeColor,
+    styleKey,
+  };
+}
+
+function deriveSeed(userSeed, normalized, extra = "") {
+  if (Number.isFinite(Number(userSeed))) return Math.floor(Number(userSeed));
+
+  const baseHash = hash(`${STYLE_VERSION}|${normalized.styleKey}|${normalized.ratio}|${extra}`);
+  const genderOffset = normalized.gender === "woman" ? 0 : 7919;
+  const derived = (baseHash + genderOffset) >>> 0;
+  return derived || DEFAULT_SEED;
+}
+
 /* ---------- Deterministic variations & hashing ---------- */
 const hash = (s) => {
   let h = 2166136261 >>> 0;
@@ -61,43 +100,78 @@ const hash = (s) => {
 const pick = (arr, h) => arr[h % arr.length];
 
 /* ---------- Prompt Builder (compact & photoreal) ---------- */
-function buildPrompt(form) {
-  const gender    = clamp(form?.gender, ["woman","man"], 0);
-  const bgKey     = clamp(form?.background, BG, 0);
-  const outfitKey = clamp(form?.outfit, OUTFIT, 1);
-  const skin      = clamp(form?.skin_tone ?? form?.skinTone ?? form?.skin, SKIN, 2);
-  const hairC     = clamp(form?.hair_color ?? form?.hairColor ?? form?.hair, HAIR_COLOR, 1);
-  const hairL     = clamp(form?.hair_length ?? form?.hairLength ?? form?.hairLen, HAIR_LEN, 2);
-  const eyes      = clamp(form?.eye_color ?? form?.eyeColor ?? form?.eyes, EYE, 0);
+function buildPrompt(normalized) {
+  const BG_MAP = {
+    studio: "white studio background",
+    office: "modern office background",
+    city: "city skyline background",
+    nature: "outdoor nature background",
+  };
+  const OUTFIT_W = {
+    blazer: "tailored blazer",
+    shirt: "fitted blouse",
+    tee: "crew-neck tee",
+    athleisure: "athleisure top",
+  };
+  const OUTFIT_M = {
+    blazer: "tailored blazer",
+    shirt: "fitted shirt",
+    tee: "crew-neck tee",
+    athleisure: "athletic performance tee",
+  };
+  const SKIN_MAP = {
+    light: "light skin tone",
+    fair: "fair skin tone",
+    medium: "medium skin tone",
+    tan: "tan skin tone",
+    deep: "deep skin tone",
+  };
+  const EYE_MAP = {
+    brown: "brown eyes",
+    blue: "blue eyes",
+    green: "green eyes",
+    hazel: "hazel eyes",
+    gray: "gray eyes",
+  };
 
-  const BG_MAP   = { studio:"white studio background", office:"office background", city:"city background", nature:"nature background" };
-  const OUTFIT_W = { blazer:"tailored blazer", shirt:"fitted top",  tee:"crew-neck tee", athleisure:"athleisure top" };
-  const OUTFIT_M = { blazer:"tailored blazer", shirt:"fitted shirt", tee:"crew-neck tee", athleisure:"athletic tee" };
+  const FRAMING = ["portrait", "close-up portrait", "headshot"];
+  const LENSES = ["85mm f/1.8", "50mm f/1.4", "135mm f/2"];
+  const LIGHTS = ["soft beauty lighting", "natural window light", "studio lighting"];
 
-  const outfit     = gender === "woman" ? OUTFIT_W[outfitKey] : OUTFIT_M[outfitKey];
-  const hairPhrase = hairL === "bald" ? "bald" : `${hairL} ${hairC} hair`;
+  const { gender, background, outfitKey, skin, hairColor, hairLength, eyeColor, styleKey } = normalized;
 
-  const FRAMING = ["portrait","close-up portrait","headshot"];
-  const LENSES  = ["85mm f/1.8","50mm f/1.4","135mm f/2"];
-  const LIGHTS  = ["soft beauty lighting","natural window light","studio lighting"];
+  const styleSeed = hash(`${STYLE_VERSION}|${styleKey}`);
+  normalized.framing = pick(FRAMING, styleSeed);
+  normalized.lens = pick(LENSES, styleSeed >> 4);
+  normalized.lighting = pick(LIGHTS, styleSeed >> 8);
 
-  const seedStr = String(form?.seed ?? `${gender}|${bgKey}|${outfitKey}|${skin}|${hairC}|${hairL}|${eyes}`);
-  const h = hash(seedStr);
-  const framing  = pick(FRAMING, h);
-  const lens     = pick(LENSES,  h >> 4);
-  const lighting = pick(LIGHTS,  h >> 8);
+  const outfit = (gender === "woman" ? OUTFIT_W : OUTFIT_M)[outfitKey];
+  const hairPhrase = hairLength === "bald" ? "clean-shaven head" : `${hairLength} ${hairColor} hair`;
+
+  const subject = gender === "woman" ? "confident professional woman" : "confident professional man";
+  const grooming = gender === "woman" ? "refined natural makeup" : "well-groomed facial features";
 
   const parts = [
-    `professional ${framing} of ${gender === "woman" ? "woman" : "man"}`,
-    BG_MAP[bgKey], outfit, hairPhrase, `${skin} skin`, `${eyes} eyes`,
-    lens, lighting,
-    gender === "woman" ? "natural makeup" : "neat grooming",
-    "photorealistic", "commercial"
+    `professional ${normalized.framing} of a ${subject}`,
+    BG_MAP[background],
+    outfit,
+    hairPhrase,
+    SKIN_MAP[skin],
+    EYE_MAP[eyeColor],
+    normalized.lens,
+    normalized.lighting,
+    grooming,
+    "photorealistic commercial portrait",
   ];
 
-  let prompt = parts.join(", ");
-  if (prompt.length > 200) prompt = parts.filter(p => !["natural makeup","neat grooming"].includes(p)).join(", ");
-  if (prompt.length > 200) prompt = parts.filter(p => p !== lens).join(", ");
+  const uniqueParts = parts.filter(Boolean);
+  let prompt = uniqueParts.join(", ");
+  if (prompt.length > 200) {
+    prompt = uniqueParts.filter((p) => p !== grooming).join(", ");
+  }
+  if (prompt.length > 200) {
+    prompt = uniqueParts.filter((p) => p !== normalized.lens).join(", ");
+  }
   return prompt;
 }
 
@@ -217,14 +291,16 @@ export default async function handler(req, res) {
     let body = req.body;
     if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
     const form = (body && typeof body === "object") ? body : {};
-    if (!ok(form?.prompt)) form.prompt = buildPrompt(form);
+
+    const normalized = normalizeForm(form);
+    if (!ok(form?.prompt)) form.prompt = buildPrompt(normalized);
 
     // Render settings
     const fast  = toBool(form?.fast ?? true); // fast par défaut
-    const ratio = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
+    const ratio = normalized.ratio;
     const [W,H] = (fast ? SIZE_FAST : SIZE_HQ)[ratio] || (fast ? [576,576] : [896,896]);
-    const seed  = Number.isFinite(Number(form?.seed)) ? Math.floor(Number(form.seed)) : DEFAULT_SEED;
-    const safe  = (form?.safe ?? true) ? "true" : "false"; // ON par défaut
+    const seed  = deriveSeed(form?.seed, normalized, `${normalized.framing}|${normalized.lighting}|${normalized.lens}`);
+    const safe  = toBool(form?.safe ?? true) ? "true" : "false"; // ON par défaut
     const prompt= String(form.prompt);
 
     // Cache key (long) — uniquement pour la BDD
