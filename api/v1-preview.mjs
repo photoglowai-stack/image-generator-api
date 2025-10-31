@@ -4,8 +4,8 @@
 // - GET: health & debug
 // - Prompt compact photoréal (≤ ~180–200 chars), variations déterministes
 // - Pollinations (model=flux): private=true, nologo=true, enhance=false, safe=true
-// - Retry/backoff (429/502/503) + timeout
-// - Upload Supabase (public/signed), cache table preview_cache
+// - Retry/backoff (429/502/503) + timeout aligné Vercel
+// - Upload Supabase (public/signed), table preview_cache (insert/update non-bloquants)
 // - Clé Storage COURTE & SAFE (hash hex), pas de base64 géant
 
 export const config = { runtime: "nodejs" };
@@ -19,13 +19,18 @@ function setCORS(req, res, opts = {}) {
 }
 
 /* ---------- ENV ---------- */
-const POL_TOKEN       = process.env.POLLINATIONS_TOKEN || ""; // Bearer (recommandé)
+const POL_TOKEN       = process.env.POLLINATIONS_TOKEN || ""; // Bearer (optionnel mais recommandé)
 const BUCKET          = process.env.PREVIEW_BUCKET || "generated_images";
 const OUTPUT_PUBLIC   = (process.env.OUTPUT_PUBLIC || "true") === "true";
 const SIGNED_TTL_S    = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7);
 const CACHE_CONTROL   = String(process.env.PREVIEW_CACHE_CONTROL_S || 31536000);
 const DEFAULT_SEED    = Number(process.env.PREVIEW_SEED || 777);
 const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true"; // OFF par défaut
+
+// Budget temps Vercel (fail-fast < maxDuration)
+const MAX_FUNCTION_S   = Number(process.env.MAX_FUNCTION_S || 25);
+const SAFETY_MARGIN_S  = Number(process.env.SAFETY_MARGIN_S || 3);
+const TIME_BUDGET_MS   = Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000); // ~22s si 25s
 
 /* ---------- Helpers ---------- */
 const ok    = (v) => typeof v === "string" && v.trim().length > 0;
@@ -40,7 +45,7 @@ const HAIR_COLOR = ["black","brown","blonde","red","gray"];
 const HAIR_LEN   = ["short","medium","long","bald"];
 const EYE        = ["brown","blue","green","hazel","gray"];
 
-// Fast plus petit ⇒ plus rapide (tu peux remonter à 640 si tu veux)
+// Fast plus petit ⇒ plus rapide (tu peux remonter à 640 si besoin)
 const SIZE_HQ   = { "1:1": [896, 896], "3:4": [896, 1152] };
 const SIZE_FAST = { "1:1": [576, 576], "3:4": [576, 768] };
 
@@ -96,7 +101,8 @@ function buildPrompt(form) {
 }
 
 /* ---------- Pollinations fetch with retry/backoff ---------- */
-async function fetchPollinations(url, headers, tries = 3, baseDelayMs = 600, timeoutMs = 45000) {
+async function fetchPollinations(url, headers, tries = 1, baseDelayMs = 600, timeoutMs = TIME_BUDGET_MS) {
+  // NB: tries=1 par défaut pour garantir la réponse < maxDuration
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try {
@@ -113,7 +119,7 @@ async function fetchPollinations(url, headers, tries = 3, baseDelayMs = 600, tim
         throw new Error(`HTTP ${r.status} ${txt.slice(0,200)}`);
       }
     } catch (e) { lastErr = e; }
-    await new Promise(s => setTimeout(s, baseDelayMs * (2 ** i))); // 600ms → 1200ms → 2400ms
+    await new Promise(s => setTimeout(s, baseDelayMs * (2 ** i))); // 600ms → 1200ms → 2400ms …
   }
   throw new Error(`pollinations_failed_after_retries: ${String(lastErr || "unknown")}`);
 }
@@ -160,7 +166,7 @@ export default async function handler(req, res) {
     if (!ok(form?.prompt)) form.prompt = buildPrompt(form);
 
     // Render settings
-    const fast  = toBool(form?.fast);
+    const fast  = toBool(form?.fast ?? true); // fast par défaut
     const ratio = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
     const [W,H] = (fast ? SIZE_FAST : SIZE_HQ)[ratio] || (fast ? [576,576] : [896,896]);
     const seed  = Number.isFinite(Number(form?.seed)) ? Math.floor(Number(form.seed)) : DEFAULT_SEED;
@@ -170,15 +176,19 @@ export default async function handler(req, res) {
     // Cache key (long) — uniquement pour la BDD
     const cacheKey = `${STYLE_VERSION}${fast ? "|fast" : ""}|${prompt}|seed:${seed}|${W}x${H}`;
 
-    // Cache lookup
+    // Cache lookup (non bloquant si update)
     const cached = await sb.from("preview_cache").select("image_url,hits").eq("key", cacheKey).maybeSingle();
     if (cached.data?.image_url) {
-      // best effort, ne bloque pas la réponse
-      sb.from("preview_cache").update({ hits:(cached.data.hits||0)+1 }).eq("key", cacheKey).catch(()=>{});
+      try {
+        const upd = await sb.from("preview_cache").update({ hits: (cached.data.hits || 0) + 1 }).eq("key", cacheKey);
+        if (upd.error) console.warn("[cache.update] non-blocking error:", upd.error);
+      } catch (e) {
+        console.warn("[cache.update] non-blocking exception:", e);
+      }
       return res.status(200).json({ ok:true, image_url: cached.data.image_url, provider:"cache", seed, key: cacheKey, fast: !!fast });
     }
 
-    // Pollinations call
+    // Pollinations call (1 essai, timeout budgeté)
     const params = new URLSearchParams({
       model: "flux",
       width: String(W),
@@ -192,11 +202,11 @@ export default async function handler(req, res) {
     const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
     const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
 
-    const r = await fetchPollinations(url, headers, 3, 600, fast ? 30000 : 60000);
-    const ctype = r.headers.get("content-type") || "";
+    const r = await fetchPollinations(url, headers, /*tries*/ 1, /*baseDelay*/ 600, /*timeout*/ TIME_BUDGET_MS);
+    const ctype = (r.headers.get("content-type") || "").toLowerCase();
     const bytes = Buffer.from(await r.arrayBuffer());
     if (!/image\/(jpeg|jpg|png|webp)/i.test(ctype) && bytes.length < 64 * 1024) {
-      // petit garde-fou si erreur textuelle renvoyée
+      // garde-fou si le provider renvoie un petit payload texte
       return res.status(502).json({ ok:false, error:"pollinations_unexpected_response" });
     }
 
@@ -228,8 +238,13 @@ export default async function handler(req, res) {
       imageUrl = data.signedUrl;
     }
 
-    // best effort (non bloquant)
-    sb.from("preview_cache").insert({ key: cacheKey, image_url: imageUrl }).catch(()=>{});
+    // Insert cache (best-effort, no crash)
+    try {
+      const ins = await sb.from("preview_cache").insert({ key: cacheKey, image_url: imageUrl });
+      if (ins.error) console.warn("[cache.insert] non-blocking error:", ins.error);
+    } catch (e) {
+      console.warn("[cache.insert] non-blocking exception:", e);
+    }
 
     return res.status(200).json({ ok:true, image_url: imageUrl, provider:"pollinations", seed, key: cacheKey, fast: !!fast });
   } catch (e) {
