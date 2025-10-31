@@ -14,25 +14,25 @@ export const config = { runtime: "nodejs" };
 
 /* ---------- CORS (inline) ---------- */
 function setCORS(req, res, opts = {}) {
-  res.setHeader("access-control-allow-origin", "*"); // Figma (Origin: null) OK
+  res.setHeader("access-control-allow-origin", "*");
   res.setHeader("access-control-allow-methods", opts.allowMethods || "GET,POST,OPTIONS");
   res.setHeader("access-control-allow-headers", opts.allowHeaders || "content-type, authorization, idempotency-key");
   res.setHeader("access-control-max-age", "86400");
 }
 
 /* ---------- ENV ---------- */
-const POL_TOKEN       = process.env.POLLINATIONS_TOKEN || ""; // optional
+const POL_TOKEN       = process.env.POLLINATIONS_TOKEN || "";
 const BUCKET          = process.env.PREVIEW_BUCKET || "generated_images";
 const OUTPUT_PUBLIC   = (process.env.OUTPUT_PUBLIC || "true") === "true";
 const SIGNED_TTL_S    = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7);
 const CACHE_CONTROL   = String(process.env.PREVIEW_CACHE_CONTROL_S || 31536000);
 const DEFAULT_SEED    = Number(process.env.PREVIEW_SEED || 777);
-const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true"; // default OFF to avoid stylized look
+const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true";
 const PREVIEW_NEGATIVE =
   process.env.PREVIEW_NEGATIVE ||
   "cartoon, illustration, anime, cgi, 3d render, doll, mannequin, plastic skin, waxy skin, over-smooth, unrealistic, deformed, extra fingers, watermark, text, logo, lowres";
 
-/* ---------- Helpers & vocab ---------- */
+/* ---------- Helpers ---------- */
 const ok = (v) => typeof v === "string" && v.trim().length > 0;
 const clamp = (v, arr, d = 0) => (ok(v) && arr.includes(v) ? v : arr[d]);
 const toBool = (v) => v === true || v === "true" || v === "1" || v === 1;
@@ -43,20 +43,15 @@ const MOOD = ["warm","neutral","cool"];
 const RATIO = ["1:1","3:4"];
 const SKIN = ["light","fair","medium","tan","deep"];
 const HAIR_COLOR = ["black","brown","blonde","red","gray"];
-const HAIR_LEN = ["short","medium","long","bald"]; // bald support
+const HAIR_LEN = ["short","medium","long","bald"];
 const EYE = ["brown","blue","green","hazel","gray"];
 const BODY = ["slim","athletic","average","curvy","muscular"];
 
-/* ---------- Render sizes ---------- */
-/* Quality mode (par défaut) – net et vendeur */
 const SIZE_HQ = { "1:1": [896, 896], "3:4": [896, 1152] };
-/* Fast mode – plus petit ⇒ plus rapide pour la prévisualisation */
 const SIZE_FAST = { "1:1": [640, 640], "3:4": [672, 896] };
-
-/* ---------- Cache version ---------- */
 const STYLE_VERSION = "commercial_photo_v2";
 
-/* ---------- Small utils ---------- */
+/* ---------- Deterministic variations ---------- */
 const hash = (s) => {
   let h = 2166136261 >>> 0;
   for (let i = 0; i < s.length; i++) {
@@ -67,9 +62,8 @@ const hash = (s) => {
 };
 const pick = (arr, h) => arr[h % arr.length];
 
-/* ---------- Prompt (commercial, photoreal, compact) ---------- */
+/* ---------- Prompt Builder ---------- */
 function buildPrompt(form) {
-  // Normalize inputs
   const gender = clamp(form?.gender, ["woman","man"], 0);
   const bgKey  = clamp(form?.background, BG, 0);
   const outfitKey = clamp(form?.outfit, OUTFIT, 1);
@@ -78,7 +72,6 @@ function buildPrompt(form) {
   const hairL  = clamp(form?.hair_length ?? form?.hairLength ?? form?.hairLen, HAIR_LEN, 2);
   const eyes   = clamp(form?.eye_color ?? form?.eyeColor ?? form?.eyes, EYE, 0);
 
-  // Mappings (concise, commercial)
   const BG_MAP = {
     studio: "white studio background",
     office: "office background",
@@ -87,22 +80,18 @@ function buildPrompt(form) {
   };
   const OUTFIT_W = { blazer:"tailored blazer", shirt:"fitted top", tee:"crew-neck tee", athleisure:"athleisure top" };
   const OUTFIT_M = { blazer:"tailored blazer", shirt:"fitted shirt", tee:"crew-neck tee", athleisure:"athletic tee" };
-
   const outfit = gender === "woman" ? OUTFIT_W[outfitKey] : OUTFIT_M[outfitKey];
   const hairPhrase = hairL === "bald" ? "bald" : `${hairL} ${hairC} hair`;
 
-  // Deterministic variations (framing / lens / lighting)
   const FRAMING = ["portrait","close-up portrait","headshot"];
   const LENSES  = ["85mm f/1.8","50mm f/1.4","135mm f/2"];
   const LIGHTS  = ["soft beauty lighting","natural window light","studio lighting"];
-
   const seedStr = String(form?.seed ?? `${gender}|${bgKey}|${outfitKey}|${skin}|${hairC}|${hairL}|${eyes}`);
   const h = hash(seedStr);
   const framing  = pick(FRAMING, h);
   const lens     = pick(LENSES,  h >> 4);
   const lighting = pick(LIGHTS,  h >> 8);
 
-  // Prompt short (~150–190 chars). Pure photo vocabulary, zero duplicates.
   const parts = [
     `professional ${framing} of ${gender === "woman" ? "woman" : "man"}`,
     BG_MAP[bgKey],
@@ -118,21 +107,15 @@ function buildPrompt(form) {
   ];
 
   let prompt = parts.join(", ");
-  // Safety belt: reduce length if >200 chars
-  if (prompt.length > 200) {
-    prompt = parts.filter(p => p !== (gender === "woman" ? "natural makeup" : "neat grooming")).join(", ");
-  }
-  if (prompt.length > 200) {
-    prompt = parts.filter(p => p !== lens).join(", ");
-  }
+  if (prompt.length > 200) prompt = parts.filter(p => !["natural makeup","neat grooming"].includes(p)).join(", ");
+  if (prompt.length > 200) prompt = parts.filter(p => p !== lens).join(", ");
   return prompt;
 }
 
-/* ---------- HTTP helpers ---------- */
+/* ---------- Timeout helper ---------- */
 async function fetchWithTimeout(url, init, ms) {
-  if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
+  if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal)
     return fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
-  }
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort("timeout"), ms);
   try { return await fetch(url, { ...init, signal: ac.signal }); }
@@ -141,19 +124,15 @@ async function fetchWithTimeout(url, init, ms) {
 
 /* ---------- Handler ---------- */
 export default async function handler(req, res) {
-  setCORS(req, res, {
-    allowMethods: "GET,POST,OPTIONS",
-    allowHeaders: "content-type, authorization, idempotency-key",
-  });
-
+  setCORS(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method === "GET")     return res.status(200).json({ ok:true, ready:true, endpoint:"/api/v1-preview" });
   if (req.method !== "POST")    return res.status(405).json({ ok:false, error:"method_not_allowed" });
 
-  // Import dynamique (évite les crashs de cold-start si ENV manquants sur GET)
+  // ✅ CORRECT IMPORT PATH
   let ensureSupabaseClient, getSupabaseServiceRole, sb;
   try {
-    ({ ensureSupabaseClient, getSupabaseServiceRole } = await import("../supabase.mjs"));
+    ({ ensureSupabaseClient, getSupabaseServiceRole } = await import("../lib/supabase.mjs"));
   } catch (e) {
     return res.status(500).json({ ok:false, error:"supabase_module_load_failed", details: String(e).slice(0,200) });
   }
@@ -163,32 +142,24 @@ export default async function handler(req, res) {
     catch { return res.status(500).json({ ok:false, error:"missing_env_supabase" }); }
     ensureSupabaseClient(sb, "service");
 
-    // --- tolerant body parsing + prompt fallback ---
     let body = req.body;
-    if (typeof body === "string") {
-      try { body = JSON.parse(body); } catch { body = {}; }
-    }
+    if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
     const form = (body && typeof body === "object") ? body : {};
     if (!ok(form?.prompt)) form.prompt = buildPrompt(form);
 
-    // --- render settings ---
-    const fast = toBool(form?.fast); // ⇢ active le mode rapide
+    const fast = toBool(form?.fast);
     const ratio = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
     const [W, H] = (fast ? SIZE_FAST : SIZE_HQ)[ratio] || (fast ? [640,640] : [896,896]);
-    const seed = Number.isFinite(Number(form?.seed)) ? Math.max(0, Math.floor(Number(form.seed))) : DEFAULT_SEED;
+    const seed = Number.isFinite(Number(form?.seed)) ? Math.floor(Number(form.seed)) : DEFAULT_SEED;
     const prompt = String(form.prompt);
-
-    // --- cache key (versioned + fast flag) ---
     const key = `${STYLE_VERSION}${fast ? "|fast" : ""}|${prompt}|seed:${seed}|${W}x${H}`;
 
-    // 0) Cache lookup
     const cached = await sb.from("preview_cache").select("image_url,hits").eq("key", key).maybeSingle();
     if (cached.data?.image_url) {
       await sb.from("preview_cache").update({ hits: (cached.data.hits||0)+1 }).eq("key", key).catch(()=>{});
       return res.status(200).json({ ok:true, image_url: cached.data.image_url, provider:"cache", seed, key, fast: !!fast });
     }
 
-    // 1) Generation (Pollinations FLUX) — photoreal anti-cartoon
     const q = new URLSearchParams({
       model: "flux",
       width: String(W),
@@ -199,25 +170,16 @@ export default async function handler(req, res) {
       nologo: "true",
       negative: PREVIEW_NEGATIVE
     }).toString();
-    const url  = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
     const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
 
-    let r;
-    if (typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal) {
-      r = await fetch(url, { headers, signal: AbortSignal.timeout(fast ? 30_000 : 60_000) });
-    } else {
-      const ac = new AbortController();
-      const t = setTimeout(() => ac.abort('timeout'), fast ? 30_000 : 60_000);
-      try { r = await fetch(url, { headers, signal: ac.signal }); }
-      finally { clearTimeout(t); }
-    }
+    const r = await fetchWithTimeout(url, { headers }, fast ? 30_000 : 60_000);
     if (!r.ok) {
       const msg = await r.text().catch(()=> "");
       return res.status(r.status).json({ ok:false, error:"pollinations_failed", details: msg.slice(0,400) });
     }
     const bytes = Buffer.from(await r.arrayBuffer());
 
-    // 2) Upload + cache insert (Supabase Storage)
     const { data: pub } = await sb.storage.getBucket(BUCKET);
     if (!pub) return res.status(500).json({ ok:false, error:"bucket_not_found", bucket: BUCKET });
 
