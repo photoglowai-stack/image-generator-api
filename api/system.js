@@ -1,4 +1,17 @@
 // --- Endpoint health/diagnostic ---
+import {
+  ensureSupabaseClient,
+  getSupabaseAnon,
+  getSupabaseEnv,
+  getSupabaseServiceRole,
+} from "../lib/supabase.mjs";
+
+const supabaseAnon = getSupabaseAnon();
+const supabaseAdmin = getSupabaseServiceRole();
+
+const BUCKET_UPLOADS = process.env.BUCKET_UPLOADS || "photos";
+const BUCKET_IMAGES = process.env.BUCKET_IMAGES || "generated_images";
+
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
 

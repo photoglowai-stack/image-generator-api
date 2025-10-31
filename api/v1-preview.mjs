@@ -172,6 +172,7 @@ export default async function handler(req, res) {
 
     // Cache key
     const key = `${STYLE_VERSION}${fast ? "|fast" : ""}|${prompt}|seed:${seed}|${W}x${H}`;
+    const safeKey = Buffer.from(key).toString("base64url");
 
     // Cache lookup
     const cached = await sb.from("preview_cache").select("image_url,hits").eq("key", key).maybeSingle();
@@ -205,7 +206,7 @@ export default async function handler(req, res) {
     const yyyy = d.getUTCFullYear();
     const mm   = String(d.getUTCMonth()+1).padStart(2,'0');
     const dd   = String(d.getUTCDate()).padStart(2,'0');
-    const path = `previews/${yyyy}-${mm}-${dd}/${encodeURIComponent(key)}.jpg`;
+    const path = `previews/${yyyy}-${mm}-${dd}/${safeKey}.jpg`;
 
     const up = await sb.storage.from(BUCKET).upload(path, bytes, {
       contentType: "image/jpeg",
