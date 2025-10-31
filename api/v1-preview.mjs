@@ -1,30 +1,31 @@
-// /api/v1-preview.mjs — Commercial Photoreal Preview (V5, stable)
-// 🧯 CORS inline, réponses JSON
-// 🔐 Import Supabase dynamique (cold-start safe) — chemin corrigé ../lib/supabase.mjs
-// ✅ GET health & debug
-// ✅ Prompt compact photoréal (≤ ~180–200 chars), variations déterministes
-// ✅ Pollinations: model=flux, private=true, nologo=true, enhance=false (par défaut), safe=true
-// ✅ Retry/backoff (429/502/503) + timeout
-// ✅ Upload Supabase (public ou signed), cache table preview_cache
+// /api/v1-preview.mjs — Commercial Photoreal Preview (V6, perf & token-ready)
+// - CORS inline, JSON only
+// - Import Supabase dynamique: ../lib/supabase.mjs
+// - GET: health & debug
+// - Prompt compact photoréal (≤ ~180–200 chars), variations déterministes
+// - Pollinations (model=flux): private=true, nologo=true, enhance=false, safe=true
+// - Retry/backoff (429/502/503) + timeout
+// - Upload Supabase (public/signed), cache table preview_cache
+// - Clé Storage COURTE & SAFE (hash hex), pas de base64 géant
 
 export const config = { runtime: "nodejs" };
 
 /* ---------- CORS ---------- */
 function setCORS(req, res, opts = {}) {
-  res.setHeader("access-control-allow-origin", "*"); // Figma (Origin: null) OK
+  res.setHeader("access-control-allow-origin", "*");
   res.setHeader("access-control-allow-methods", opts.allowMethods || "GET,POST,OPTIONS");
   res.setHeader("access-control-allow-headers", opts.allowHeaders || "content-type, authorization, idempotency-key");
   res.setHeader("access-control-max-age", "86400");
 }
 
 /* ---------- ENV ---------- */
-const POL_TOKEN       = process.env.POLLINATIONS_TOKEN || ""; // Bearer côté serveur (optionnel mais recommandé)
+const POL_TOKEN       = process.env.POLLINATIONS_TOKEN || ""; // Bearer (recommandé)
 const BUCKET          = process.env.PREVIEW_BUCKET || "generated_images";
 const OUTPUT_PUBLIC   = (process.env.OUTPUT_PUBLIC || "true") === "true";
 const SIGNED_TTL_S    = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7);
 const CACHE_CONTROL   = String(process.env.PREVIEW_CACHE_CONTROL_S || 31536000);
 const DEFAULT_SEED    = Number(process.env.PREVIEW_SEED || 777);
-const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true"; // OFF par défaut pour éviter le look stylisé
+const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true"; // OFF par défaut
 
 /* ---------- Helpers ---------- */
 const ok    = (v) => typeof v === "string" && v.trim().length > 0;
@@ -39,12 +40,13 @@ const HAIR_COLOR = ["black","brown","blonde","red","gray"];
 const HAIR_LEN   = ["short","medium","long","bald"];
 const EYE        = ["brown","blue","green","hazel","gray"];
 
+// Fast plus petit ⇒ plus rapide (tu peux remonter à 640 si tu veux)
 const SIZE_HQ   = { "1:1": [896, 896], "3:4": [896, 1152] };
-const SIZE_FAST = { "1:1": [640, 640], "3:4": [672, 896] };
+const SIZE_FAST = { "1:1": [576, 576], "3:4": [576, 768] };
 
 const STYLE_VERSION = "commercial_photo_v2";
 
-/* ---------- Deterministic variations ---------- */
+/* ---------- Deterministic variations & hashing ---------- */
 const hash = (s) => {
   let h = 2166136261 >>> 0;
   for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h + (h<<1) + (h<<4) + (h<<7) + (h<<8) + (h<<24)) >>> 0; }
@@ -102,21 +104,16 @@ async function fetchPollinations(url, headers, tries = 3, baseDelayMs = 600, tim
       if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
         r = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
       } else {
-        const ac = new AbortController();
-        const t = setTimeout(() => ac.abort("timeout"), timeoutMs);
-        try { r = await fetch(url, { headers, signal: ac.signal }); }
-        finally { clearTimeout(t); }
+        const ac = new AbortController(); const t = setTimeout(() => ac.abort("timeout"), timeoutMs);
+        try { r = await fetch(url, { headers, signal: ac.signal }); } finally { clearTimeout(t); }
       }
       if (r.ok) return r;
-      // Retry uniquement sur 429/502/503
       if (![429,502,503].includes(r.status)) {
         const txt = await r.text().catch(()=> "");
         throw new Error(`HTTP ${r.status} ${txt.slice(0,200)}`);
       }
-    } catch (e) {
-      lastErr = e;
-    }
-    await new Promise(s => setTimeout(s, baseDelayMs * (2 ** i))); // 600ms, 1200ms, 2400ms
+    } catch (e) { lastErr = e; }
+    await new Promise(s => setTimeout(s, baseDelayMs * (2 ** i))); // 600ms → 1200ms → 2400ms
   }
   throw new Error(`pollinations_failed_after_retries: ${String(lastErr || "unknown")}`);
 }
@@ -143,7 +140,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ ok:false, error:"method_not_allowed" });
   }
 
-  // Import dynamique Supabase (chemin corrigé)
+  // Import dynamique Supabase (chemin correct)
   let ensureSupabaseClient, getSupabaseServiceRole, sb;
   try {
     ({ ensureSupabaseClient, getSupabaseServiceRole } = await import("../lib/supabase.mjs"));
@@ -165,23 +162,23 @@ export default async function handler(req, res) {
     // Render settings
     const fast  = toBool(form?.fast);
     const ratio = clamp(form?.aspect_ratio ?? form?.aspectRatio, RATIO, 0);
-    const [W,H] = (fast ? SIZE_FAST : SIZE_HQ)[ratio] || (fast ? [640,640] : [896,896]);
+    const [W,H] = (fast ? SIZE_FAST : SIZE_HQ)[ratio] || (fast ? [576,576] : [896,896]);
     const seed  = Number.isFinite(Number(form?.seed)) ? Math.floor(Number(form.seed)) : DEFAULT_SEED;
-    const safe  = (form?.safe ?? true) ? "true" : "false"; // OFF → à tes risques; ON par défaut pour la preview
+    const safe  = (form?.safe ?? true) ? "true" : "false"; // ON par défaut
     const prompt= String(form.prompt);
 
-    // Cache key
-    const key = `${STYLE_VERSION}${fast ? "|fast" : ""}|${prompt}|seed:${seed}|${W}x${H}`;
-    const safeKey = Buffer.from(key).toString("base64url");
+    // Cache key (long) — uniquement pour la BDD
+    const cacheKey = `${STYLE_VERSION}${fast ? "|fast" : ""}|${prompt}|seed:${seed}|${W}x${H}`;
 
     // Cache lookup
-    const cached = await sb.from("preview_cache").select("image_url,hits").eq("key", key).maybeSingle();
+    const cached = await sb.from("preview_cache").select("image_url,hits").eq("key", cacheKey).maybeSingle();
     if (cached.data?.image_url) {
-      try { await sb.from("preview_cache").update({ hits:(cached.data.hits||0)+1 }).eq("key", key); } catch {}
-      return res.status(200).json({ ok:true, image_url: cached.data.image_url, provider:"cache", seed, key, fast: !!fast });
+      // best effort, ne bloque pas la réponse
+      sb.from("preview_cache").update({ hits:(cached.data.hits||0)+1 }).eq("key", cacheKey).catch(()=>{});
+      return res.status(200).json({ ok:true, image_url: cached.data.image_url, provider:"cache", seed, key: cacheKey, fast: !!fast });
     }
 
-    // Pollinations call (GET image bytes)
+    // Pollinations call
     const params = new URLSearchParams({
       model: "flux",
       width: String(W),
@@ -195,18 +192,24 @@ export default async function handler(req, res) {
     const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
     const headers = POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {};
 
-    const r = await fetchPollinations(url, headers, /*tries*/ 3, /*baseDelay*/ 600, /*timeout*/ fast ? 30000 : 60000);
+    const r = await fetchPollinations(url, headers, 3, 600, fast ? 30000 : 60000);
+    const ctype = r.headers.get("content-type") || "";
     const bytes = Buffer.from(await r.arrayBuffer());
+    if (!/image\/(jpeg|jpg|png|webp)/i.test(ctype) && bytes.length < 64 * 1024) {
+      // petit garde-fou si erreur textuelle renvoyée
+      return res.status(502).json({ ok:false, error:"pollinations_unexpected_response" });
+    }
 
-    // Supabase upload
-    const bucketExists = await sb.storage.getBucket(BUCKET);
-    if (!bucketExists?.data) return res.status(500).json({ ok:false, error:"bucket_not_found", bucket: BUCKET });
-
+    // Supabase upload — clé COURTE & SAFE : v2[-fast]-s{seed}-{W}x{H}-{hash}.jpg
     const d = new Date();
     const yyyy = d.getUTCFullYear();
     const mm   = String(d.getUTCMonth()+1).padStart(2,'0');
     const dd   = String(d.getUTCDate()).padStart(2,'0');
-    const path = `previews/${yyyy}-${mm}-${dd}/${safeKey}.jpg`;
+
+    const hval   = hash(cacheKey + (POL_TOKEN ? "|auth" : "|noauth"));
+    const suffix = hval.toString(16).padStart(8,"0");
+    const fileKey = `${STYLE_VERSION}${fast?'-fast':''}-s${seed}-${W}x${H}-${suffix}.jpg`;
+    const path = `previews/${yyyy}-${mm}-${dd}/${fileKey}`;
 
     const up = await sb.storage.from(BUCKET).upload(path, bytes, {
       contentType: "image/jpeg",
@@ -225,9 +228,10 @@ export default async function handler(req, res) {
       imageUrl = data.signedUrl;
     }
 
-    try { await sb.from("preview_cache").insert({ key, image_url: imageUrl }); } catch {}
+    // best effort (non bloquant)
+    sb.from("preview_cache").insert({ key: cacheKey, image_url: imageUrl }).catch(()=>{});
 
-    return res.status(200).json({ ok:true, image_url: imageUrl, provider:"pollinations", seed, key, fast: !!fast });
+    return res.status(200).json({ ok:true, image_url: imageUrl, provider:"pollinations", seed, key: cacheKey, fast: !!fast });
   } catch (e) {
     return res.status(500).json({ ok:false, error:"server_error", details:String(e).slice(0,400) });
   }
