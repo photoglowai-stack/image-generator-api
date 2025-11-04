@@ -65,10 +65,9 @@ const EYE        = ["brown","blue","green","hazel","gray"];
 
 const SIZE_HQ   = { "1:1": [896, 896], "3:4": [896, 1152] };
 const SIZE_FAST = { "1:1": [576, 576], "3:4": [576, 768] };
-const STYLE_VERSION = "commercial_photo_v2";
+const STYLE_VERSION = "commercial_photo_v3"; // ▲ nouvelle version
 
 const hash = (s) => { let h = 2166136261>>>0; for (let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=(h+(h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24))>>>0 } return h>>>0; };
-const pick = (arr, h) => arr[h % arr.length];
 
 /* -------------------- Normalisation + seed ---------------------- */
 function normalizeForm(raw) {
@@ -97,38 +96,40 @@ function deriveSeed(userSeed, n, extra = "") {
 }
 
 /* ------------------------ Prompt builder ------------------------ */
+/** Prompt stable et directif (headshot pro) */
 function buildPrompt(n) {
-  const BG_MAP = { studio:"white studio background", office:"modern office background", city:"city skyline background", nature:"outdoor nature background" };
+  const BG_MAP = {
+    studio: "plain neutral studio background",
+    office: "modern office background",
+    city:   "subtle city background",
+    nature: "soft outdoor background"
+  };
   const OUTFIT_W = { blazer:"tailored blazer", shirt:"fitted blouse", tee:"crew-neck tee", athleisure:"athleisure top" };
   const OUTFIT_M = { blazer:"tailored blazer", shirt:"fitted shirt",  tee:"crew-neck tee", athleisure:"athletic performance tee" };
   const SKIN_MAP = { light:"light skin tone", fair:"fair skin tone", medium:"medium skin tone", tan:"tan skin tone", deep:"deep skin tone" };
   const EYE_MAP  = { brown:"brown eyes", blue:"blue eyes", green:"green eyes", hazel:"hazel eyes", gray:"gray eyes" };
-  const FRAMING = ["portrait","close-up portrait","headshot"];
-  const LENSES  = ["85mm f/1.8","50mm f/1.4","135mm f/2"];
-  const LIGHTS  = ["soft beauty lighting","natural window light","studio lighting"];
 
-  const seed = hash(`${STYLE_VERSION}|${n.styleKey}`);
-  n.framing  = pick(FRAMING, seed);
-  n.lens     = pick(LENSES,  seed>>4);
-  n.lighting = pick(LIGHTS,  seed>>8);
+  const subject   = n.gender === "woman" ? "confident professional woman" : "confident professional man";
+  const outfit    = (n.gender === "woman" ? OUTFIT_W : OUTFIT_M)[n.outfitKey];
+  const hairPhrase= n.hairLength === "bald" ? "clean-shaven head" : `${n.hairLength} ${n.hairColor} hair`;
+  const grooming  = n.gender === "woman" ? "refined natural makeup" : "well-groomed facial features";
 
-  const outfit = (n.gender === "woman" ? OUTFIT_W : OUTFIT_M)[n.outfitKey];
-  const hairPhrase = n.hairLength === "bald" ? "clean-shaven head" : `${n.hairLength} ${n.hairColor} hair`;
-  const subject = n.gender === "woman" ? "confident professional woman" : "confident professional man";
-  const grooming = n.gender === "woman" ? "refined natural makeup" : "well-groomed facial features";
-
+  // Grammaire resserrée (pas d’aléatoire de framing/optique/lumière)
   const parts = [
-    `professional ${n.framing} of a ${subject}`,
-    BG_MAP[n.background], outfit, hairPhrase,
-    SKIN_MAP[n.skin], EYE_MAP[n.eyeColor],
-    n.lens, n.lighting, grooming,
-    "photorealistic commercial portrait",
-  ].filter(Boolean);
+    `high quality professional headshot of a ${subject}`,
+    BG_MAP[n.background],
+    outfit,
+    hairPhrase,
+    SKIN_MAP[n.skin],
+    EYE_MAP[n.eyeColor],
+    "eye-level shot, from chest up",
+    "neutral soft lighting, minimal shadows",
+    "85mm lens look, shallow depth of field",
+    "photorealistic portrait, clean composition, realistic proportions, natural skin texture"
+  ];
 
-  let prompt = parts.join(", ");
-  if (prompt.length > 200) prompt = parts.filter(p => p !== grooming).join(", ");
-  if (prompt.length > 200) prompt = parts.filter(p => p !== n.lens).join(", ");
-  return prompt;
+  // Évite les prompts trop longs
+  return parts.filter(Boolean).join(", ");
 }
 
 /* --------------------- Pollinations (HTTP) ---------------------- */
@@ -199,7 +200,6 @@ async function toJPEG(bytes) {
     const sharp = (sharpMod.default || sharpMod);
     return await sharp(Buffer.from(bytes)).jpeg({ quality: 92 }).toBuffer();
   } catch {
-    // Fallback: bytes bruts si sharp indisponible (déconseillé pour Figma si WEBP)
     return Buffer.from(bytes);
   }
 }
@@ -213,9 +213,11 @@ export default async function handler(req, res) {
     const hasUrl = Boolean(process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL);
     const hasSrv = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY);
     return res.status(200).json({
-      ok:true, endpoint:"/v1/preview",
+      ok:true,
+      endpoint:"/api/v1-preview", // ▲ cohérent avec la route
       has_supabase_url:hasUrl, has_service_role:hasSrv,
-      bucket:BUCKET, output_public:OUTPUT_PUBLIC, poll_token:Boolean(POL_TOKEN)
+      bucket:BUCKET, output_public:OUTPUT_PUBLIC, poll_token:Boolean(POL_TOKEN),
+      style_version: STYLE_VERSION
     });
   }
 
@@ -254,7 +256,7 @@ export default async function handler(req, res) {
 
   // Normalisation & prompt
   const n = normalizeForm(body);
-  const fastDefault = !strict; // strict => on respecte width/height fournis
+  const fastDefault = !strict;
   const fast = toBool(body?.fast ?? fastDefault);
 
   // Dimensions
@@ -270,7 +272,7 @@ export default async function handler(req, res) {
   const prompt = strict && ok(body.prompt) ? String(body.prompt) : (ok(body?.prompt) ? String(body.prompt) : buildPrompt(n));
   const seed   = strict && Number.isFinite(Number(body?.seed))
     ? Math.floor(Number(body.seed))
-    : deriveSeed(body?.seed, n, `${n.framing}|${n.lighting}|${n.lens}`);
+    : deriveSeed(body?.seed, n, "headshot|neutral_soft|85mm");
   const safe   = toBool(body?.safe ?? true) ? "true" : "false";
 
   /* --------------------- PREVIEW (JSON) ---------------------- */
