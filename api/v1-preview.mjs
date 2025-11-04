@@ -63,17 +63,18 @@ const HAIR_COLOR = ["black","brown","blonde","red","gray"];
 const HAIR_LEN   = ["short","medium","long","bald"];
 const EYE        = ["brown","blue","green","hazel","gray"];
 
-// Nouveaux attributs supportés (safe wording)
+// Attributs morpho/humeur (on les garde neutres dans le prompt)
 const BODY_TYPE  = ["slim","athletic","curvy","average"];
-const BUST_SIZE  = ["small","medium","large"];
-const BUTT_SIZE  = ["small","medium","large"]; // => "hips" dans le prompt
+const BUST_SIZE  = ["small","medium","large"]; // non prononcé explicitement
+const BUTT_SIZE  = ["small","medium","large"]; // non prononcé explicitement
 const MOOD       = ["neutral","friendly","confident","cool","serious","approachable"];
 
 const SIZE_HQ   = { "1:1": [896, 896], "3:4": [896, 1152] };
 const SIZE_FAST = { "1:1": [576, 576], "3:4": [576, 768] };
-const STYLE_VERSION = "commercial_photo_v4"; // ▲ stable + morpho/mood
+const STYLE_VERSION = "commercial_photo_v4"; // editorial, youthful, safe
 
 const hash = (s) => { let h = 2166136261>>>0; for (let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=(h+(h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24))>>>0 } return h>>>0; };
+const pick = (arr, h) => arr[h % arr.length];
 
 /* -------------------- Normalisation + seed ---------------------- */
 function normalizeForm(raw) {
@@ -89,19 +90,14 @@ function normalizeForm(raw) {
   let hairColor    = clamp(form.hair_color ?? form.hairColor ?? form.hair, HAIR_COLOR, 1);
   if (hairLength === "bald") hairColor = "none";
 
-  // Nouveaux champs (camelCase & snake_case)
   const bodyType   = clamp((form.body_type ?? form.bodyType), BODY_TYPE, 3); // default average
   const bustSize   = clamp((form.bust_size ?? form.bustSize), BUST_SIZE, 1); // default medium
   const buttSize   = clamp((form.butt_size ?? form.buttSize), BUTT_SIZE, 1);
   const mood       = clamp((form.mood ?? form.expression ?? form.vibe), MOOD, 2); // default confident
 
-  // Activer hips dans le prompt si waist-up / three-quarter explicit
-  const framingStr = String(form.framing || "").toLowerCase();
-  const includeHips = toBool(form.waist_up) || /waist|three|3\/4/.test(framingStr);
-
-  const styleKey   = `${background}|${outfitKey}|${skin}|${hairLength}|${hairColor}|${eyeColor}|${bodyType}|${bustSize}|${mood}|${includeHips ? "hips" : "-"}`;
+  const styleKey   = `${background}|${outfitKey}|${skin}|${hairLength}|${hairColor}|${eyeColor}|${bodyType}|${bustSize}|${buttSize}|${mood}`;
   return { gender, background, outfitKey, ratio, skin, hairColor, hairLength, eyeColor,
-           bodyType, bustSize, buttSize, mood, includeHips, styleKey };
+           bodyType, bustSize, buttSize, mood, styleKey };
 }
 
 function deriveSeed(userSeed, n, extra = "") {
@@ -113,7 +109,7 @@ function deriveSeed(userSeed, n, extra = "") {
 }
 
 /* ------------------------ Prompt builder ------------------------ */
-/** Prompt stable, directif (headshot/waist-up, 85mm, soft light) */
+/** Editorial, youthful, safe (adult 25+, fully clothed), shoulders-up */
 function buildPrompt(n) {
   const BG_MAP = {
     studio: "white seamless studio background",
@@ -126,52 +122,41 @@ function buildPrompt(n) {
   const SKIN_MAP = { light:"light skin tone", fair:"fair skin tone", medium:"medium skin tone", tan:"tan skin tone", deep:"deep skin tone" };
   const EYE_MAP  = { brown:"brown eyes", blue:"blue eyes", green:"green eyes", hazel:"hazel eyes", gray:"gray eyes" };
 
-  const subject   = n.gender === "woman" ? "confident professional woman" : "confident professional man";
+  const subject   = n.gender === "woman" ? "stylish adult woman (25+)" : "stylish adult man (25+)";
   const outfit    = (n.gender === "woman" ? OUTFIT_W : OUTFIT_M)[n.outfitKey];
   const hairDesc  = n.hairLength === "bald" ? "clean-shaven head" : `${n.hairLength} ${n.hairColor} hair`;
   const skinDesc  = SKIN_MAP[n.skin];
   const eyeDesc   = EYE_MAP[n.eyeColor];
   const bgDesc    = BG_MAP[n.background];
 
-  // Morphologie (safe wording)
-  const bodyMap = { slim:"slim build", athletic:"athletic build", curvy:"curvy build", average:"average build" };
-  const chestMapW = { small:"subtle chest profile", medium:"balanced chest profile", large:"fuller chest profile" };
-  const chestMapM = { small:"slim chest",           medium:"balanced chest",        large:"broad chest" };
-  const hipsMap   = { small:"narrow hips", medium:"balanced hips", large:"fuller hips" };
-
-  const chestDesc = (n.gender === "woman" ? chestMapW : chestMapM)[n.bustSize] || (n.gender === "woman" ? "balanced chest profile" : "balanced chest");
-  const hipsDesc  = hipsMap[n.buttSize] || "balanced hips";
-
-  // Humeur/expression
+  // Build neutre (jeune/élancé sans zones sensibles)
+  const bodyMap = { slim:"slim build", athletic:"athletic build", curvy:"balanced curves", average:"average build" };
   const moodMap = {
     neutral: "neutral expression",
-    friendly: "gentle friendly expression",
+    friendly: "friendly look",
     confident: "confident look",
-    cool: "calm composed look",
+    cool: "cool composed look",
     serious: "serious expression",
     approachable: "approachable slight smile"
   };
-  const moodDesc = moodMap[n.mood] || "confident look";
-
-  // Framing selon includeHips
-  const framing = n.includeHips ? "waist-up portrait, eye-level" : "eye-level headshot from chest up";
 
   const parts = [
-    `high quality professional ${n.includeHips ? "portrait" : "headshot"} of a ${subject}`,
+    `high quality editorial portrait of a ${subject}`,
+    "fully clothed",
+    "youthful vibe",
     bgDesc,
     outfit,
     hairDesc,
     skinDesc,
     eyeDesc,
-    bodyMap[n.bodyType] || "balanced build",
-    chestDesc,
-    n.includeHips ? hipsDesc : null,
-    moodDesc,
-    framing,
-    "neutral soft beauty lighting, minimal shadows",
+    bodyMap[n.bodyType] || "balanced proportions",
+    moodMap[n.mood] || "confident look",
+    // framing & light
+    "from shoulders up, eye-level",
+    "soft beauty lighting, minimal shadows",
     "85mm lens look, shallow depth of field",
-    "photorealistic portrait, clean composition, realistic proportions, natural skin texture",
-    n.gender === "woman" ? "refined natural makeup" : "well-groomed appearance"
+    // réalisme
+    "photorealistic, clean composition, natural skin texture, realistic proportions"
   ];
 
   return parts.filter(Boolean).join(", ");
@@ -300,6 +285,10 @@ export default async function handler(req, res) {
     return res.status(200).json(cached);
   }
 
+  // ---- Paramètre px (accélère les previews) ----
+  const pxRaw = Number(body?.px);
+  const px = Number.isFinite(pxRaw) ? Math.max(128, Math.min(1024, Math.floor(pxRaw))) : 0;
+
   // Normalisation & prompt
   const n = normalizeForm(body);
   const fastDefault = !strict;
@@ -307,6 +296,12 @@ export default async function handler(req, res) {
 
   // Dimensions
   let [W,H] = (fast ? SIZE_FAST : SIZE_HQ)[n.ratio] || (fast ? [576,576] : [896,896]);
+  // Override par px (utile pour preview petite)
+  if (px > 0) {
+    if (n.ratio === "1:1") { W = px; H = px; }
+    else if (n.ratio === "3:4") { W = px; H = Math.round(px * 4 / 3); }
+  }
+  // strict width/height gardent la priorité
   if (strict) {
     const bw = Number(body.width), bh = Number(body.height);
     if (Number.isFinite(bw) && Number.isFinite(bh) && bw >= 64 && bh >= 64) {
@@ -314,11 +309,11 @@ export default async function handler(req, res) {
     }
   }
 
-  // Prompt & seed
+  // Prompt & seed (builder = "editorial portrait" jeune & safe)
   const prompt = strict && ok(body.prompt) ? String(body.prompt) : (ok(body?.prompt) ? String(body.prompt) : buildPrompt(n));
   const seed   = strict && Number.isFinite(Number(body?.seed))
     ? Math.floor(Number(body.seed))
-    : deriveSeed(body?.seed, n, "headshot|neutral_soft|85mm");
+    : deriveSeed(body?.seed, n, "editorial|youthful|85mm");
   const safe   = toBool(body?.safe ?? true) ? "true" : "false";
 
   /* --------------------- PREVIEW (JSON) ---------------------- */
