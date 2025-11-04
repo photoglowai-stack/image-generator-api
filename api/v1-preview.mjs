@@ -1,10 +1,10 @@
-// /api/v1-preview.mjs — Synchronous Strict (V8)
-// - Synchronous: pollinations GET -> validate bytes -> upload Supabase -> return Supabase URL
-// - GET-only (plus stable) ; POST désactivé par défaut
-// - No provider URL in normal flow (pour éviter les confusions “preview”)
-// - UUID unique ; upsert:false (pas d'écrasement)
-// - Validation dure: content-type image/* & taille min
-// - Flags: strict (force params), debug_compare (SHA-256 provider vs Supabase)
+// /api/v1-preview.mjs — No-Storage Preview (Provider URL by default, optional Proxy Binary)
+// - Default: provider_only → return Pollinations URL (no storage, fastest path)
+// - Optional: proxy_only  → fetch image bytes from Pollinations and return binary (no storage)
+// - Strict mode: can force a raw prompt (skips builder) if body.strict=true + body.prompt
+// - Hard validation in proxy path: content-type image/* & minimum size
+// - GET → health/status, POST → preview
+// - No Supabase import/usage whatsoever
 
 export const config = { runtime: "nodejs", maxDuration: 25 };
 
@@ -18,11 +18,6 @@ function setCORS(req, res) {
 
 /* ------------------------------ ENV ----------------------------- */
 const POL_TOKEN       = process.env.POLLINATIONS_TOKEN || "";
-const BUCKET          = process.env.PREVIEW_BUCKET || "generated_images";
-const OUTPUT_PUBLIC   = (process.env.OUTPUT_PUBLIC || "true") === "true";
-const SIGNED_TTL_S    = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 7);
-const CACHE_CONTROL   = String(process.env.PREVIEW_CACHE_CONTROL_S || 31536000);
-const DEFAULT_SEED    = Number(process.env.PREVIEW_SEED || 777);
 const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true";
 
 const MAX_FUNCTION_S   = Number(process.env.MAX_FUNCTION_S || 25);
@@ -46,7 +41,9 @@ const EYE        = ["brown","blue","green","hazel","gray"];
 const SIZE_HQ   = { "1:1": [896, 896], "3:4": [896, 1152] };
 const SIZE_FAST = { "1:1": [576, 576], "3:4": [576, 768] };
 const STYLE_VERSION = "commercial_photo_v2";
+const DEFAULT_SEED  = Number(process.env.PREVIEW_SEED || 777);
 
+// simple FNV-like hash for deterministic picks
 const hash = (s) => { let h = 2166136261>>>0; for (let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=(h+(h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24))>>>0 } return h>>>0; };
 const pick = (arr, h) => arr[h % arr.length];
 
@@ -125,6 +122,20 @@ async function fetchWithTimeout(url, init = {}, timeoutMs = POL_TIMEOUT_MS) {
   finally { clearTimeout(t); }
 }
 
+function buildPollinationsUrl({ prompt, width, height, seed, safe }) {
+  const qs = new URLSearchParams({
+    model:"flux",
+    width:String(width),
+    height:String(height),
+    seed:String(seed),
+    private:"true",
+    nologo:"true",
+    enhance: PREVIEW_ENHANCE ? "true" : "false",
+    safe
+  }).toString();
+  return `${POL_ENDPOINT}/${encodeURIComponent(prompt)}?${qs}`;
+}
+
 async function readImageResponse(res) {
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
@@ -142,23 +153,9 @@ async function readImageResponse(res) {
   return { bytes, ctype: ctype.includes("png") ? "image/png" : ctype.includes("webp") ? "image/webp" : "image/jpeg" };
 }
 
-async function fetchPollinationsBinary({ prompt, width, height, seed, safe }) {
+async function fetchPollinationsBinary({ url }) {
   const baseHeaders = { Accept: "image/*", "User-Agent": "Photoglow-Preview/1.0" };
   if (POL_TOKEN) baseHeaders.Authorization = `Bearer ${POL_TOKEN}`;
-
-  // GET-only (plus fiable en preview)
-  const qs = new URLSearchParams({
-    model:"flux",
-    width:String(width),
-    height:String(height),
-    seed:String(seed),
-    private:"true",
-    nologo:"true",
-    enhance: PREVIEW_ENHANCE ? "true" : "false",
-    safe
-  }).toString();
-
-  const url = `${POL_ENDPOINT}/${encodeURIComponent(prompt)}?${qs}`;
 
   // Tentatives avec backoff
   let lastErr;
@@ -181,12 +178,14 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(204).end();
 
   if (req.method === "GET") {
-    const hasUrl = Boolean(process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL);
-    const hasSrv = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY);
     return res.status(200).json({
       ok:true, endpoint:"/v1/preview",
-      has_supabase_url:hasUrl, has_service_role:hasSrv,
-      bucket:BUCKET, output_public:OUTPUT_PUBLIC, poll_token:Boolean(POL_TOKEN)
+      mode_default:"provider_only",
+      supports_proxy_only:true,
+      poll_token:Boolean(POL_TOKEN),
+      enhance: PREVIEW_ENHANCE,
+      time_budget_ms: TIME_BUDGET_MS,
+      poll_timeout_ms: POL_TIMEOUT_MS
     });
   }
 
@@ -200,8 +199,10 @@ export default async function handler(req, res) {
   if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
   if (!body || typeof body !== "object") body = {};
 
-  // Strict mode: force params (pas de builder)
-  const strict = toBool(body?.strict);
+  // Flags
+  const strict     = toBool(body?.strict);
+  const proxyOnly  = toBool(body?.proxy_only);
+  // provider_only est implicite par défaut quand proxy_only n'est pas demandé
 
   // Normalisation & prompt
   const n = normalizeForm(body);
@@ -211,83 +212,34 @@ export default async function handler(req, res) {
   const seed   = deriveSeed(body?.seed, n, `${n.framing}|${n.lighting}|${n.lens}`);
   const safe   = toBool(body?.safe ?? true) ? "true" : "false";
 
-  // 1) Télécharger depuis Pollinations (bloquant)
-  let bin;
+  // 1) Construire l'URL provider (toujours)
+  const providerUrl = buildPollinationsUrl({ prompt, width: W, height: H, seed, safe });
+
+  // 2A) Chemin provider_only (défaut) → renvoyer juste l'URL (aucun téléchargement côté serveur)
+  if (!proxyOnly) {
+    res.setHeader("content-type","application/json");
+    return res.status(200).json({
+      ok:true, mode:"provider_only",
+      provider_url: providerUrl,
+      seed, width: W, height: H, fast: !!fast
+    });
+  }
+
+  // 2B) Chemin proxy_only → télécharger + renvoyer le binaire au client (toujours sans stockage)
   try {
-    bin = await fetchPollinationsBinary({ prompt, width: W, height: H, seed, safe });
+    const { bytes, ctype } = await fetchPollinationsBinary({ url: providerUrl });
+
+    // Cache client raisonnable (le provider peut être déterministe via seed)
+    res.setHeader("content-type", ctype);
+    res.setHeader("cache-control", "public, max-age=31536000, immutable");
+    // Optionnel : exposer quelques headers utiles côté client
+    res.setHeader("x-photoglow-mode", "proxy_only");
+    res.setHeader("x-photoglow-seed", String(seed));
+    res.setHeader("x-photoglow-size", `${W}x${H}`);
+
+    return res.status(200).end(bytes);
   } catch (e) {
     res.setHeader("content-type","application/json");
     return res.status(502).json({ ok:false, error:"pollinations_failed", details:String(e).slice(0,200) });
   }
-  const { bytes, ctype } = bin;
-
-  // 2) Upload Supabase (clé UUID, pas d'upsert)
-  let ensureSupabaseClient, getSupabaseServiceRole, sb, randomUUID;
-  try {
-    ({ ensureSupabaseClient, getSupabaseServiceRole } = await import("../lib/supabase.mjs"));
-    ({ randomUUID } = await import("node:crypto"));
-    sb = getSupabaseServiceRole(); ensureSupabaseClient(sb, "service");
-  } catch (e) {
-    return res.status(500).json({ ok:false, error:"supabase_module_load_failed", details:String(e).slice(0,200) });
-  }
-
-  const d = new Date();
-  const yyyy = d.getUTCFullYear(), mm = String(d.getUTCMonth()+1).padStart(2,"0"), dd = String(d.getUTCDate()).padStart(2,"0");
-  const ext = ctype.includes("png") ? "png" : ctype.includes("webp") ? "webp" : "jpg";
-  const uploadType = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
-  const fileKey = `${STYLE_VERSION}${fast ? "-fast" : ""}-s${seed}-${W}x${H}-${randomUUID()}.${ext}`;
-  const path = `previews/${yyyy}-${mm}-${dd}/${fileKey}`;
-
-  // tentative upload ; si collision (rare), on réessaie avec un autre UUID
-  let up = await sb.storage.from(BUCKET).upload(path, bytes, {
-    contentType: uploadType, upsert: false, cacheControl: CACHE_CONTROL
-  });
-  if (up.error && String(up.error.message || up.error).includes("already exists")) {
-    const altPath = `previews/${yyyy}-${mm}-${dd}/${STYLE_VERSION}${fast ? "-fast" : ""}-s${seed}-${W}x${H}-${randomUUID()}.${ext}`;
-    up = await sb.storage.from(BUCKET).upload(altPath, bytes, { contentType: uploadType, upsert: false, cacheControl: CACHE_CONTROL });
-    if (up.error) return res.status(500).json({ ok:false, error:"upload_failed", details:String(up.error).slice(0,200) });
-  } else if (up.error) {
-    return res.status(500).json({ ok:false, error:"upload_failed", details:String(up.error).slice(0,200) });
-  }
-
-  // 3) URL Supabase
-  let imageUrl;
-  const finalPath = up?.data?.path || path;
-  if (OUTPUT_PUBLIC) imageUrl = sb.storage.from(BUCKET).getPublicUrl(finalPath).data.publicUrl;
-  else {
-    const s = await sb.storage.from(BUCKET).createSignedUrl(finalPath, SIGNED_TTL_S);
-    if (s.error) return res.status(500).json({ ok:false, error:"signed_url_failed", details:String(s.error).slice(0,200) });
-    imageUrl = s.data.signedUrl;
-  }
-
-  // 4) (option) comparaison SHA-256 provider vs Supabase
-  let debug;
-  if (toBool(body?.debug_compare)) {
-    try {
-      const crypto = await import("node:crypto");
-      const provider_sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
-      const noCacheUrl = imageUrl + (imageUrl.includes("?") ? "&" : "?") + "nocache=" + Date.now();
-      const r = await fetch(noCacheUrl);
-      const supaBuf = Buffer.from(await r.arrayBuffer());
-      const supabase_sha256 = crypto.createHash("sha256").update(supaBuf).digest("hex");
-      debug = {
-        compare: provider_sha256 === supabase_sha256 ? "IDENTICAL" : "DIFFERENT",
-        provider_sha256, provider_bytes: bytes.length,
-        supabase_sha256, supabase_bytes: supaBuf.length,
-        supabase_content_type: r.headers.get("content-type") || "",
-        storage_path: finalPath,
-        url_checked: noCacheUrl
-      };
-    } catch (e) {
-      debug = { compare: "ERROR", error: String(e).slice(0,200) };
-    }
-  }
-
-  res.setHeader("content-type","application/json");
-  return res.status(200).json({
-    ok:true, mode:"normal",
-    image_url: imageUrl,
-    seed, width: W, height: H, fast: !!fast,
-    ...(debug ? { debug } : {})
-  });
 }
