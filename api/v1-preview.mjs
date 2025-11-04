@@ -63,9 +63,15 @@ const HAIR_COLOR = ["black","brown","blonde","red","gray"];
 const HAIR_LEN   = ["short","medium","long","bald"];
 const EYE        = ["brown","blue","green","hazel","gray"];
 
+// Nouveaux attributs supportés (safe wording)
+const BODY_TYPE  = ["slim","athletic","curvy","average"];
+const BUST_SIZE  = ["small","medium","large"];
+const BUTT_SIZE  = ["small","medium","large"]; // => "hips" dans le prompt
+const MOOD       = ["neutral","friendly","confident","cool","serious","approachable"];
+
 const SIZE_HQ   = { "1:1": [896, 896], "3:4": [896, 1152] };
 const SIZE_FAST = { "1:1": [576, 576], "3:4": [576, 768] };
-const STYLE_VERSION = "commercial_photo_v3"; // ▲ nouvelle version
+const STYLE_VERSION = "commercial_photo_v4"; // ▲ stable + morpho/mood
 
 const hash = (s) => { let h = 2166136261>>>0; for (let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=(h+(h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24))>>>0 } return h>>>0; };
 
@@ -83,8 +89,19 @@ function normalizeForm(raw) {
   let hairColor    = clamp(form.hair_color ?? form.hairColor ?? form.hair, HAIR_COLOR, 1);
   if (hairLength === "bald") hairColor = "none";
 
-  const styleKey   = `${background}|${outfitKey}|${skin}|${hairLength}|${hairColor}|${eyeColor}`;
-  return { gender, background, outfitKey, ratio, skin, hairColor, hairLength, eyeColor, styleKey };
+  // Nouveaux champs (camelCase & snake_case)
+  const bodyType   = clamp((form.body_type ?? form.bodyType), BODY_TYPE, 3); // default average
+  const bustSize   = clamp((form.bust_size ?? form.bustSize), BUST_SIZE, 1); // default medium
+  const buttSize   = clamp((form.butt_size ?? form.buttSize), BUTT_SIZE, 1);
+  const mood       = clamp((form.mood ?? form.expression ?? form.vibe), MOOD, 2); // default confident
+
+  // Activer hips dans le prompt si waist-up / three-quarter explicit
+  const framingStr = String(form.framing || "").toLowerCase();
+  const includeHips = toBool(form.waist_up) || /waist|three|3\/4/.test(framingStr);
+
+  const styleKey   = `${background}|${outfitKey}|${skin}|${hairLength}|${hairColor}|${eyeColor}|${bodyType}|${bustSize}|${mood}|${includeHips ? "hips" : "-"}`;
+  return { gender, background, outfitKey, ratio, skin, hairColor, hairLength, eyeColor,
+           bodyType, bustSize, buttSize, mood, includeHips, styleKey };
 }
 
 function deriveSeed(userSeed, n, extra = "") {
@@ -96,39 +113,67 @@ function deriveSeed(userSeed, n, extra = "") {
 }
 
 /* ------------------------ Prompt builder ------------------------ */
-/** Prompt stable et directif (headshot pro) */
+/** Prompt stable, directif (headshot/waist-up, 85mm, soft light) */
 function buildPrompt(n) {
   const BG_MAP = {
-    studio: "plain neutral studio background",
+    studio: "white seamless studio background",
     office: "modern office background",
     city:   "subtle city background",
     nature: "soft outdoor background"
   };
-  const OUTFIT_W = { blazer:"tailored blazer", shirt:"fitted blouse", tee:"crew-neck tee", athleisure:"athleisure top" };
-  const OUTFIT_M = { blazer:"tailored blazer", shirt:"fitted shirt",  tee:"crew-neck tee", athleisure:"athletic performance tee" };
+  const OUTFIT_W = { blazer:"tailored blazer", shirt:"fitted blouse", tee:"crew-neck tee", athleisure:"athleisure sports top" };
+  const OUTFIT_M = { blazer:"tailored blazer", shirt:"fitted shirt",  tee:"crew-neck tee", athleisure:"athletic performance top" };
   const SKIN_MAP = { light:"light skin tone", fair:"fair skin tone", medium:"medium skin tone", tan:"tan skin tone", deep:"deep skin tone" };
   const EYE_MAP  = { brown:"brown eyes", blue:"blue eyes", green:"green eyes", hazel:"hazel eyes", gray:"gray eyes" };
 
   const subject   = n.gender === "woman" ? "confident professional woman" : "confident professional man";
   const outfit    = (n.gender === "woman" ? OUTFIT_W : OUTFIT_M)[n.outfitKey];
-  const hairPhrase= n.hairLength === "bald" ? "clean-shaven head" : `${n.hairLength} ${n.hairColor} hair`;
-  const grooming  = n.gender === "woman" ? "refined natural makeup" : "well-groomed facial features";
+  const hairDesc  = n.hairLength === "bald" ? "clean-shaven head" : `${n.hairLength} ${n.hairColor} hair`;
+  const skinDesc  = SKIN_MAP[n.skin];
+  const eyeDesc   = EYE_MAP[n.eyeColor];
+  const bgDesc    = BG_MAP[n.background];
 
-  // Grammaire resserrée (pas d’aléatoire de framing/optique/lumière)
+  // Morphologie (safe wording)
+  const bodyMap = { slim:"slim build", athletic:"athletic build", curvy:"curvy build", average:"average build" };
+  const chestMapW = { small:"subtle chest profile", medium:"balanced chest profile", large:"fuller chest profile" };
+  const chestMapM = { small:"slim chest",           medium:"balanced chest",        large:"broad chest" };
+  const hipsMap   = { small:"narrow hips", medium:"balanced hips", large:"fuller hips" };
+
+  const chestDesc = (n.gender === "woman" ? chestMapW : chestMapM)[n.bustSize] || (n.gender === "woman" ? "balanced chest profile" : "balanced chest");
+  const hipsDesc  = hipsMap[n.buttSize] || "balanced hips";
+
+  // Humeur/expression
+  const moodMap = {
+    neutral: "neutral expression",
+    friendly: "gentle friendly expression",
+    confident: "confident look",
+    cool: "calm composed look",
+    serious: "serious expression",
+    approachable: "approachable slight smile"
+  };
+  const moodDesc = moodMap[n.mood] || "confident look";
+
+  // Framing selon includeHips
+  const framing = n.includeHips ? "waist-up portrait, eye-level" : "eye-level headshot from chest up";
+
   const parts = [
-    `high quality professional headshot of a ${subject}`,
-    BG_MAP[n.background],
+    `high quality professional ${n.includeHips ? "portrait" : "headshot"} of a ${subject}`,
+    bgDesc,
     outfit,
-    hairPhrase,
-    SKIN_MAP[n.skin],
-    EYE_MAP[n.eyeColor],
-    "eye-level shot, from chest up",
-    "neutral soft lighting, minimal shadows",
+    hairDesc,
+    skinDesc,
+    eyeDesc,
+    bodyMap[n.bodyType] || "balanced build",
+    chestDesc,
+    n.includeHips ? hipsDesc : null,
+    moodDesc,
+    framing,
+    "neutral soft beauty lighting, minimal shadows",
     "85mm lens look, shallow depth of field",
-    "photorealistic portrait, clean composition, realistic proportions, natural skin texture"
+    "photorealistic portrait, clean composition, realistic proportions, natural skin texture",
+    n.gender === "woman" ? "refined natural makeup" : "well-groomed appearance"
   ];
 
-  // Évite les prompts trop longs
   return parts.filter(Boolean).join(", ");
 }
 
@@ -200,6 +245,7 @@ async function toJPEG(bytes) {
     const sharp = (sharpMod.default || sharpMod);
     return await sharp(Buffer.from(bytes)).jpeg({ quality: 92 }).toBuffer();
   } catch {
+    // Fallback si sharp indisponible (ex. build minimal)
     return Buffer.from(bytes);
   }
 }
@@ -214,7 +260,7 @@ export default async function handler(req, res) {
     const hasSrv = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY);
     return res.status(200).json({
       ok:true,
-      endpoint:"/api/v1-preview", // ▲ cohérent avec la route
+      endpoint:"/api/v1-preview",
       has_supabase_url:hasUrl, has_service_role:hasSrv,
       bucket:BUCKET, output_public:OUTPUT_PUBLIC, poll_token:Boolean(POL_TOKEN),
       style_version: STYLE_VERSION
