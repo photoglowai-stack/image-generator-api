@@ -1,15 +1,17 @@
 // /api/v1-preview.mjs — V9 Preview-by-default (no storage unless save:true)
-// - Preview par défaut: PAS d'upload. Renvoie provider_url (ultra rapide)
-// - proxy:true => renvoie le binaire (image/*) sans Supabase
-// - save:true  => télécharge -> upload Supabase -> renvoie image_url
-// - GET-only côté provider (plus stable), timeouts & backoff
-// - Flags: strict, safe, proxy, save, debug_compare (uniquement en save:true)
+// - Preview: JSON provider_url (aucun upload)
+// - proxy:true: renvoie le binaire image/jpeg (Figma-friendly), transcode si besoin
+// - save:true: télécharge -> upload Supabase -> renvoie image_url (outputs/YYYY-MM-DD/...jpg)
+// - Flags: strict, safe, proxy, save, debug_compare (uniquement avec save:true)
 
 export const config = { runtime: "nodejs", maxDuration: 25 };
 
 /* ----------------------------- CORS ----------------------------- */
 function setCORS(req, res) {
-  res.setHeader("access-control-allow-origin", "*");
+  const origin = req.headers.origin;
+  const allow = (!origin || origin === "null") ? "null" : origin;
+  res.setHeader("access-control-allow-origin", allow);
+  res.setHeader("vary", "origin");
   res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
   res.setHeader("access-control-allow-headers", "content-type, authorization, idempotency-key");
   res.setHeader("access-control-max-age", "86400");
@@ -171,6 +173,18 @@ async function fetchPollinationsBinary({ prompt, width, height, seed, safe }) {
   throw lastErr || new Error("pollinations_failed");
 }
 
+/* --------------------- Transcodage → JPEG ----------------------- */
+async function toJPEG(bytes) {
+  try {
+    const sharpMod = await import('sharp');
+    const sharp = (sharpMod.default || sharpMod);
+    return await sharp(Buffer.from(bytes)).jpeg({ quality: 92 }).toBuffer();
+  } catch {
+    // Fallback: bytes bruts si sharp indisponible (déconseillé pour Figma si WEBP)
+    return Buffer.from(bytes);
+  }
+}
+
 /* ------------------------------ API ----------------------------- */
 export default async function handler(req, res) {
   setCORS(req, res);
@@ -197,38 +211,53 @@ export default async function handler(req, res) {
   if (!body || typeof body !== "object") body = {};
 
   const strict = toBool(body?.strict);
-  const proxy  = toBool(body?.proxy);   // si true => binaire
-  const save   = toBool(body?.save);    // si true => upload Supabase (finalisation)
+  const proxy  = toBool(body?.proxy);   // binaire
+  const save   = toBool(body?.save);    // upload Supabase
 
   // Normalisation & prompt
   const n = normalizeForm(body);
-  const fast = toBool(body?.fast ?? !strict);
-  const [W,H] = (fast ? SIZE_FAST : SIZE_HQ)[n.ratio] || (fast ? [576,576] : [896,896]);
+  const fastDefault = !strict; // strict => on respecte width/height fournis
+  const fast = toBool(body?.fast ?? fastDefault);
+
+  // Dimensions
+  let [W,H] = (fast ? SIZE_FAST : SIZE_HQ)[n.ratio] || (fast ? [576,576] : [896,896]);
+  if (strict) {
+    const bw = Number(body.width), bh = Number(body.height);
+    if (Number.isFinite(bw) && Number.isFinite(bh) && bw >= 64 && bh >= 64) {
+      W = Math.floor(bw); H = Math.floor(bh);
+    }
+  }
+
+  // Prompt & seed
   const prompt = strict && ok(body.prompt) ? String(body.prompt) : (ok(body?.prompt) ? String(body.prompt) : buildPrompt(n));
-  const seed   = deriveSeed(body?.seed, n, `${n.framing}|${n.lighting}|${n.lens}`);
+  const seed   = strict && Number.isFinite(Number(body?.seed))
+    ? Math.floor(Number(body.seed))
+    : deriveSeed(body?.seed, n, `${n.framing}|${n.lighting}|${n.lens}`);
   const safe   = toBool(body?.safe ?? true) ? "true" : "false";
 
-  // ---- PREVIEW PAR DÉFAUT : pas d'upload ----
+  /* --------------------- PREVIEW (JSON) ---------------------- */
   if (!save && !proxy) {
     const provider_url = buildProviderURL({ prompt, width: W, height: H, seed, safe });
     res.setHeader("content-type","application/json");
     return res.status(200).json({ ok:true, mode:"preview", provider_url, width:W, height:H, fast:!!fast });
   }
 
-  // ---- PROXY BINAIRE : pas d'upload ----
+  /* --------------------- PROXY (BINAIRE) --------------------- */
   if (!save && proxy) {
     try {
       const { bytes, ctype } = await fetchPollinationsBinary({ prompt, width: W, height: H, seed, safe });
-      res.setHeader("content-type", ctype);
+      const out = ctype.includes("jpeg") ? bytes : await toJPEG(bytes);
+      res.setHeader("content-type", "image/jpeg");
       res.setHeader("cache-control", "no-store");
-      return res.status(200).send(bytes);
+      res.setHeader("content-disposition", 'inline; filename="preview.jpg"');
+      return res.status(200).send(out);
     } catch (e) {
       res.setHeader("content-type","application/json");
       return res.status(502).json({ ok:false, mode:"proxy", error:"pollinations_failed", details:String(e).slice(0,200) });
     }
   }
 
-  // ---- SAVE (finalisation) : download -> upload Supabase -> URL ----
+  /* ----------------------- SAVE (UPLOAD) --------------------- */
   let bin;
   try {
     bin = await fetchPollinationsBinary({ prompt, width: W, height: H, seed, safe });
@@ -237,6 +266,7 @@ export default async function handler(req, res) {
     return res.status(502).json({ ok:false, error:"pollinations_failed", details:String(e).slice(0,200) });
   }
   const { bytes, ctype } = bin;
+  const jpegBytes = ctype.includes("jpeg") ? bytes : await toJPEG(bytes);
 
   // Supabase upload
   let ensureSupabaseClient, getSupabaseServiceRole, sb, randomUUID;
@@ -250,20 +280,20 @@ export default async function handler(req, res) {
 
   const d = new Date();
   const yyyy = d.getUTCFullYear(), mm = String(d.getUTCMonth()+1).padStart(2,"0"), dd = String(d.getUTCDate()).padStart(2,"0");
-  const ext = ctype.includes("png") ? "png" : ctype.includes("webp") ? "webp" : "jpg";
-  const uploadType = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
-  const fileKey = `${STYLE_VERSION}${fast ? "-fast" : ""}-s${seed}-${W}x${H}-${randomUUID()}.${ext}`;
-  const path = `previews/${yyyy}-${mm}-${dd}/${fileKey}`;
+  const uploadType = "image/jpeg";
+  const fileKey = `${STYLE_VERSION}${fast ? "-fast" : ""}-s${seed}-${W}x${H}-${(randomUUID?.() || Math.random().toString(36).slice(2))}.jpg`;
+  const path = `outputs/${yyyy}-${mm}-${dd}/${fileKey}`;
 
-  const up = await sb.storage.from(BUCKET).upload(path, bytes, {
+  const up = await sb.storage.from(BUCKET).upload(path, jpegBytes, {
     contentType: uploadType, upsert: false, cacheControl: CACHE_CONTROL
   });
   if (up.error) return res.status(500).json({ ok:false, error:"upload_failed", details:String(up.error).slice(0,200) });
 
   let imageUrl;
   const finalPath = up?.data?.path || path;
-  if (OUTPUT_PUBLIC) imageUrl = sb.storage.from(BUCKET).getPublicUrl(finalPath).data.publicUrl;
-  else {
+  if (OUTPUT_PUBLIC) {
+    imageUrl = sb.storage.from(BUCKET).getPublicUrl(finalPath).data.publicUrl;
+  } else {
     const s = await sb.storage.from(BUCKET).createSignedUrl(finalPath, SIGNED_TTL_S);
     if (s.error) return res.status(500).json({ ok:false, error:"signed_url_failed", details:String(s.error).slice(0,200) });
     imageUrl = s.data.signedUrl;
@@ -274,14 +304,14 @@ export default async function handler(req, res) {
   if (toBool(body?.debug_compare)) {
     try {
       const crypto = await import("node:crypto");
-      const provider_sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+      const provider_sha256 = crypto.createHash("sha256").update(jpegBytes).digest("hex");
       const noCacheUrl = imageUrl + (imageUrl.includes("?") ? "&" : "?") + "nocache=" + Date.now();
       const r = await fetch(noCacheUrl);
       const supaBuf = Buffer.from(await r.arrayBuffer());
       const supabase_sha256 = crypto.createHash("sha256").update(supaBuf).digest("hex");
       debug = {
         compare: provider_sha256 === supabase_sha256 ? "IDENTICAL" : "DIFFERENT",
-        provider_sha256, provider_bytes: bytes.length,
+        provider_sha256, provider_bytes: jpegBytes.length,
         supabase_sha256, supabase_bytes: supaBuf.length,
         supabase_content_type: r.headers.get("content-type") || "",
         storage_path: finalPath, url_checked: noCacheUrl
