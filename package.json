@@ -8,5 +8,9 @@
     "@supabase/supabase-js": "^2.44.2",
     "replicate": "^0.31.0"
   },
-  "scripts": {}
+  "scripts": {
+    "smoke:preview": "curl -sS -X POST $API -H 'Content-Type: application/json' -d '{\"gender\":\"woman\",\"background\":\"studio\",\"ratio\":\"1:1\",\"fast\":true}' | jq",
+    "smoke:proxy": "curl -fL -X POST $API -H 'Content-Type: application/json' -d '{\"gender\":\"woman\",\"background\":\"studio\",\"ratio\":\"1:1\",\"fast\":true,\"proxy\":true}' -o preview.jpg && file preview.jpg",
+    "smoke:save": "curl -sS -X POST $API -H 'Content-Type: application/json' -d '{\"gender\":\"woman\",\"background\":\"studio\",\"ratio\":\"3:4\",\"fast\":false,\"save\":true,\"safe\":false}' | jq"
+  }
 }

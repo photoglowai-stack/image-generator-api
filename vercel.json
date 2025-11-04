@@ -10,7 +10,7 @@
   "routes": [
     { "src": "^/v1/jobs$", "dest": "/api/v1-jobs.mjs" },
     { "src": "^/v1/jobs/(.*)$", "dest": "/api/v1-jobs.mjs" },
-    { "src": "^/v1/preview$", "dest": "/api/v1-preview.mjs" },
+    { "src": "^/v1/preview$", "dest": "/api/v1-preview" },
     { "src": "^/v1/ideas/generate$", "dest": "/api/v1/ideas/generate.mjs" },
     { "src": "^/api/generate-gen4-image$", "dest": "/api/generate-gen4-image.mjs" },
     { "src": "^/api/storage-signed-upload$", "dest": "/api/storage-signed-upload.js" },

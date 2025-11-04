@@ -4,6 +4,25 @@
 // - save:true: télécharge -> upload Supabase -> renvoie image_url (outputs/YYYY-MM-DD/...jpg)
 // - Flags: strict, safe, proxy, save, debug_compare (uniquement avec save:true)
 
+const RATE_WINDOW_MS = 10_000; // 10s
+const RATE_MAX = 10;           // 10 req / 10s / IP
+const _seen = new Map();
+
+function rateLimit(req) {
+  const ip = String((req.headers["x-forwarded-for"] || "").split(",")[0] || "anon").trim();
+  const now = Date.now();
+  const arr = (_seen.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
+  arr.push(now);
+  _seen.set(ip, arr);
+  if (arr.length > RATE_MAX) {
+    const err = new Error("rate_limited");
+    err.status = 429;
+    throw err;
+  }
+}
+function idemKey(req) { return String(req.headers["idempotency-key"] || ""); }
+globalThis.__idemCache ||= new Map();
+
 export const config = { runtime: "nodejs", maxDuration: 25 };
 
 /* ----------------------------- CORS ----------------------------- */
@@ -210,9 +229,28 @@ export default async function handler(req, res) {
   if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
   if (!body || typeof body !== "object") body = {};
 
+  const reqId = (await import("node:crypto")).randomUUID();
+  try {
+    rateLimit(req);
+  } catch (e) {
+    res.setHeader("content-type", "application/json");
+    console.log(JSON.stringify({ level:"warn", reqId, event:"rate_limited" }));
+    return res.status(e.status || 429).json({ ok:false, error:"rate_limited" });
+  }
+  const idem = idemKey(req);
+
   const strict = toBool(body?.strict);
   const proxy  = toBool(body?.proxy);   // binaire
   const save   = toBool(body?.save);    // upload Supabase
+
+  console.log(JSON.stringify({ level:"info", reqId, event:"preview_start", flags:{ strict, proxy, save } }));
+
+  if (idem && globalThis.__idemCache.has(idem)) {
+    const cached = globalThis.__idemCache.get(idem);
+    res.setHeader("content-type","application/json");
+    console.log(JSON.stringify({ level:"info", reqId, event:"idem_hit" }));
+    return res.status(200).json(cached);
+  }
 
   // Normalisation & prompt
   const n = normalizeForm(body);
@@ -322,5 +360,8 @@ export default async function handler(req, res) {
   }
 
   res.setHeader("content-type","application/json");
-  return res.status(200).json({ ok:true, mode:"save", image_url:imageUrl, width:W, height:H, fast:!!fast, ...(debug?{debug}:{}) });
+  const payload = { ok:true, mode:"save", image_url:imageUrl, width:W, height:H, fast:!!fast, ...(debug?{debug}:{}) };
+  if (idem) globalThis.__idemCache.set(idem, payload);
+  console.log(JSON.stringify({ level:"info", reqId, event:"save_done", path: finalPath }));
+  return res.status(200).json(payload);
 }
