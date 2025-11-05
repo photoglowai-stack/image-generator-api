@@ -1,5 +1,5 @@
 // /api/v1-preview.mjs — Preview-by-default (no storage unless save:true)
-// Résumé modes:
+// Modes:
 // - Preview (défaut): JSON { provider_url } — rapide (front)
 // - proxy:true       : image/jpeg binaire — pour Figma
 // - save:true        : download -> upload Supabase -> JSON { image_url }
@@ -68,9 +68,10 @@ const BUST_SIZE=["small","medium","large"];
 const BUTT_SIZE=["small","medium","large"];
 const MOOD=["neutral","friendly","confident","cool","serious","approachable"];
 
+const STYLE_VERSION = "instagram_virtual_model_v1";
+
 const SIZE_HQ   = { "1:1":[896,896], "3:4":[896,1152] };
 const SIZE_FAST = { "1:1":[576,576], "3:4":[576,768] };
-const STYLE_VERSION = "commercial_photo_v4";
 
 const hash = s => { let h=2166136261>>>0; for (let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=(h+(h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24))>>>0 } return h>>>0; };
 const round64 = n => Math.max(64, Math.round(n/64)*64);
@@ -82,7 +83,7 @@ function normalizeForm(raw) {
   const gender = clamp(f.gender ?? f.sex, ["woman","man"], 1);
   const background = clamp(f.background ?? f.bg ?? f.scene, BG, 0);
   const outfitKey  = clamp(f.outfit ?? f.outfitKey ?? f.style, OUTFIT, 2);
-  const ratio      = clamp(f.aspect_ratio ?? f.aspectRatio ?? f.ratio, RATIO, 1);
+  const ratio      = clamp(f.aspect_ratio ?? f.aspectRatio ?? f.ratio, RATIO, 0);
   const skin       = clamp(f.skin_tone ?? f.skinTone ?? f.skin, SKIN, 2);
   const hairLength = clamp(f.hair_length ?? f.hairLength ?? f.hairLen, HAIR_LEN, 0);
   const eyeColor   = clamp(f.eye_color ?? f.eyeColor ?? f.eyes, EYE, 0);
@@ -104,37 +105,44 @@ function normalizeForm(raw) {
 function deriveSeed(userSeed, n, extra=""){ if(Number.isFinite(Number(userSeed))) return Math.floor(Number(userSeed)); const base=hash(`${STYLE_VERSION}|${n.styleKey}|${n.ratio}|${extra}`); return ((base + (n.gender==="woman"?0:7919))>>>0) || DEFAULT_SEED; }
 
 /* ------------------------ Prompt builder ------------------------ */
+//  Template: "photorealistic instagram-virtual-model portrait, {gender}, adult (25–35), {skin_tone} skin, {body_type} build,
+//  {hair_length} {hair_color} hair, {eye_color} eyes, wearing {outfit_text}, {mood_text}, looking at camera, {background_text},
+//  soft beauty lighting, studio-quality retouching, 85mm portrait look, shallow depth of field, clean framing, high detail,
+//  natural skin texture, no celebrity likeness, fully clothed, modest neckline"
 function buildPrompt(n){
-  const BG_MAP={studio:"white seamless studio background", office:"modern office background", city:"subtle city background", nature:"soft outdoor background"};
-  const OUTFIT_W={blazer:"tailored blazer", shirt:"fitted blouse", tee:"crew-neck tee", athleisure:"athleisure sports top"};
-  const OUTFIT_M={blazer:"tailored blazer", shirt:"fitted shirt",  tee:"crew-neck tee", athleisure:"athletic performance top"};
-  const SKIN_MAP={light:"light skin tone", fair:"fair skin tone", medium:"medium skin tone", tan:"tan skin tone", deep:"deep skin tone"};
-  const EYE_MAP ={brown:"brown eyes", blue:"blue eyes", green:"green eyes", hazel:"hazel eyes", gray:"gray eyes"};
+  const BG_MAP={studio:"white studio background", office:"modern office background", city:"subtle city background", nature:"soft outdoor background"};
+  const OUTFIT_W={ blazer:"tailored blazer", shirt:"fitted blouse", tee:"fitted tee", athleisure:"sleeveless fitted tank top with modest neckline" };
+  const OUTFIT_M={ blazer:"tailored blazer", shirt:"fitted shirt",  tee:"fitted v-neck top with modest neckline", athleisure:"sleeveless athletic tank with modest neckline" };
+  const SKIN_MAP={light:"light", fair:"fair", medium:"medium", tan:"tan", deep:"deep"};
+  const EYE_MAP ={brown:"brown", blue:"blue", green:"green", hazel:"hazel", gray:"gray"};
 
-  const subject = n.gender==="woman" ? "confident professional woman" : "confident professional man";
+  const subject = n.gender==="woman" ? "woman" : "man";
   const outfit  = (n.gender==="woman"?OUTFIT_W:OUTFIT_M)[n.outfitKey];
   const hair    = n.hairLength==="bald" ? "clean-shaven head" : `${n.hairLength} ${n.hairColor} hair`;
-  const bodyMap = { slim:"slim build", athletic:"athletic build", curvy:"curvy build", average:"average build" };
-  const chestW = { small:"subtle chest profile", medium:"balanced chest profile", large:"fuller chest profile" };
-  const chestM = { small:"slim chest", medium:"balanced chest", large:"broad chest" };
-  const hips   = { small:"narrow hips", medium:"balanced hips", large:"fuller hips" };
-  const chest  = (n.gender==="woman" ? chestW : chestM)[n.bustSize] || (n.gender==="woman" ? "balanced chest profile" : "balanced chest");
-  const hipsD  = hips[n.buttSize] || "balanced hips";
-  const moodMap={neutral:"neutral expression",friendly:"gentle friendly expression",confident:"confident look",cool:"calm composed look",serious:"serious expression",approachable:"approachable slight smile"};
-  const mood   = moodMap[n.mood] || "confident look";
-  const framing= n.includeHips ? "waist-up portrait" : "headshot from shoulders up";
+  const bodyMap = { slim:"slim", athletic:"athletic", curvy:"curvy", average:"average" };
+  const chestW  = { small:"subtle chest profile",    medium:"balanced chest profile",  large:"fuller chest profile" };
+  const chestM  = { small:"slim chest",              medium:"balanced chest",          large:"broad chest" };
+  const hips    = { small:"narrow hips", medium:"balanced hips", large:"fuller hips" };
 
-  let prompt = [
-    `editorial portrait of a ${subject}, adult (25+), fully clothed`,
-    BG_MAP[n.background], outfit, hair, SKIN_MAP[n.skin], EYE_MAP[n.eyeColor],
-    bodyMap[n.bodyType] || "balanced build", chest, n.includeHips ? hipsD : null,
-    mood, "soft neutral lighting", "85mm look, shallow depth of field",
-    framing, "photorealistic, clean composition, natural skin texture"
-  ].filter(Boolean).join(", ");
+  const chest   = (n.gender==="woman" ? chestW : chestM)[n.bustSize] || (n.gender==="woman" ? "balanced chest profile" : "balanced chest");
+  const hipsD   = hips[n.buttSize] || "balanced hips";
+  const moodMap = { neutral:"neutral expression", friendly:"friendly expression", confident:"confident look", cool:"calm composed look", serious:"serious expression", approachable:"approachable slight smile" };
+  const mood    = moodMap[n.mood] || "confident look";
+  const framing = n.includeHips ? "waist-up" : "shoulders-up";
 
-  if (prompt.length > 220) prompt = prompt.replace(", photorealistic, clean composition, natural skin texture", "");
-  if (prompt.length > 220) prompt = prompt.replace(", 85mm look, shallow depth of field", "");
-  return prompt;
+  const parts = [
+    `photorealistic instagram-virtual-model portrait, ${subject}, adult (25–35)`,
+    `${SKIN_MAP[n.skin]} skin, ${bodyMap[n.bodyType]} build`,
+    `${hair}, ${EYE_MAP[n.eyeColor]} eyes`,
+    `wearing ${outfit}`,
+    chest, n.includeHips ? hipsD : null,
+    `${mood}, looking at camera`,
+    BG_MAP[n.background],
+    "soft beauty lighting, studio-quality retouching, 85mm portrait look, shallow depth of field",
+    `${framing}, clean framing, high detail, natural skin texture`,
+    "no celebrity likeness, fully clothed, modest neckline"
+  ];
+  return parts.filter(Boolean).join(", ");
 }
 
 /* --------------------- Pollinations (HTTP) ---------------------- */
@@ -146,7 +154,8 @@ async function fetchWithTimeout(url, init={}, timeoutMs=POL_TIMEOUT_MS){
   const ac=new AbortController(); const t=setTimeout(()=>ac.abort("timeout"), timeoutMs);
   try { return await fetch(url, { ...init, signal: ac.signal }); } finally { clearTimeout(t); }
 }
-// signatures binaires (pour accepter petits JPEG)
+
+// Détection binaire tolérante (petits JPEG ok)
 const isJPEG = b => b.length>3 && b[0]===0xFF && b[1]===0xD8 && b[2]===0xFF;
 const isPNG  = b => b.length>8 && b[0]===0x89 && b[1]===0x50 && b[2]===0x4E && b[3]===0x47 && b[4]===0x0D && b[5]===0x0A && b[6]===0x1A && b[7]===0x0A;
 const isWEBP = b => b.length>12 && b.slice(0,4).toString()==="RIFF" && b.slice(8,12).toString()==="WEBP";
@@ -169,7 +178,7 @@ async function readImageResponse(res){
     const preview = bytes.toString("utf8", 0, Math.min(bytes.length, 160));
     throw new Error(`pollinations_unexpected_${ctype}_len${bytes.length}_${preview}`);
   }
-  // ⚠️ tolère les petites previews (ex. 8–12 KB)
+  // Autorise les très petites previews (ex. 8–12 KB)
   if (bytes.length < MIN_IMAGE_BYTES && bytes.length < 1024) {
     const preview = bytes.toString("utf8", 0, Math.min(bytes.length, 160));
     throw new Error(`pollinations_unexpected_small_${ctype}_len${bytes.length}_${preview}`);
@@ -202,9 +211,13 @@ async function fetchPollinationsBinary({ prompt, width, height, seed, safe }){
 }
 
 async function toJPEG(bytes){
-  try { const sharpMod = await import("sharp"); const sharp = (sharpMod.default || sharpMod);
-        return await sharp(Buffer.from(bytes)).jpeg({ quality: 92 }).toBuffer(); }
-  catch { return Buffer.from(bytes); }
+  try {
+    const sharpMod = await import("sharp");
+    const sharp = (sharpMod.default || sharpMod);
+    return await sharp(Buffer.from(bytes)).jpeg({ quality: 92 }).toBuffer();
+  } catch {
+    return Buffer.from(bytes);
+  }
 }
 
 /* ------------------------------ API ----------------------------- */
@@ -228,11 +241,15 @@ export default async function handler(req, res){
     return res.status(405).json({ ok:false, error:"method_not_allowed" });
   }
 
+  // Parse body
   let body = req.body;
   if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
   if (!body || typeof body !== "object") body = {};
 
-  try { rateLimit(req); } catch (e) { res.setHeader("content-type","application/json"); return res.status(e.status||429).json({ ok:false, error:"rate_limited" }); }
+  try { rateLimit(req); } catch (e) {
+    res.setHeader("content-type","application/json");
+    return res.status(e.status||429).json({ ok:false, error:"rate_limited" });
+  }
 
   const idem = idemKey(req);
   const strict = toBool(body?.strict);
@@ -249,18 +266,21 @@ export default async function handler(req, res){
   const n = normalizeForm(body);
   const fastDefault = !strict;
   const fast = toBool(body?.fast ?? fastDefault);
+
   let [W,H] = (fast ? SIZE_FAST : SIZE_HQ)[n.ratio] || (fast ? [576,576] : [896,896]);
-  const pxDims = dimsFromPx(body?.px, n.ratio); if (pxDims && !save) { [W,H] = pxDims; }
+  const pxDims = dimsFromPx(body?.px, n.ratio);
+  if (pxDims && !save) { [W,H] = pxDims; } // preview/proxy controllés par px
+
   if (strict) {
     const bw = Number(body.width), bh = Number(body.height);
     if (Number.isFinite(bw) && Number.isFinite(bh) && bw>=64 && bh>=64) { W=Math.floor(bw); H=Math.floor(bh); }
   }
 
   const prompt = strict && ok(body.prompt) ? String(body.prompt) : (ok(body?.prompt) ? String(body.prompt) : buildPrompt(n));
-  const seed   = strict && Number.isFinite(Number(body?.seed)) ? Math.floor(Number(body.seed)) : deriveSeed(body?.seed, n, "editorial|soft|85mm");
+  const seed   = strict && Number.isFinite(Number(body?.seed)) ? Math.floor(Number(body.seed)) : deriveSeed(body?.seed, n, "igvm|soft|85mm");
   const safe   = toBool(body?.safe ?? true) ? "true" : "false";
 
-  // Preview JSON
+  // Preview JSON (front)
   if (!save && !proxy) {
     const provider_url = buildProviderURL({ prompt, width: W, height: H, seed, safe });
     res.setHeader("content-type","application/json");
@@ -283,7 +303,7 @@ export default async function handler(req, res){
     }
   }
 
-  // SAVE (upload Supabase)
+  // SAVE (upload Supabase) — optionnel
   let bin;
   try { bin = await fetchPollinationsBinary({ prompt, width: W, height: H, seed, safe }); }
   catch (e) { res.setHeader("content-type","application/json"); return res.status(502).json({ ok:false, error:"pollinations_failed", details:String(e).slice(0,200) }); }
@@ -317,22 +337,8 @@ export default async function handler(req, res){
     imageUrl = s.data.signedUrl;
   }
 
-  // Debug optionnel
-  let debug;
-  if (toBool(body?.debug_compare)) {
-    try {
-      const crypto = await import("node:crypto");
-      const provider_sha256 = crypto.createHash("sha256").update(jpegBytes).digest("hex");
-      const noCacheUrl = imageUrl + (imageUrl.includes("?") ? "&" : "?") + "nocache=" + Date.now();
-      const r = await fetch(noCacheUrl);
-      const supaBuf = Buffer.from(await r.arrayBuffer());
-      const supabase_sha256 = crypto.createHash("sha256").update(supaBuf).digest("hex");
-      debug = { compare: provider_sha256===supabase_sha256 ? "IDENTICAL" : "DIFFERENT", provider_sha256, provider_bytes: jpegBytes.length, supabase_sha256, supabase_bytes: supaBuf.length, storage_path: finalPath };
-    } catch (e) { debug = { compare:"ERROR", error:String(e).slice(0,200) }; }
-  }
-
   res.setHeader("content-type","application/json");
-  const payload = { ok:true, mode:"save", image_url:imageUrl, width:W, height:H, fast:!!fast, ...(debug?{debug}:{}) };
+  const payload = { ok:true, mode:"save", image_url:imageUrl, width:W, height:H, fast:!!fast };
   if (idem) globalThis.__idemCache.set(idem, payload);
   return res.status(200).json(payload);
 }
