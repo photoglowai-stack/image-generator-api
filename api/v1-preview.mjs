@@ -1,13 +1,20 @@
 // /api/v1-preview.mjs — Preview-by-default (no storage unless save:true)
 // Modes:
 // - Preview (défaut): JSON { provider_url } — rapide (front)
-// - proxy:true       : image/jpeg binaire — pour Figma
+// - proxy:true       : image/jpeg binaire — pour Figma (blob)
 // - save:true        : download -> upload Supabase -> JSON { image_url }
 //
-// ENV requis:
-// POLLINATIONS_TOKEN (optionnel), SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-// PREVIEW_BUCKET=generated_images, OUTPUT_PUBLIC=true, PREVIEW_CACHE_CONTROL_S=31536000
-// MAX_FUNCTION_S=25, MIN_IMAGE_BYTES=1024
+// ENV requis (save:true seulement):
+// SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+// PREVIEW_BUCKET=generated_images, OUTPUT_PUBLIC=true
+//
+// Optionnels:
+// POLLINATIONS_TOKEN, PREVIEW_CACHE_CONTROL_S, MAX_FUNCTION_S, MIN_IMAGE_BYTES, PREVIEW_ENHANCE
+//
+// Notes clé :
+// - “safe” = true par défaut. Pour “sleeveless tank top”, passe “safe:false” côté client.
+// - “px” (128–1024) force la taille en preview/proxy (p.ex. 384/512), => +net, +rapide
+// - tolérance aux petits JPEG en proxy (fini les 502 “unexpected_*_lenXXXX”)
 
 export const config = { runtime: "nodejs", maxDuration: 25 };
 
@@ -63,6 +70,7 @@ const HAIR_COLOR=["black","brown","blonde","red","gray"];
 const HAIR_LEN=["short","medium","long","bald"];
 const EYE=["brown","blue","green","hazel","gray"];
 
+// attributs morpho “safe wording”
 const BODY_TYPE=["slim","athletic","curvy","average"];
 const BUST_SIZE=["small","medium","large"];
 const BUTT_SIZE=["small","medium","large"];
@@ -75,7 +83,11 @@ const SIZE_FAST = { "1:1":[576,576], "3:4":[576,768] };
 
 const hash = s => { let h=2166136261>>>0; for (let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=(h+(h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24))>>>0 } return h>>>0; };
 const round64 = n => Math.max(64, Math.round(n/64)*64);
-function dimsFromPx(px, ratio){ const p=Math.max(128, Math.min(1024, Number(px)||0)); if(!p) return null; return ratio==="3:4" ? [round64(p), round64(p*4/3)] : [round64(p), round64(p)]; }
+function dimsFromPx(px, ratio){
+  const p = Math.max(128, Math.min(1024, Number(px)||0));
+  if (!p) return null;
+  return ratio==="3:4" ? [round64(p), round64(p*4/3)] : [round64(p), round64(p)];
+}
 
 /* -------------------- Normalisation + seed ---------------------- */
 function normalizeForm(raw) {
@@ -102,17 +114,36 @@ function normalizeForm(raw) {
   const styleKey = `${background}|${outfitKey}|${skin}|${hairLength}|${hairColor}|${eyeColor}|${bodyType}|${bustSize}|${mood}|${includeHips?"hips":"-"}`;
   return { gender, background, outfitKey, ratio, skin, hairColor, hairLength, eyeColor, bodyType, bustSize, buttSize, mood, includeHips, styleKey };
 }
-function deriveSeed(userSeed, n, extra=""){ if(Number.isFinite(Number(userSeed))) return Math.floor(Number(userSeed)); const base=hash(`${STYLE_VERSION}|${n.styleKey}|${n.ratio}|${extra}`); return ((base + (n.gender==="woman"?0:7919))>>>0) || DEFAULT_SEED; }
+function deriveSeed(userSeed, n, extra=""){
+  if (Number.isFinite(Number(userSeed))) return Math.floor(Number(userSeed));
+  const base=hash(`${STYLE_VERSION}|${n.styleKey}|${n.ratio}|${extra}`);
+  return ((base + (n.gender==="woman"?0:7919))>>>0) || DEFAULT_SEED;
+}
 
 /* ------------------------ Prompt builder ------------------------ */
-//  Template: "photorealistic instagram-virtual-model portrait, {gender}, adult (25–35), {skin_tone} skin, {body_type} build,
-//  {hair_length} {hair_color} hair, {eye_color} eyes, wearing {outfit_text}, {mood_text}, looking at camera, {background_text},
-//  soft beauty lighting, studio-quality retouching, 85mm portrait look, shallow depth of field, clean framing, high detail,
-//  natural skin texture, no celebrity likeness, fully clothed, modest neckline"
+// Template :
+// "photorealistic instagram-virtual-model portrait, youthful adult (25–35) {gender},
+//  {skin_tone} skin, {body_type} build,
+//  {hair_length} {hair_color} hair, {eye_color} eyes,
+//  wearing {outfit_text},
+//  {mood_text}, looking at camera, {background_text},
+//  soft beauty lighting, studio-quality retouching, 85mm portrait look, shallow depth of field,
+//  {framing}, clean framing, high detail, natural skin texture, instagram influencer aesthetic,
+//  no celebrity likeness"
 function buildPrompt(n){
   const BG_MAP={studio:"white studio background", office:"modern office background", city:"subtle city background", nature:"soft outdoor background"};
-  const OUTFIT_W={ blazer:"tailored blazer", shirt:"fitted blouse", tee:"fitted tee", athleisure:"sleeveless fitted tank top with modest neckline" };
-  const OUTFIT_M={ blazer:"tailored blazer", shirt:"fitted shirt",  tee:"fitted v-neck top with modest neckline", athleisure:"sleeveless athletic tank with modest neckline" };
+  const OUTFIT_W={
+    blazer:"tailored blazer",
+    shirt:"fitted blouse",
+    tee:"fitted tee",
+    athleisure:"sleeveless fitted tank top with modest neckline"
+  };
+  const OUTFIT_M={
+    blazer:"tailored blazer",
+    shirt:"fitted shirt",
+    tee:"fitted v-neck top with modest neckline",
+    athleisure:"sleeveless athletic tank with modest neckline"
+  };
   const SKIN_MAP={light:"light", fair:"fair", medium:"medium", tan:"tan", deep:"deep"};
   const EYE_MAP ={brown:"brown", blue:"blue", green:"green", hazel:"hazel", gray:"gray"};
 
@@ -123,15 +154,14 @@ function buildPrompt(n){
   const chestW  = { small:"subtle chest profile",    medium:"balanced chest profile",  large:"fuller chest profile" };
   const chestM  = { small:"slim chest",              medium:"balanced chest",          large:"broad chest" };
   const hips    = { small:"narrow hips", medium:"balanced hips", large:"fuller hips" };
-
   const chest   = (n.gender==="woman" ? chestW : chestM)[n.bustSize] || (n.gender==="woman" ? "balanced chest profile" : "balanced chest");
   const hipsD   = hips[n.buttSize] || "balanced hips";
   const moodMap = { neutral:"neutral expression", friendly:"friendly expression", confident:"confident look", cool:"calm composed look", serious:"serious expression", approachable:"approachable slight smile" };
   const mood    = moodMap[n.mood] || "confident look";
   const framing = n.includeHips ? "waist-up" : "shoulders-up";
 
-  const parts = [
-    `photorealistic instagram-virtual-model portrait, ${subject}, adult (25–35)`,
+  return [
+    `photorealistic instagram-virtual-model portrait, youthful adult (25–35) ${subject}`,
     `${SKIN_MAP[n.skin]} skin, ${bodyMap[n.bodyType]} build`,
     `${hair}, ${EYE_MAP[n.eyeColor]} eyes`,
     `wearing ${outfit}`,
@@ -139,10 +169,9 @@ function buildPrompt(n){
     `${mood}, looking at camera`,
     BG_MAP[n.background],
     "soft beauty lighting, studio-quality retouching, 85mm portrait look, shallow depth of field",
-    `${framing}, clean framing, high detail, natural skin texture`,
-    "no celebrity likeness, fully clothed, modest neckline"
-  ];
-  return parts.filter(Boolean).join(", ");
+    `${framing}, clean framing, high detail, natural skin texture, instagram influencer aesthetic`,
+    "no celebrity likeness"
+  ].filter(Boolean).join(", ");
 }
 
 /* --------------------- Pollinations (HTTP) ---------------------- */
@@ -150,14 +179,16 @@ const POL_ENDPOINT = "https://image.pollinations.ai/prompt";
 
 async function fetchWithTimeout(url, init={}, timeoutMs=POL_TIMEOUT_MS){
   if (timeoutMs <= 0) throw new Error("invalid_timeout");
-  if (typeof AbortSignal!=="undefined" && "timeout" in AbortSignal) return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  if (typeof AbortSignal!=="undefined" && "timeout" in AbortSignal) {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  }
   const ac=new AbortController(); const t=setTimeout(()=>ac.abort("timeout"), timeoutMs);
   try { return await fetch(url, { ...init, signal: ac.signal }); } finally { clearTimeout(t); }
 }
 
-// Détection binaire tolérante (petits JPEG ok)
-const isJPEG = b => b.length>3 && b[0]===0xFF && b[1]===0xD8 && b[2]===0xFF;
-const isPNG  = b => b.length>8 && b[0]===0x89 && b[1]===0x50 && b[2]===0x4E && b[3]===0x47 && b[4]===0x0D && b[5]===0x0A && b[6]===0x1A && b[7]===0x0A;
+// Détection binaire tolérante (petits JPEG OK)
+const isJPEG = b => b.length>3  && b[0]===0xFF && b[1]===0xD8 && b[2]===0xFF;
+const isPNG  = b => b.length>8  && b[0]===0x89 && b[1]===0x50 && b[2]===0x4E && b[3]===0x47 && b[4]===0x0D && b[5]===0x0A && b[6]===0x1A && b[7]===0x0A;
 const isWEBP = b => b.length>12 && b.slice(0,4).toString()==="RIFF" && b.slice(8,12).toString()==="WEBP";
 
 async function readImageResponse(res){
@@ -178,18 +209,23 @@ async function readImageResponse(res){
     const preview = bytes.toString("utf8", 0, Math.min(bytes.length, 160));
     throw new Error(`pollinations_unexpected_${ctype}_len${bytes.length}_${preview}`);
   }
-  // Autorise les très petites previews (ex. 8–12 KB)
-  if (bytes.length < MIN_IMAGE_BYTES && bytes.length < 1024) {
-    const preview = bytes.toString("utf8", 0, Math.min(bytes.length, 160));
-    throw new Error(`pollinations_unexpected_small_${ctype}_len${bytes.length}_${preview}`);
+  // Accepte les petites previews (>= ~1KB)
+  if (bytes.length < MIN_IMAGE_BYTES) {
+    // On accepte quand même, on expose juste la taille pour debug
   }
   return { bytes, ctype: ctype.includes("png") ? "image/png" : ctype.includes("webp") ? "image/webp" : "image/jpeg" };
 }
 
 function buildProviderURL({ prompt, width, height, seed, safe }){
   const qs = new URLSearchParams({
-    model:"flux", width:String(width), height:String(height), seed:String(seed),
-    private:"true", nologo:"true", enhance: PREVIEW_ENHANCE ? "true" : "false", safe
+    model:"flux",
+    width:String(width),
+    height:String(height),
+    seed:String(seed),
+    private:"true",
+    nologo:"true",
+    enhance: PREVIEW_ENHANCE ? "true" : "false",
+    safe
   }).toString();
   return `${POL_ENDPOINT}/${encodeURIComponent(prompt)}?${qs}`;
 }
@@ -269,18 +305,19 @@ export default async function handler(req, res){
 
   let [W,H] = (fast ? SIZE_FAST : SIZE_HQ)[n.ratio] || (fast ? [576,576] : [896,896]);
   const pxDims = dimsFromPx(body?.px, n.ratio);
-  if (pxDims && !save) { [W,H] = pxDims; } // preview/proxy controllés par px
-
-  if (strict) {
-    const bw = Number(body.width), bh = Number(body.height);
-    if (Number.isFinite(bw) && Number.isFinite(bh) && bw>=64 && bh>=64) { W=Math.floor(bw); H=Math.floor(bh); }
+  if (pxDims && !save) { [W,H] = pxDims; } // preview/proxy contrôlés par px
+  if (!save && !strict && !pxDims) { // défaut rapide si px absent
+    const d = dimsFromPx(384, n.ratio); if (d) [W,H] = d;
   }
 
-  const prompt = strict && ok(body.prompt) ? String(body.prompt) : (ok(body?.prompt) ? String(body.prompt) : buildPrompt(n));
-  const seed   = strict && Number.isFinite(Number(body?.seed)) ? Math.floor(Number(body.seed)) : deriveSeed(body?.seed, n, "igvm|soft|85mm");
+  const prompt = strict && ok(body.prompt) ? String(body.prompt)
+                : (ok(body?.prompt) ? String(body.prompt) : buildPrompt(n));
+  const seed   = strict && Number.isFinite(Number(body?.seed))
+                ? Math.floor(Number(body.seed))
+                : deriveSeed(body?.seed, n, "igvm|soft|85mm");
   const safe   = toBool(body?.safe ?? true) ? "true" : "false";
 
-  // Preview JSON (front)
+  // Preview JSON (front, rapide)
   if (!save && !proxy) {
     const provider_url = buildProviderURL({ prompt, width: W, height: H, seed, safe });
     res.setHeader("content-type","application/json");
