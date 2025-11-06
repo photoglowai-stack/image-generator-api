@@ -1,11 +1,12 @@
 // /api/v1-preview.mjs
 // Photoglow — v1 (previews only, no storage)
 // Modes:
-//  - Preview (default) : JSON { ok, mode:"preview", provider_url, width, height, seed, fast }
-//  - Proxy (Figma)     : proxy:true  → image/jpeg binaire
+//  - Preview (default): JSON { ok, mode:"preview", provider_url, width, height, seed, fast }
+//  - Proxy (Figma)    : proxy:true → image/jpeg binaire
 //
-// Objectifs clés : vitesse, cadrage contrôlé (hs|cu|wu), seeds réutilisables, femme/homme, poitrine/décolleté côté femme.
-// Aucune persistance. "safe" = false par défaut (looks mode). Negative prompt anti close-up.
+// Objectifs : vitesse, cadrage contrôlé (hs|cu|wu), seeds réutilisables, femme/homme,
+// poitrine/décolleté côté femme. Aucune persistance. "safe" = false par défaut.
+// Negative prompt anti close-up.
 //
 // ENV optionnels: POLLINATIONS_TOKEN, PREVIEW_ENHANCE, MAX_FUNCTION_S, MIN_IMAGE_BYTES
 export const config = { runtime: "nodejs", maxDuration: 25 };
@@ -19,6 +20,8 @@ function setCORS(req, res) {
   res.setHeader("access-control-allow-methods", "POST,OPTIONS,GET");
   res.setHeader("access-control-allow-headers", "content-type, authorization, idempotency-key");
   res.setHeader("access-control-max-age", "86400");
+  // Expose custom headers for Figma (Origin:null)
+  res.setHeader("Access-Control-Expose-Headers", "x-provider-url, x-provider-dims, x-seed, x-framing, x-ratio, x-px");
 }
 
 /* ------------------------------ ENV ----------------------------- */
@@ -42,12 +45,13 @@ function dimsFromPx(px, ratio) {
   return [round64(p), round64(p)];
 }
 
-async function fetchWithTimeout(url, init={}, timeoutMs=POL_TIMEOUT_MS){
+async function fetchWithTimeout(url, init = {}, timeoutMs = POL_TIMEOUT_MS) {
   if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
     return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
   }
   const ac = new AbortController(); const t = setTimeout(() => ac.abort("timeout"), timeoutMs);
-  try { return await fetch(url, { ...init, signal: ac.signal }); } finally { clearTimeout(t); }
+  try { return await fetch(url, { ...init, signal: ac.signal }); }
+  finally { clearTimeout(t); }
 }
 
 // quick content sniff
@@ -66,7 +70,7 @@ async function readImageResponse(res) {
 
   if (!/^image\//.test(ctype)) {
     const preview = bytes.toString("utf8", 0, Math.min(bytes.length, 200));
-    throw new Error(`pollinations_unexpected_${ctype||"unknown"}_len${bytes.length}_${preview}`);
+    throw new Error(`pollinations_unexpected_${ctype || "unknown"}_len${bytes.length}_${preview}`);
   }
   const looksLike = isJPEG(bytes) || isPNG(bytes) || isWEBP(bytes);
   if (!looksLike) {
@@ -79,7 +83,7 @@ async function readImageResponse(res) {
   return { bytes, ctype: ctype.includes("png") ? "image/png" : ctype.includes("webp") ? "image/webp" : "image/jpeg" };
 }
 
-async function toJPEG(bytes){
+async function toJPEG(bytes) {
   try {
     const sharpMod = await import("sharp");
     const sharp = (sharpMod.default || sharpMod);
@@ -112,14 +116,13 @@ function normalize(raw) {
   const background = BG.includes(f.background) ? f.background : "studio";
   const outfit     = OUTFIT.includes(f.outfit) ? f.outfit : "tee";
   let   ratio      = RATIO.includes(f.ratio) ? f.ratio : "1:1";
-  const skin_tone  = SKIN.includes(f.skin_tone) ? f.skin_tone : (f.skin_tone==="olive" ? "medium" : "medium");
+  const skin_tone  = SKIN.includes(f.skin_tone) ? f.skin_tone : (f.skin_tone === "olive" ? "medium" : "medium");
   const hair_length= HAIRLEN.includes(f.hair_length) ? f.hair_length : "short";
   let   hair_color = HAIRCOL.includes(f.hair_color) ? f.hair_color : "brown";
   if (hair_length === "bald") hair_color = "none";
   const eye_color  = EYES.includes(f.eye_color) ? f.eye_color : "brown";
-  let   body_type  = BODY.includes(f.body_type) ? f.body_type : (
-                      (f.body_type==="muscular"||f.body_type==="fit") ? "athletic" : "average"
-                    );
+  let   body_type  = BODY.includes(f.body_type) ? f.body_type
+                    : ((f.body_type === "muscular" || f.body_type === "fit") ? "athletic" : "average");
   let   bust_size  = BUST.includes(f.bust_size) ? f.bust_size : "medium";
   if (f.bust_size === "average") bust_size = "medium";
   let   butt_size  = BUTT.includes(f.butt_size) ? f.butt_size : "medium";
@@ -127,7 +130,7 @@ function normalize(raw) {
   const mood       = MOOD.includes(f.mood) ? f.mood : "confident";
 
   // cadrage
-  const framing    = FRAME.includes((f.framing||"").toLowerCase()) ? (f.framing||"hs").toLowerCase() : "hs";
+  const framing    = FRAME.includes((f.framing || "").toLowerCase()) ? (f.framing || "hs").toLowerCase() : "hs";
   // ratio par défaut intelligent
   if (!ok(f.ratio) && framing === "wu") ratio = "3:4";
 
@@ -151,20 +154,30 @@ function normalize(raw) {
   let seed = Number.isFinite(Number(f.seed)) ? Math.floor(Number(f.seed)) : undefined;
   if (!seed) seed = shuffle ? randomSeed() : deriveSeedFromKey(key);
 
-  return { gender, background, outfit, ratio, skin_tone, hair_length, hair_color, eye_color,
-           body_type, bust_size, butt_size, mood, framing, neckline, px, fast, safe,
-           negative_prompt, seed, key };
+  return {
+    gender, background, outfit, ratio, skin_tone, hair_length, hair_color, eye_color,
+    body_type, bust_size, butt_size, mood, framing, neckline, px, fast, safe,
+    negative_prompt, seed, key
+  };
 }
 
-function fnv1a32(str){ let h=0x811c9dc5>>>0;
-  for(let i=0;i<str.length;i++){ h^=str.charCodeAt(i); h=(h+((h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24)))>>>0; }
-  return h>>>0;
+function fnv1a32(str) {
+  let h = 0x811c9dc5 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h >>> 0;
 }
 function deriveSeedFromKey(key){ return fnv1a32("PGv1|" + key); }
-function randomSeed(){ const u=new Uint32Array(1); (globalThis.crypto?.getRandomValues?.(u)); return (u[0]||Math.floor(Math.random()*0xffffffff))>>>0; }
+function randomSeed(){
+  const u = new Uint32Array(1);
+  try { (globalThis.crypto?.getRandomValues?.(u)); } catch {}
+  return (u[0] || Math.floor(Math.random() * 0xffffffff)) >>> 0;
+}
 
 /* ------------------------ Prompt builder ------------------------ */
-function buildPrompt(n, customPrompt){
+function buildPrompt(n, customPrompt) {
   if (ok(customPrompt)) return customPrompt.trim();
 
   const bgMap = {
@@ -193,13 +206,9 @@ function buildPrompt(n, customPrompt){
         ? "sleeveless fitted tank top"
         : "fitted athletic top";
     } else if (n.outfit === "shirt") {
-      outfitText = (n.neckline === "vneck")
-        ? "fitted blouse with modest v-neck"
-        : "fitted blouse";
+      outfitText = (n.neckline === "vneck") ? "fitted blouse with modest v-neck" : "fitted blouse";
     } else if (n.outfit === "tee") {
-      outfitText = (n.neckline === "vneck")
-        ? "fitted v-neck tee"
-        : "fitted crew-neck tee";
+      outfitText = (n.neckline === "vneck") ? "fitted v-neck tee" : "fitted crew-neck tee";
     } else if (n.outfit === "blazer") {
       outfitText = "tailored blazer over fitted top";
     }
@@ -222,7 +231,7 @@ function buildPrompt(n, customPrompt){
 
   // Descripteurs poitrine/hanches (sobres)
   const chestW  = { small:"subtle chest profile", medium:"balanced chest profile", large:"fuller chest profile" };
-  const chestM  = { small:"slim chest", medium:"balanced chest", large:"broad chest" };
+  const chestM  = { small:"slim chest",          medium:"balanced chest",         large:"broad chest" };
   const hips    = { small:"narrow hips", medium:"balanced hips", large:"fuller hips" };
   const chest   = (n.gender === "woman" ? chestW : chestM)[n.bust_size] || (n.gender==="woman" ? "balanced chest profile" : "balanced chest");
   const hipsD   = hips[n.butt_size] || "balanced hips";
@@ -295,6 +304,7 @@ export default async function handler(req, res){
     return res.status(405).json({ ok:false, error:"method_not_allowed" });
   }
 
+  // Parse body JSON (Vercel/Node runtime)
   let body = req.body;
   if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
   if (!body || typeof body !== "object") body = {};
@@ -308,8 +318,15 @@ export default async function handler(req, res){
     const safe = n.safe; // false par défaut
     const seed = n.seed;
 
-    // 2) Build URL
+    // 2) Build URL + expose headers for debug/front
     const provider_url = buildProviderURL({ prompt, width: W, height: H, seed, safe, negative_prompt });
+    res.setHeader("x-provider-url", provider_url);
+    res.setHeader("x-provider-dims", `${W}x${H}`);
+    res.setHeader("x-seed", String(seed));
+    res.setHeader("x-framing", n.framing);
+    res.setHeader("x-ratio", n.ratio);
+    res.setHeader("x-px", String(n.px));
+    console.log("[v1-preview]", { provider_url, dims:`${W}x${H}`, seed, framing:n.framing, ratio:n.ratio, px:n.px });
 
     // 3) Proxy or Preview
     if (toBool(body.proxy)) {
@@ -318,14 +335,14 @@ export default async function handler(req, res){
         const out = ctype.includes("jpeg") ? bytes : await toJPEG(bytes);
         res.setHeader("content-type","image/jpeg");
         res.setHeader("cache-control","no-store");
-        res.setHeader("x-seed", String(seed));
-        res.setHeader("x-framing", n.framing);
-        res.setHeader("x-ratio", n.ratio);
-        res.setHeader("x-px", String(n.px));
         return res.status(200).send(out);
       } catch (e) {
         res.setHeader("content-type","application/json");
-        return res.status(502).json({ ok:false, mode:"proxy", error:"pollinations_failed", details:String(e).slice(0,200) });
+        return res.status(502).json({
+          ok:false, mode:"proxy", error:"pollinations_failed",
+          provider_url,
+          details:String(e).slice(0,200)
+        });
       }
     }
 
