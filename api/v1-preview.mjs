@@ -1,16 +1,9 @@
-// /api/v1-preview.mjs
-// Photoglow — v1 (previews only, no storage)
-// Modes:
-//  - Preview (default) : JSON { ok, mode:"preview", provider_url, width, height, seed, fast }
-//  - Proxy (Figma)     : proxy:true  → image/jpeg binaire
-//
-// Objectifs : vitesse, cadrage contrôlé (hs|cu|wu), seeds réutilisables, femme/homme, poitrine/décolleté côté femme.
-// Aucune persistance. "safe" est **FORCÉ OFF** côté serveur (looks mode). Negative prompt anti close-up.
-//
-// ENV optionnels: POLLINATIONS_TOKEN, PREVIEW_ENHANCE, MAX_FUNCTION_S, MIN_IMAGE_BYTES
-export const config = { runtime: "nodejs", maxDuration: 25 };
+// /api/v1-preview.mjs — HOTFIX STABLE (Vercel Serverless, no export config)
+// Previews only (no storage). Modes:
+//  - Preview JSON  : { ok, mode:"preview", provider_url, width, height, seed, fast }
+//  - Proxy (Figma) : proxy:true  → image/jpeg binaire
+// SAFE est forcé OFF côté serveur.
 
-/* ----------------------------- CORS ----------------------------- */
 function setCORS(req, res) {
   const origin = req.headers.origin;
   const allow = (!origin || origin === "null") ? "null" : origin;
@@ -21,7 +14,6 @@ function setCORS(req, res) {
   res.setHeader("access-control-max-age", "86400");
 }
 
-/* ------------------------------ ENV ----------------------------- */
 const POL_TOKEN       = process.env.POLLINATIONS_TOKEN || "";
 const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true";
 const MIN_IMAGE_BYTES = Number(process.env.MIN_IMAGE_BYTES || 1024);
@@ -30,7 +22,6 @@ const SAFETY_MARGIN_S = 3;
 const TIME_BUDGET_MS  = Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000);
 const POL_TIMEOUT_MS  = Math.max(4000, Math.min(TIME_BUDGET_MS - 1500, 15000));
 
-/* ---------------------------- Helpers --------------------------- */
 const ok     = v => typeof v === "string" && v.trim().length > 0;
 const toBool = v => v === true || v === "true" || v === 1 || v === "1";
 const clamp  = (n, min, max) => Math.max(min, Math.min(max, Math.floor(Number(n) || 0)));
@@ -50,7 +41,6 @@ async function fetchWithTimeout(url, init={}, timeoutMs=POL_TIMEOUT_MS){
   try { return await fetch(url, { ...init, signal: ac.signal }); } finally { clearTimeout(t); }
 }
 
-// quick content sniff
 const isJPEG = b => b.length>3  && b[0]===0xFF && b[1]===0xD8 && b[2]===0xFF;
 const isPNG  = b => b.length>8  && b[0]===0x89 && b[1]===0x50 && b[2]===0x4E && b[3]===0x47 && b[4]===0x0D && b[5]===0x0A && b[6]===0x1A && b[7]===0x0A;
 const isWEBP = b => b.length>12 && b.slice(0,4).toString()==="RIFF" && b.slice(8,12).toString()==="WEBP";
@@ -73,23 +63,11 @@ async function readImageResponse(res) {
     const preview = bytes.toString("utf8", 0, Math.min(bytes.length, 200));
     throw new Error(`pollinations_unexpected_${ctype}_len${bytes.length}_${preview}`);
   }
-  if (bytes.length < MIN_IMAGE_BYTES) {
-    // tolère petits JPEG, continue
-  }
-  return { bytes, ctype: ctype.includes("png") ? "image/png" : ctype.includes("webp") ? "image/webp" : "image/jpeg" };
+  if (bytes.length < MIN_IMAGE_BYTES) { /* on tolère */ }
+  return { bytes, ctype: "image/jpeg" }; // on renvoie tel quel sans transcodage
 }
 
-async function toJPEG(bytes){
-  try {
-    const sharpMod = await import("sharp");
-    const sharp = (sharpMod.default || sharpMod);
-    return await sharp(Buffer.from(bytes)).jpeg({ quality: 92 }).toBuffer();
-  } catch {
-    return Buffer.from(bytes);
-  }
-}
-
-/* ---------------------- Domain: attributes ---------------------- */
+/* ------------ Domain: attributes & normalization --------------- */
 const BG      = ["studio","office","city","nature"];
 const OUTFIT  = ["blazer","shirt","tee","athleisure"];
 const RATIO   = ["1:1","3:4"];
@@ -99,13 +77,25 @@ const HAIRLEN = ["short","medium","long","bald"];
 const HAIRCOL = ["black","brown","blonde","red","gray","none"];
 const EYES    = ["brown","blue","green","hazel","gray"];
 const BODY    = ["athletic","slim","average","curvy"];
-const BUST    = ["small","medium","large"];    // femmes
+const BUST    = ["small","medium","large"];
 const BUTT    = ["small","medium","large"];
 const MOOD    = ["neutral","friendly","confident","cool","serious","approachable"];
-const FRAME   = ["hs","cu","wu"];              // head-shoulders / chest-up / waist-up
+const FRAME   = ["hs","cu","wu"];
 const NECK    = ["crew","vneck","scoop","plunge","strapless","sleeveless"];
 
-/* -------------------- Normalisation + seed ---------------------- */
+function fnv1a32(str){ let h=0x811c9dc5>>>0;
+  for(let i=0;i<str.length;i++){ h^=str.charCodeAt(i); h=(h+((h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24)))>>>0; }
+  return h>>>0;
+}
+function deriveSeedFromKey(key){ return fnv1a32("PGv1|" + key); }
+function randomSeed(){
+  try {
+    const u=new Uint32Array(1);
+    if (globalThis.crypto?.getRandomValues) { globalThis.crypto.getRandomValues(u); return u[0]>>>0; }
+  } catch {}
+  return (Math.floor(Math.random()*0xffffffff))>>>0;
+}
+
 function normalize(raw) {
   const f = raw && typeof raw === "object" ? raw : {};
   const gender     = GENDER.includes(f.gender) ? f.gender : "woman";
@@ -117,70 +107,49 @@ function normalize(raw) {
   let   hair_color = HAIRCOL.includes(f.hair_color) ? f.hair_color : "brown";
   if (hair_length === "bald") hair_color = "none";
   const eye_color  = EYES.includes(f.eye_color) ? f.eye_color : "brown";
-  let   body_type  = BODY.includes(f.body_type) ? f.body_type : (
-                      (f.body_type==="muscular"||f.body_type==="fit") ? "athletic" : "average"
-                    );
+  let   body_type  = BODY.includes(f.body_type) ? f.body_type : ((f.body_type==="muscular"||f.body_type==="fit") ? "athletic" : "average");
   let   bust_size  = BUST.includes(f.bust_size) ? f.bust_size : "medium";
   if (f.bust_size === "average") bust_size = "medium";
   let   butt_size  = BUTT.includes(f.butt_size) ? f.butt_size : "medium";
   if (f.butt_size === "average") butt_size = "medium";
   const mood       = MOOD.includes(f.mood) ? f.mood : "confident";
 
-  // cadrage
   const framing    = FRAME.includes((f.framing||"").toLowerCase()) ? (f.framing||"hs").toLowerCase() : "hs";
   if (!ok(f.ratio) && framing === "wu") ratio = "3:4";
-
-  // neckline (femmes)
   const neckline   = NECK.includes(f.neckline) ? f.neckline : undefined;
 
   const px         = clamp(f.px ?? 384, 128, 1024);
   const fast       = f.fast !== undefined ? toBool(f.fast) : true;
 
-  // ⚠️ SAFE FORCÉ OFF côté serveur (on n'accepte pas la valeur client)
+  // SAFE OFF — on ignore toute valeur client
   const safe       = false;
 
   const shuffle    = toBool(f.shuffle);
   const negative_prompt = ok(f.negative_prompt) ? String(f.negative_prompt) : "";
 
-  const keyParts = {
-    ratio, px, gender, background, outfit, skin_tone, hair_length, hair_color,
-    eye_color, body_type, bust_size, butt_size, mood, framing, neckline: neckline || "-",
-  };
+  const keyParts = { ratio, px, gender, background, outfit, skin_tone, hair_length, hair_color,
+                     eye_color, body_type, bust_size, butt_size, mood, framing, neckline: neckline || "-" };
   const key = JSON.stringify(keyParts);
 
   let seed = Number.isFinite(Number(f.seed)) ? Math.floor(Number(f.seed)) : undefined;
   if (!seed) seed = shuffle ? randomSeed() : deriveSeedFromKey(key);
+  seed = Number.isFinite(seed) ? (seed >>> 0) : 123456789;
 
   return { gender, background, outfit, ratio, skin_tone, hair_length, hair_color, eye_color,
            body_type, bust_size, butt_size, mood, framing, neckline, px, fast, safe,
            negative_prompt, seed, key };
 }
 
-function fnv1a32(str){ let h=0x811c9dc5>>>0;
-  for(let i=0;i<str.length;i++){ h^=str.charCodeAt(i); h=(h+((h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24)))>>>0; }
-  return h>>>0;
-}
-function deriveSeedFromKey(key){ return fnv1a32("PGv1|" + key); }
-function randomSeed(){ const u=new Uint32Array(1); (globalThis.crypto?.getRandomValues?.(u)); return (u[0]||Math.floor(Math.random()*0xffffffff))>>>0; }
-
 /* ------------------------ Prompt builder ------------------------ */
 function buildPrompt(n, customPrompt){
   if (ok(customPrompt)) return customPrompt.trim();
-
-  const bgMap = {
-    studio: "white studio background",
-    office: "modern office background",
-    city:   "subtle city background",
-    nature: "soft outdoor background"
-  };
-
+  const bgMap = { studio:"white studio background", office:"modern office background", city:"subtle city background", nature:"soft outdoor background" };
   const framingTxt = n.framing === "wu"
     ? "waist-up framing (upper body visible, include both shoulders and arms), medium shot, balanced headroom"
     : n.framing === "cu"
     ? "chest-up framing (upper torso and both shoulders visible), medium camera distance, balanced headroom"
     : "head-and-shoulders framing (both shoulders visible, small headroom), medium camera distance";
 
-  // Outfit + neckline (femmes seulement pour décolleté)
   let outfitText = n.outfit;
   if (n.gender === "woman") {
     if (n.outfit === "athleisure") {
@@ -192,29 +161,20 @@ function buildPrompt(n, customPrompt){
         ? "sleeveless fitted tank top"
         : "fitted athletic top";
     } else if (n.outfit === "shirt") {
-      outfitText = (n.neckline === "vneck")
-        ? "fitted blouse with modest v-neck"
-        : "fitted blouse";
+      outfitText = (n.neckline === "vneck") ? "fitted blouse with modest v-neck" : "fitted blouse";
     } else if (n.outfit === "tee") {
-      outfitText = (n.neckline === "vneck")
-        ? "fitted v-neck tee"
-        : "fitted crew-neck tee";
+      outfitText = (n.neckline === "vneck") ? "fitted v-neck tee" : "fitted crew-neck tee";
     } else if (n.outfit === "blazer") {
       outfitText = "tailored blazer over fitted top";
     }
-  } else { // man
+  } else {
     if (n.outfit === "tee") outfitText = "fitted crew-neck tee";
     if (n.outfit === "shirt") outfitText = "fitted shirt";
     if (n.outfit === "blazer") outfitText = "tailored blazer";
     if (n.outfit === "athleisure") outfitText = "athletic top";
   }
 
-  const moodMap = {
-    neutral:"neutral expression", friendly:"friendly expression",
-    confident:"confident look",  cool:"calm composed look",
-    serious:"serious expression", approachable:"approachable slight smile"
-  };
-
+  const moodMap = { neutral:"neutral expression", friendly:"friendly expression", confident:"confident look", cool:"calm composed look", serious:"serious expression", approachable:"approachable slight smile" };
   const subject = n.gender === "man" ? "man" : "woman";
   const hair = n.hair_length === "bald" ? "clean-shaven head" : `${n.hair_length} ${n.hair_color} hair`;
   const bodyMap = { slim:"slim", athletic:"athletic", curvy:"curvy", average:"average" };
@@ -225,7 +185,7 @@ function buildPrompt(n, customPrompt){
   const chest   = (n.gender === "woman" ? chestW : chestM)[n.bust_size] || (n.gender==="woman" ? "balanced chest profile" : "balanced chest");
   const hipsD   = hips[n.butt_size] || "balanced hips";
 
-  const parts = [
+  return [
     "photorealistic instagram influencer aesthetic portrait",
     framingTxt,
     `youthful adult (25–35) ${subject}, ${n.skin_tone} skin, ${bodyMap[n.body_type]} build`,
@@ -237,9 +197,7 @@ function buildPrompt(n, customPrompt){
     "sharp focus, micro-contrast, detailed eyes, natural skin texture",
     "soft beauty lighting, 85mm portrait look, clean composition, high detail",
     "no text, no watermark, no celebrity likeness"
-  ].filter(Boolean);
-
-  return parts.join(", ");
+  ].filter(Boolean).join(", ");
 }
 
 function defaultNegative(n, customNeg){
@@ -249,24 +207,23 @@ function defaultNegative(n, customNeg){
 
 /* --------------------- Provider: Pollinations ------------------- */
 const POL_ENDPOINT = "https://image.pollinations.ai/prompt";
-
 function buildProviderURL({ prompt, width, height, seed, safe, negative_prompt }) {
+  const s = Number.isFinite(seed) ? (seed >>> 0) : 123456789;
   const qs = new URLSearchParams({
     model: "flux",
     width: String(width),
     height: String(height),
-    seed: String(seed >>> 0),
+    seed: String(s),
     private: "true",
     nologo: "true",
     nofeed: "true",
     enhance: PREVIEW_ENHANCE ? "true" : "false",
-    safe: safe ? "true" : "false",
+    safe: "false", // OFF forcé
     quality: "medium",
     negative_prompt: String(negative_prompt || "")
   }).toString();
   return `${POL_ENDPOINT}/${encodeURIComponent(prompt)}?${qs}`;
 }
-
 async function fetchProviderBinary(url){
   const headers = { Accept:"image/*", "User-Agent":"Photoglow-Preview/1.0" };
   if (POL_TOKEN) headers.Authorization = `Bearer ${POL_TOKEN}`;
@@ -276,46 +233,42 @@ async function fetchProviderBinary(url){
 
 /* ------------------------------ API ----------------------------- */
 export default async function handler(req, res){
-  setCORS(req, res);
-  if (req.method === "OPTIONS") return res.status(204).end();
-
-  if (req.method === "GET") {
-    res.setHeader("x-safe","0");
-    return res.status(200).json({
-      ok:true, endpoint:"/api/v1-preview",
-      notes:"preview only (no storage), proxy for Figma",
-      defaults:{ fast:true, safe:false, px:384, ratio:"1:1", framing:"hs" }
-    });
-  }
-
-  if (req.method !== "POST") {
-    res.setHeader("content-type","application/json");
-    return res.status(405).json({ ok:false, error:"method_not_allowed" });
-  }
-
-  let body = req.body;
-  if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
-  if (!body || typeof body !== "object") body = {};
-
   try {
-    // 1) normalize & build
+    setCORS(req, res);
+    if (req.method === "OPTIONS") return res.status(204).end();
+
+    if (req.method === "GET") {
+      res.setHeader("x-safe","0");
+      return res.status(200).json({
+        ok:true, endpoint:"/api/v1-preview",
+        notes:"preview only (no storage), proxy for Figma",
+        defaults:{ fast:true, safe:false, px:384, ratio:"1:1", framing:"hs" }
+      });
+    }
+
+    if (req.method !== "POST") {
+      res.setHeader("content-type","application/json");
+      return res.status(405).json({ ok:false, error:"method_not_allowed" });
+    }
+
+    let body = req.body;
+    if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+    if (!body || typeof body !== "object") body = {};
+
     const n = normalize(body);
     const [W,H] = dimsFromPx(n.px, n.ratio);
     const prompt = buildPrompt(n, body.prompt);
     const negative_prompt = defaultNegative(n, body.negative_prompt);
 
-    // ⚠️ SAFE TOUJOURS OFF côté serveur
+    // SAFE toujours off
     const safe = false;
-    const seed = n.seed;
+    const seed = Number.isFinite(n.seed) ? (n.seed >>> 0) : 123456789;
 
-    // 2) Build URL
     const provider_url = buildProviderURL({ prompt, width: W, height: H, seed, safe, negative_prompt });
 
-    // 3) Proxy or Preview
     if (toBool(body.proxy)) {
       try {
-        const { bytes, ctype } = await fetchProviderBinary(provider_url);
-        const out = ctype.includes("jpeg") ? bytes : await toJPEG(bytes);
+        const { bytes } = await fetchProviderBinary(provider_url);
         res.setHeader("content-type","image/jpeg");
         res.setHeader("cache-control","no-store");
         res.setHeader("x-safe","0");
@@ -323,6 +276,25 @@ export default async function handler(req, res){
         res.setHeader("x-framing", n.framing);
         res.setHeader("x-ratio", n.ratio);
         res.setHeader("x-px", String(n.px));
-        return res.status(200).send(out);
+        return res.status(200).send(bytes);
       } catch (e) {
-        r
+        res.setHeader("content-type","application/json");
+        res.setHeader("x-safe","0");
+        return res.status(502).json({ ok:false, mode:"proxy", error:"pollinations_failed", details:String(e).slice(0,200) });
+      }
+    }
+
+    res.setHeader("content-type","application/json");
+    res.setHeader("x-safe","0");
+    return res.status(200).json({
+      ok:true, mode:"preview", provider_url, width:W, height:H, seed, fast:n.fast
+    });
+
+  } catch (e) {
+    // trace dans les logs Vercel
+    console.error("v1-preview FATAL:", e);
+    res.setHeader("content-type","application/json");
+    res.setHeader("x-safe","0");
+    return res.status(500).json({ ok:false, error:"server_error", message:String(e).slice(0,200) });
+  }
+}
