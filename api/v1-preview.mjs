@@ -4,8 +4,8 @@
 //  - Preview (default) : JSON { ok, mode:"preview", provider_url, width, height, seed, fast }
 //  - Proxy (Figma)     : proxy:true  → image/jpeg binaire
 //
-// Objectifs clés : vitesse, cadrage contrôlé (hs|cu|wu), seeds réutilisables, femme/homme, poitrine/décolleté côté femme.
-// Aucune persistance. "safe" = false par défaut (looks mode). Negative prompt anti close-up.
+// Objectifs : vitesse, cadrage contrôlé (hs|cu|wu), seeds réutilisables, femme/homme, poitrine/décolleté côté femme.
+// Aucune persistance. "safe" est **FORCÉ OFF** côté serveur (looks mode). Negative prompt anti close-up.
 //
 // ENV optionnels: POLLINATIONS_TOKEN, PREVIEW_ENHANCE, MAX_FUNCTION_S, MIN_IMAGE_BYTES
 export const config = { runtime: "nodejs", maxDuration: 25 };
@@ -128,7 +128,6 @@ function normalize(raw) {
 
   // cadrage
   const framing    = FRAME.includes((f.framing||"").toLowerCase()) ? (f.framing||"hs").toLowerCase() : "hs";
-  // ratio par défaut intelligent
   if (!ok(f.ratio) && framing === "wu") ratio = "3:4";
 
   // neckline (femmes)
@@ -136,15 +135,16 @@ function normalize(raw) {
 
   const px         = clamp(f.px ?? 384, 128, 1024);
   const fast       = f.fast !== undefined ? toBool(f.fast) : true;
-  // safe : par défaut false (fashion looks)
-  const safe       = f.safe !== undefined ? toBool(f.safe) : false;
+
+  // ⚠️ SAFE FORCÉ OFF côté serveur (on n'accepte pas la valeur client)
+  const safe       = false;
+
   const shuffle    = toBool(f.shuffle);
   const negative_prompt = ok(f.negative_prompt) ? String(f.negative_prompt) : "";
 
   const keyParts = {
     ratio, px, gender, background, outfit, skin_tone, hair_length, hair_color,
     eye_color, body_type, bust_size, butt_size, mood, framing, neckline: neckline || "-",
-    // NB: on n'intègre PAS "prompt" custom dans la seed déterministe => si prompt custom, passez votre seed
   };
   const key = JSON.stringify(keyParts);
 
@@ -174,7 +174,6 @@ function buildPrompt(n, customPrompt){
     nature: "soft outdoor background"
   };
 
-  // Cadrage texte
   const framingTxt = n.framing === "wu"
     ? "waist-up framing (upper body visible, include both shoulders and arms), medium shot, balanced headroom"
     : n.framing === "cu"
@@ -220,7 +219,6 @@ function buildPrompt(n, customPrompt){
   const hair = n.hair_length === "bald" ? "clean-shaven head" : `${n.hair_length} ${n.hair_color} hair`;
   const bodyMap = { slim:"slim", athletic:"athletic", curvy:"curvy", average:"average" };
 
-  // Descripteurs poitrine/hanches (sobres)
   const chestW  = { small:"subtle chest profile", medium:"balanced chest profile", large:"fuller chest profile" };
   const chestM  = { small:"slim chest", medium:"balanced chest", large:"broad chest" };
   const hips    = { small:"narrow hips", medium:"balanced hips", large:"fuller hips" };
@@ -246,7 +244,6 @@ function buildPrompt(n, customPrompt){
 
 function defaultNegative(n, customNeg){
   if (ok(customNeg)) return customNeg.trim();
-  // anti close-up + anti artefacts, pas de ban "cleavage"
   return "extreme close-up, face-only, tight crop, zoomed-in face, forehead cut, chin cut, cropped hairline, soft focus, blur, low-res, jpeg artifacts";
 }
 
@@ -283,6 +280,7 @@ export default async function handler(req, res){
   if (req.method === "OPTIONS") return res.status(204).end();
 
   if (req.method === "GET") {
+    res.setHeader("x-safe","0");
     return res.status(200).json({
       ok:true, endpoint:"/api/v1-preview",
       notes:"preview only (no storage), proxy for Figma",
@@ -305,7 +303,9 @@ export default async function handler(req, res){
     const [W,H] = dimsFromPx(n.px, n.ratio);
     const prompt = buildPrompt(n, body.prompt);
     const negative_prompt = defaultNegative(n, body.negative_prompt);
-    const safe = n.safe; // false par défaut
+
+    // ⚠️ SAFE TOUJOURS OFF côté serveur
+    const safe = false;
     const seed = n.seed;
 
     // 2) Build URL
@@ -318,25 +318,11 @@ export default async function handler(req, res){
         const out = ctype.includes("jpeg") ? bytes : await toJPEG(bytes);
         res.setHeader("content-type","image/jpeg");
         res.setHeader("cache-control","no-store");
+        res.setHeader("x-safe","0");
         res.setHeader("x-seed", String(seed));
         res.setHeader("x-framing", n.framing);
         res.setHeader("x-ratio", n.ratio);
         res.setHeader("x-px", String(n.px));
         return res.status(200).send(out);
       } catch (e) {
-        res.setHeader("content-type","application/json");
-        return res.status(502).json({ ok:false, mode:"proxy", error:"pollinations_failed", details:String(e).slice(0,200) });
-      }
-    }
-
-    // Preview JSON
-    res.setHeader("content-type","application/json");
-    return res.status(200).json({
-      ok:true, mode:"preview", provider_url, width:W, height:H, seed, fast:n.fast
-    });
-
-  } catch (e) {
-    res.setHeader("content-type","application/json");
-    return res.status(500).json({ ok:false, error:"server_error", message:String(e).slice(0,200) });
-  }
-}
+        r
