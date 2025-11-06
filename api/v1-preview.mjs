@@ -5,7 +5,7 @@
 //  - Proxy (Figma)    : proxy:true → image/jpeg binaire
 //
 // Objectifs : vitesse, cadrage contrôlé (hs|cu|wu), seeds réutilisables, femme/homme,
-// poitrine/décolleté côté femme. Aucune persistance. "safe" = false par défaut.
+// poitrine/décolleté côté femme. Aucune persistance. "safe" = false (FORCÉ côté serveur).
 // Negative prompt anti close-up.
 //
 // ENV optionnels: POLLINATIONS_TOKEN, PREVIEW_ENHANCE, MAX_FUNCTION_S, MIN_IMAGE_BYTES
@@ -78,7 +78,7 @@ async function readImageResponse(res) {
     throw new Error(`pollinations_unexpected_${ctype}_len${bytes.length}_${preview}`);
   }
   if (bytes.length < MIN_IMAGE_BYTES) {
-    // tolère petits JPEG, continue
+    // tolère petits JPEG
   }
   return { bytes, ctype: ctype.includes("png") ? "image/png" : ctype.includes("webp") ? "image/webp" : "image/jpeg" };
 }
@@ -117,9 +117,12 @@ function normalize(raw) {
   const outfit     = OUTFIT.includes(f.outfit) ? f.outfit : "tee";
   let   ratio      = RATIO.includes(f.ratio) ? f.ratio : "1:1";
   const skin_tone  = SKIN.includes(f.skin_tone) ? f.skin_tone : (f.skin_tone === "olive" ? "medium" : "medium");
-  const hair_length= HAIRLEN.includes(f.hair_length) ? f.hair_length : "short";
-  let   hair_color = HAIRCOL.includes(f.hair_color) ? f.hair_color : "brown";
+
+  // Defaults de longueur de cheveux par genre
+  let hair_length  = HAIRLEN.includes(f.hair_length) ? f.hair_length : (gender === "woman" ? "long" : "short");
+  let hair_color   = HAIRCOL.includes(f.hair_color) ? f.hair_color : "brown";
   if (hair_length === "bald") hair_color = "none";
+
   const eye_color  = EYES.includes(f.eye_color) ? f.eye_color : "brown";
   let   body_type  = BODY.includes(f.body_type) ? f.body_type
                     : ((f.body_type === "muscular" || f.body_type === "fit") ? "athletic" : "average");
@@ -131,23 +134,23 @@ function normalize(raw) {
 
   // cadrage
   const framing    = FRAME.includes((f.framing || "").toLowerCase()) ? (f.framing || "hs").toLowerCase() : "hs";
-  // ratio par défaut intelligent
-  if (!ok(f.ratio) && framing === "wu") ratio = "3:4";
+  if (!ok(f.ratio) && framing === "wu") ratio = "3:4"; // ratio auto
 
   // neckline (femmes)
   const neckline   = NECK.includes(f.neckline) ? f.neckline : undefined;
 
   const px         = clamp(f.px ?? 384, 128, 1024);
   const fast       = f.fast !== undefined ? toBool(f.fast) : true;
-  // safe : par défaut false (fashion looks)
-  const safe       = f.safe !== undefined ? toBool(f.safe) : false;
+
+  // IMPORTANT : on FORCE le safe à false (le client est ignoré)
+  const safe       = false;
+
   const shuffle    = toBool(f.shuffle);
   const negative_prompt = ok(f.negative_prompt) ? String(f.negative_prompt) : "";
 
   const keyParts = {
     ratio, px, gender, background, outfit, skin_tone, hair_length, hair_color,
     eye_color, body_type, bust_size, butt_size, mood, framing, neckline: neckline || "-",
-    // NB: on n'intègre PAS "prompt" custom dans la seed déterministe => si prompt custom, passez votre seed
   };
   const key = JSON.stringify(keyParts);
 
@@ -187,14 +190,13 @@ function buildPrompt(n, customPrompt) {
     nature: "soft outdoor background"
   };
 
-  // Cadrage texte
   const framingTxt = n.framing === "wu"
     ? "waist-up framing (upper body visible, include both shoulders and arms), medium shot, balanced headroom"
     : n.framing === "cu"
     ? "chest-up framing (upper torso and both shoulders visible), medium camera distance, balanced headroom"
     : "head-and-shoulders framing (both shoulders visible, small headroom), medium camera distance";
 
-  // Outfit + neckline (femmes seulement pour décolleté)
+  // Outfit + neckline (femmes → contrôle du décolleté avec wording fashion)
   let outfitText = n.outfit;
   if (n.gender === "woman") {
     if (n.outfit === "athleisure") {
@@ -229,7 +231,6 @@ function buildPrompt(n, customPrompt) {
   const hair = n.hair_length === "bald" ? "clean-shaven head" : `${n.hair_length} ${n.hair_color} hair`;
   const bodyMap = { slim:"slim", athletic:"athletic", curvy:"curvy", average:"average" };
 
-  // Descripteurs poitrine/hanches (sobres)
   const chestW  = { small:"subtle chest profile", medium:"balanced chest profile", large:"fuller chest profile" };
   const chestM  = { small:"slim chest",          medium:"balanced chest",         large:"broad chest" };
   const hips    = { small:"narrow hips", medium:"balanced hips", large:"fuller hips" };
@@ -255,7 +256,6 @@ function buildPrompt(n, customPrompt) {
 
 function defaultNegative(n, customNeg){
   if (ok(customNeg)) return customNeg.trim();
-  // anti close-up + anti artefacts, pas de ban "cleavage"
   return "extreme close-up, face-only, tight crop, zoomed-in face, forehead cut, chin cut, cropped hairline, soft focus, blur, low-res, jpeg artifacts";
 }
 
@@ -312,14 +312,16 @@ export default async function handler(req, res){
   try {
     // 1) normalize & build
     const n = normalize(body);
+    // Sécurité supplémentaire : SAFE TOUJOURS FALSE
+    n.safe = false;
+
     const [W,H] = dimsFromPx(n.px, n.ratio);
     const prompt = buildPrompt(n, body.prompt);
     const negative_prompt = defaultNegative(n, body.negative_prompt);
-    const safe = n.safe; // false par défaut
     const seed = n.seed;
 
-    // 2) Build URL + expose headers for debug/front
-    const provider_url = buildProviderURL({ prompt, width: W, height: H, seed, safe, negative_prompt });
+    // 2) Build URL + expose headers pour debug/front
+    const provider_url = buildProviderURL({ prompt, width: W, height: H, seed, safe: false, negative_prompt });
     res.setHeader("x-provider-url", provider_url);
     res.setHeader("x-provider-dims", `${W}x${H}`);
     res.setHeader("x-seed", String(seed));
@@ -340,8 +342,7 @@ export default async function handler(req, res){
         res.setHeader("content-type","application/json");
         return res.status(502).json({
           ok:false, mode:"proxy", error:"pollinations_failed",
-          provider_url,
-          details:String(e).slice(0,200)
+          provider_url, details:String(e).slice(0,200)
         });
       }
     }
