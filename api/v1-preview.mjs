@@ -1,10 +1,10 @@
-// /api/v1-preview.mjs — Previews only (fast). No "safe", No storage.
+// /api/v1-preview.mjs — Previews only, fast, safe=false by default (no storage)
 // Modes:
 // - Preview (défaut): JSON { ok, mode:"preview", provider_url, width, height, seed, fast }
 // - proxy:true       : image/jpeg binaire — pour Figma (blob)
 //
 // ENV optionnels: POLLINATIONS_TOKEN, PREVIEW_CACHE_CONTROL_S, MAX_FUNCTION_S, MIN_IMAGE_BYTES, PREVIEW_ENHANCE
-// Recommandé côté client: fast:true, ratio:"1:1", px:384|512, seed aléatoire.
+// Reco client: fast:true, ratio:"1:1", px:384|512, seed aléatoire, safe:false (look mode/décolleté)
 
 export const config = { runtime: "nodejs", maxDuration: 25 };
 
@@ -42,6 +42,9 @@ const SKIN=["light","fair","medium","tan","deep"];
 const HAIR_COLOR=["black","brown","blonde","red","gray","none"];
 const HAIR_LEN=["short","medium","long","bald"];
 const EYE=["brown","blue","green","hazel","gray"];
+const BODY_TYPE=["slim","athletic","average","curvy"];
+const BUST_SIZE=["small","medium","large"];
+const BUTT_SIZE=["small","medium","large"];
 const MOOD=["neutral","friendly","confident","cool","serious","approachable"];
 
 const STYLE_VERSION = "ig_influencer_v1";
@@ -57,6 +60,7 @@ function dimsFromPx(px, ratio){
 }
 const hash = s => { let h=2166136261>>>0; for (let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=(h+(h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24))>>>0 } return h>>>0; };
 
+/* ------------------------ Normalisation ------------------------- */
 function normalizeForm(raw) {
   const f = raw && typeof raw==="object" ? raw : {};
   const gender     = ["woman","man"].includes(f.gender) ? f.gender : "woman";
@@ -68,10 +72,13 @@ function normalizeForm(raw) {
   const eyeColor   = EYE.includes(f.eye_color) ? f.eye_color : "brown";
   let   hairColor  = HAIR_COLOR.includes(f.hair_color) ? f.hair_color : "brown";
   if (hairLength === "bald") hairColor = "none";
+  const bodyType   = BODY_TYPE.includes(f.body_type) ? f.body_type : "average";
+  const bustSize   = BUST_SIZE.includes(f.bust_size) ? f.bust_size : "medium";
+  const buttSize   = BUTT_SIZE.includes(f.butt_size) ? f.butt_size : "medium";
   const mood       = MOOD.includes(f.mood) ? f.mood : "neutral";
   const includeHips= Boolean(f.waist_up || /waist|3\/4|three/.test(String(f.framing||"")));
-  const key = `${background}|${outfitKey}|${skin}|${hairLength}|${hairColor}|${eyeColor}|${mood}|${includeHips?"hips":"-"}`
-  return { gender, background, outfitKey, ratio, skin, hairLength, hairColor, eyeColor, mood, includeHips, key };
+  const key = `${background}|${outfitKey}|${skin}|${hairLength}|${hairColor}|${eyeColor}|${bodyType}|${bustSize}|${buttSize}|${mood}|${includeHips?"hips":"-"}`
+  return { gender, background, outfitKey, ratio, skin, hairLength, hairColor, eyeColor, bodyType, bustSize, buttSize, mood, includeHips, key };
 }
 function deriveSeed(userSeed, n, extra=""){
   if (Number.isFinite(Number(userSeed))) return Math.floor(Number(userSeed));
@@ -80,51 +87,40 @@ function deriveSeed(userSeed, n, extra=""){
 }
 
 /* ------------------------ Prompt builder ------------------------ */
-// "influencer aesthetic" conservé. Aucun "bust/hips".
+// On garde "instagram influencer aesthetic", avec bust/hips si fournis.
 function buildPrompt(n){
   const BG_MAP={studio:"white studio background", office:"modern office background", city:"subtle city background", nature:"soft outdoor background"};
   const OUTFIT_MAP={
     blazer:"tailored blazer",
     shirt:"button-up shirt",
-    tee:"plain t-shirt, regular fit",
-    athleisure:"athletic top"
+    tee:"fitted tee",
+    athleisure:"sleeveless fitted tank top"
   };
   const subject = n.gender==="man" ? "man" : "woman";
   const outfit  = OUTFIT_MAP[n.outfitKey];
   const hair    = n.hairLength==="bald" ? "clean-shaven head" : `${n.hairLength} ${n.hairColor} hair`;
   const moodMap = { neutral:"neutral expression", friendly:"friendly expression", confident:"confident look", cool:"calm composed look", serious:"serious expression", approachable:"approachable slight smile" };
   const mood    = moodMap[n.mood] || "neutral expression";
-  const framing = n.includeHips ? "waist-up" : "head-and-shoulders";
+  const framing = n.includeHips ? "waist-up" : "shoulders-up";
+
+  const chestW  = { small:"subtle chest profile", medium:"balanced chest profile", large:"fuller chest profile" };
+  const chestM  = { small:"slim chest",           medium:"balanced chest",        large:"broad chest" };
+  const hips    = { small:"narrow hips",          medium:"balanced hips",         large:"fuller hips" };
+  const chest   = (n.gender==="woman" ? chestW : chestM)[n.bustSize];
+  const hipsD   = hips[n.buttSize];
 
   return [
     `photorealistic instagram influencer aesthetic portrait, youthful adult (25–35) ${subject}`,
-    `${hair}, ${n.eyeColor} eyes, ${n.skin} skin`,
+    `${n.skin} skin, ${n.bodyType} build`,
+    `${hair}, ${n.eyeColor} eyes`,
     `wearing ${outfit}`,
+    chest, n.includeHips ? hipsD : null,
     `${mood}, looking at camera`,
     BG_MAP[n.background],
-    "soft studio lighting, studio-quality retouching, 85mm portrait look",
+    "soft beauty lighting, studio-quality retouching, 85mm portrait look, shallow depth of field",
     `${framing}, clean framing, natural skin texture`,
     "no watermark, no text, no celebrity likeness"
   ].filter(Boolean).join(", ");
-}
-
-/* --------------------- Negative prompt (soft) ------------------- */
-// N’empêche pas le décolleté. Vise l’explicite dur uniquement.
-const NEG_BASE = [
-  "nsfw","explicit","sexual","porn","erotic","lewd",
-  "nude","naked","topless","bottomless",
-  "nipples","areola",
-  "see-through","sheer","transparent fabric",
-  "underwear","lingerie","fetish","bdsm",
-  "sexual act","minors","child","underage","loli",
-  "gore","violence","blood"
-];
-function buildNegatives(userNeg) {
-  const set = new Set(NEG_BASE);
-  if (typeof userNeg === "string" && userNeg.trim()) {
-    for (const t of userNeg.split(/[,\n]/)) { const s=t.trim(); if (s) set.add(s); }
-  }
-  return Array.from(set).join(", ");
 }
 
 /* --------------------- Provider (HTTP GET fast) ----------------- */
@@ -159,7 +155,7 @@ async function readImageResponse(res){
   return { bytes, ctype: ctype.includes("png") ? "image/png" : ctype.includes("webp") ? "image/webp" : "image/jpeg" };
 }
 
-function buildProviderURL({ prompt, width, height, seed, negative_prompt }){
+function buildProviderURL({ prompt, width, height, seed, safe, negative_prompt }){
   const qs = new URLSearchParams({
     model: "flux",
     width: String(width),
@@ -170,8 +166,8 @@ function buildProviderURL({ prompt, width, height, seed, negative_prompt }){
     nofeed: "true",
     enhance: PREVIEW_ENHANCE ? "true" : "false",
     quality: "medium",
+    ...(typeof safe === "string" ? { safe } : {}), // "false" par défaut fixé plus bas
     negative_prompt: String(negative_prompt || "") // jamais "undefined"
-    // NOTE: pas de "safe" ici
   }).toString();
   return `${POL_ENDPOINT}/${encodeURIComponent(prompt)}?${qs}`;
 }
@@ -218,12 +214,11 @@ export default async function handler(req, res){
   // Normalisation
   const n = normalizeForm(body);
 
-  // Fast par défaut
+  // Vitesse / dimensions
   const strict = toBool(body.strict);
   const fastDefault = !strict;
   const fast = toBool(body.fast ?? fastDefault);
 
-  // Dims
   let [W,H] = (fast ? (SIZE_FAST[n.ratio]||[576,576]) : (SIZE_HQ[n.ratio]||[896,896]));
   const pxDims = body.px ? dimsFromPx(body.px, n.ratio) : null;
   if (pxDims) [W,H] = pxDims; else if (!strict && !body.px) [W,H] = dimsFromPx(384, n.ratio);
@@ -232,25 +227,29 @@ export default async function handler(req, res){
   const prompt = ok(body.prompt) ? String(body.prompt) : buildPrompt(n);
   const seed   = Number.isFinite(Number(body.seed)) ? Math.floor(Number(body.seed)) : deriveSeed(body.seed, n, "ig|85mm");
 
-  // Negative prompt (soft)
-  const neg = buildNegatives(body.negative_prompt);
+  // safe=false par défaut (important pour looks mode/décolleté)
+  let safeStr = "false";
+  if (typeof body.safe !== "undefined") safeStr = toBool(body.safe) ? "true" : "false";
 
-  // PREVIEW JSON — rapide (front)
+  // Negative prompt : optionnel (on ne bride pas par défaut)
+  const neg = ok(body.negative_prompt) ? String(body.negative_prompt) : "";
+
+  // PREVIEW JSON — rapide
   const isProxy = toBool(body.proxy);
+  const provider_url = buildProviderURL({ prompt, width: W, height: H, seed, safe: safeStr, negative_prompt: neg });
+
   if (!isProxy) {
-    const provider_url = buildProviderURL({ prompt, width: W, height: H, seed, negative_prompt: neg });
     res.setHeader("content-type","application/json");
     return res.status(200).json({ ok:true, mode:"preview", provider_url, width:W, height:H, seed, fast });
   }
 
   // PROXY — binaire (Figma)
   try {
-    const url = buildProviderURL({ prompt, width: W, height: H, seed, negative_prompt: neg });
-    const { bytes, ctype } = await fetchProviderBinary(url);
+    const { bytes, ctype } = await fetchProviderBinary(provider_url);
     const out = ctype.includes("jpeg") ? bytes : await toJPEG(bytes);
     res.setHeader("content-type","image/jpeg");
     res.setHeader("cache-control","no-store");
-    res.setHeader("x-neg-length", String(neg.length));
+    res.setHeader("x-safe", safeStr);
     return res.status(200).send(out);
   } catch (e) {
     res.setHeader("content-type","application/json");
