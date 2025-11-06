@@ -1,9 +1,12 @@
-// /api/v1-preview.mjs — HOTFIX STABLE (Vercel Serverless, no export config)
-// Previews only (no storage). Modes:
+// /api/v1-preview.mjs — Photoglow v1 (previews only, no storage)
+// Modes:
 //  - Preview JSON  : { ok, mode:"preview", provider_url, width, height, seed, fast }
-//  - Proxy (Figma) : proxy:true  → image/jpeg binaire
-// SAFE est forcé OFF côté serveur.
+//  - Proxy (Figma) : proxy:true → image/jpeg binaire
+// SAFE est forcé OFF côté serveur. Negative prompt anti close-up.
 
+export const config = { runtime: "nodejs", maxDuration: 25 };
+
+/* ----------------------------- CORS ----------------------------- */
 function setCORS(req, res) {
   const origin = req.headers.origin;
   const allow = (!origin || origin === "null") ? "null" : origin;
@@ -14,6 +17,7 @@ function setCORS(req, res) {
   res.setHeader("access-control-max-age", "86400");
 }
 
+/* ------------------------------ ENV ----------------------------- */
 const POL_TOKEN       = process.env.POLLINATIONS_TOKEN || "";
 const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true";
 const MIN_IMAGE_BYTES = Number(process.env.MIN_IMAGE_BYTES || 1024);
@@ -22,6 +26,7 @@ const SAFETY_MARGIN_S = 3;
 const TIME_BUDGET_MS  = Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000);
 const POL_TIMEOUT_MS  = Math.max(4000, Math.min(TIME_BUDGET_MS - 1500, 15000));
 
+/* ---------------------------- Helpers --------------------------- */
 const ok     = v => typeof v === "string" && v.trim().length > 0;
 const toBool = v => v === true || v === "true" || v === 1 || v === "1";
 const clamp  = (n, min, max) => Math.max(min, Math.min(max, Math.floor(Number(n) || 0)));
@@ -41,6 +46,7 @@ async function fetchWithTimeout(url, init={}, timeoutMs=POL_TIMEOUT_MS){
   try { return await fetch(url, { ...init, signal: ac.signal }); } finally { clearTimeout(t); }
 }
 
+// quick content sniff
 const isJPEG = b => b.length>3  && b[0]===0xFF && b[1]===0xD8 && b[2]===0xFF;
 const isPNG  = b => b.length>8  && b[0]===0x89 && b[1]===0x50 && b[2]===0x4E && b[3]===0x47 && b[4]===0x0D && b[5]===0x0A && b[6]===0x1A && b[7]===0x0A;
 const isWEBP = b => b.length>12 && b.slice(0,4).toString()==="RIFF" && b.slice(8,12).toString()==="WEBP";
@@ -63,11 +69,14 @@ async function readImageResponse(res) {
     const preview = bytes.toString("utf8", 0, Math.min(bytes.length, 200));
     throw new Error(`pollinations_unexpected_${ctype}_len${bytes.length}_${preview}`);
   }
-  if (bytes.length < MIN_IMAGE_BYTES) { /* on tolère */ }
-  return { bytes, ctype: "image/jpeg" }; // on renvoie tel quel sans transcodage
+  if (bytes.length < MIN_IMAGE_BYTES) {
+    // tolère petits JPEG
+  }
+  // On renvoie tel quel (on pose content-type image/jpeg côté réponse proxy)
+  return { bytes, ctype: "image/jpeg" };
 }
 
-/* ------------ Domain: attributes & normalization --------------- */
+/* ---------------------- Domain: attributes ---------------------- */
 const BG      = ["studio","office","city","nature"];
 const OUTFIT  = ["blazer","shirt","tee","athleisure"];
 const RATIO   = ["1:1","3:4"];
@@ -77,25 +86,13 @@ const HAIRLEN = ["short","medium","long","bald"];
 const HAIRCOL = ["black","brown","blonde","red","gray","none"];
 const EYES    = ["brown","blue","green","hazel","gray"];
 const BODY    = ["athletic","slim","average","curvy"];
-const BUST    = ["small","medium","large"];
+const BUST    = ["small","medium","large"];    // femmes
 const BUTT    = ["small","medium","large"];
 const MOOD    = ["neutral","friendly","confident","cool","serious","approachable"];
-const FRAME   = ["hs","cu","wu"];
+const FRAME   = ["hs","cu","wu"];              // head-shoulders / chest-up / waist-up
 const NECK    = ["crew","vneck","scoop","plunge","strapless","sleeveless"];
 
-function fnv1a32(str){ let h=0x811c9dc5>>>0;
-  for(let i=0;i<str.length;i++){ h^=str.charCodeAt(i); h=(h+((h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24)))>>>0; }
-  return h>>>0;
-}
-function deriveSeedFromKey(key){ return fnv1a32("PGv1|" + key); }
-function randomSeed(){
-  try {
-    const u=new Uint32Array(1);
-    if (globalThis.crypto?.getRandomValues) { globalThis.crypto.getRandomValues(u); return u[0]>>>0; }
-  } catch {}
-  return (Math.floor(Math.random()*0xffffffff))>>>0;
-}
-
+/* -------------------- Normalisation + seed ---------------------- */
 function normalize(raw) {
   const f = raw && typeof raw === "object" ? raw : {};
   const gender     = GENDER.includes(f.gender) ? f.gender : "woman";
@@ -107,7 +104,9 @@ function normalize(raw) {
   let   hair_color = HAIRCOL.includes(f.hair_color) ? f.hair_color : "brown";
   if (hair_length === "bald") hair_color = "none";
   const eye_color  = EYES.includes(f.eye_color) ? f.eye_color : "brown";
-  let   body_type  = BODY.includes(f.body_type) ? f.body_type : ((f.body_type==="muscular"||f.body_type==="fit") ? "athletic" : "average");
+  let   body_type  = BODY.includes(f.body_type) ? f.body_type : (
+                      (f.body_type==="muscular"||f.body_type==="fit") ? "athletic" : "average"
+                    );
   let   bust_size  = BUST.includes(f.bust_size) ? f.bust_size : "medium";
   if (f.bust_size === "average") bust_size = "medium";
   let   butt_size  = BUTT.includes(f.butt_size) ? f.butt_size : "medium";
@@ -127,8 +126,10 @@ function normalize(raw) {
   const shuffle    = toBool(f.shuffle);
   const negative_prompt = ok(f.negative_prompt) ? String(f.negative_prompt) : "";
 
-  const keyParts = { ratio, px, gender, background, outfit, skin_tone, hair_length, hair_color,
-                     eye_color, body_type, bust_size, butt_size, mood, framing, neckline: neckline || "-" };
+  const keyParts = {
+    ratio, px, gender, background, outfit, skin_tone, hair_length, hair_color,
+    eye_color, body_type, bust_size, butt_size, mood, framing, neckline: neckline || "-"
+  };
   const key = JSON.stringify(keyParts);
 
   let seed = Number.isFinite(Number(f.seed)) ? Math.floor(Number(f.seed)) : undefined;
@@ -140,10 +141,30 @@ function normalize(raw) {
            negative_prompt, seed, key };
 }
 
+function fnv1a32(str){ let h=0x811c9dc5>>>0;
+  for(let i=0;i<str.length;i++){ h^=str.charCodeAt(i); h=(h+((h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24)))>>>0; }
+  return h>>>0;
+}
+function deriveSeedFromKey(key){ return fnv1a32("PGv1|" + key); }
+function randomSeed(){
+  try {
+    const u=new Uint32Array(1);
+    if (globalThis.crypto?.getRandomValues) { globalThis.crypto.getRandomValues(u); return u[0]>>>0; }
+  } catch {}
+  return (Math.floor(Math.random()*0xffffffff))>>>0;
+}
+
 /* ------------------------ Prompt builder ------------------------ */
 function buildPrompt(n, customPrompt){
   if (ok(customPrompt)) return customPrompt.trim();
-  const bgMap = { studio:"white studio background", office:"modern office background", city:"subtle city background", nature:"soft outdoor background" };
+
+  const bgMap = {
+    studio: "white studio background",
+    office: "modern office background",
+    city:   "subtle city background",
+    nature: "soft outdoor background"
+  };
+
   const framingTxt = n.framing === "wu"
     ? "waist-up framing (upper body visible, include both shoulders and arms), medium shot, balanced headroom"
     : n.framing === "cu"
@@ -153,13 +174,15 @@ function buildPrompt(n, customPrompt){
   let outfitText = n.outfit;
   if (n.gender === "woman") {
     if (n.outfit === "athleisure") {
-      outfitText = (n.neckline === "vneck" || n.neckline === "scoop")
-        ? "sleeveless fitted tank top, tasteful low neckline (v-neck / scoop), subtle cleavage"
-        : (n.neckline === "plunge" || n.neckline === "strapless")
-        ? "fashion top with plunge/strapless design, tasteful low neckline, subtle cleavage"
-        : (n.neckline === "sleeveless")
-        ? "sleeveless fitted tank top"
-        : "fitted athletic top";
+      if (n.neckline === "vneck" || n.neckline === "scoop") {
+        outfitText = "sleeveless fitted tank top, tasteful low neckline (v-neck / scoop), subtle cleavage";
+      } else if (n.neckline === "plunge" || n.neckline === "strapless") {
+        outfitText = "fashion top with plunge/strapless design, tasteful low neckline, subtle cleavage";
+      } else if (n.neckline === "sleeveless") {
+        outfitText = "sleeveless fitted tank top";
+      } else {
+        outfitText = "fitted athletic top";
+      }
     } else if (n.outfit === "shirt") {
       outfitText = (n.neckline === "vneck") ? "fitted blouse with modest v-neck" : "fitted blouse";
     } else if (n.outfit === "tee") {
@@ -174,14 +197,18 @@ function buildPrompt(n, customPrompt){
     if (n.outfit === "athleisure") outfitText = "athletic top";
   }
 
-  const moodMap = { neutral:"neutral expression", friendly:"friendly expression", confident:"confident look", cool:"calm composed look", serious:"serious expression", approachable:"approachable slight smile" };
+  const moodMap = {
+    neutral:"neutral expression", friendly:"friendly expression",
+    confident:"confident look",  cool:"calm composed look",
+    serious:"serious expression", approachable:"approachable slight smile"
+  };
   const subject = n.gender === "man" ? "man" : "woman";
-  const hair = n.hair_length === "bald" ? "clean-shaven head" : `${n.hair_length} ${n.hair_color} hair`;
+  const hair = (n.hair_length === "bald") ? "clean-shaven head" : `${n.hair_length} ${n.hair_color} hair`;
   const bodyMap = { slim:"slim", athletic:"athletic", curvy:"curvy", average:"average" };
 
   const chestW  = { small:"subtle chest profile", medium:"balanced chest profile", large:"fuller chest profile" };
-  const chestM  = { small:"slim chest", medium:"balanced chest", large:"broad chest" };
-  const hips    = { small:"narrow hips", medium:"balanced hips", large:"fuller hips" };
+  const chestM  = { small:"slim chest",          medium:"balanced chest",          large:"broad chest" };
+  const hips    = { small:"narrow hips",         medium:"balanced hips",          large:"fuller hips" };
   const chest   = (n.gender === "woman" ? chestW : chestM)[n.bust_size] || (n.gender==="woman" ? "balanced chest profile" : "balanced chest");
   const hipsD   = hips[n.butt_size] || "balanced hips";
 
@@ -207,6 +234,7 @@ function defaultNegative(n, customNeg){
 
 /* --------------------- Provider: Pollinations ------------------- */
 const POL_ENDPOINT = "https://image.pollinations.ai/prompt";
+
 function buildProviderURL({ prompt, width, height, seed, safe, negative_prompt }) {
   const s = Number.isFinite(seed) ? (seed >>> 0) : 123456789;
   const qs = new URLSearchParams({
@@ -218,12 +246,13 @@ function buildProviderURL({ prompt, width, height, seed, safe, negative_prompt }
     nologo: "true",
     nofeed: "true",
     enhance: PREVIEW_ENHANCE ? "true" : "false",
-    safe: "false", // OFF forcé
+    safe: "false", // OFF forcé côté serveur
     quality: "medium",
     negative_prompt: String(negative_prompt || "")
   }).toString();
   return `${POL_ENDPOINT}/${encodeURIComponent(prompt)}?${qs}`;
 }
+
 async function fetchProviderBinary(url){
   const headers = { Accept:"image/*", "User-Agent":"Photoglow-Preview/1.0" };
   if (POL_TOKEN) headers.Authorization = `Bearer ${POL_TOKEN}`;
@@ -233,28 +262,29 @@ async function fetchProviderBinary(url){
 
 /* ------------------------------ API ----------------------------- */
 export default async function handler(req, res){
+  setCORS(req, res);
+  if (req.method === "OPTIONS") return res.status(204).end();
+
+  if (req.method === "GET") {
+    res.setHeader("content-type","application/json");
+    res.setHeader("x-safe","0");
+    return res.status(200).json({
+      ok:true, endpoint:"/api/v1-preview",
+      notes:"preview only (no storage), proxy for Figma",
+      defaults:{ fast:true, safe:false, px:384, ratio:"1:1", framing:"hs" }
+    });
+  }
+
+  if (req.method !== "POST") {
+    res.setHeader("content-type","application/json");
+    return res.status(405).json({ ok:false, error:"method_not_allowed" });
+  }
+
+  let body = req.body;
+  if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+  if (!body || typeof body !== "object") body = {};
+
   try {
-    setCORS(req, res);
-    if (req.method === "OPTIONS") return res.status(204).end();
-
-    if (req.method === "GET") {
-      res.setHeader("x-safe","0");
-      return res.status(200).json({
-        ok:true, endpoint:"/api/v1-preview",
-        notes:"preview only (no storage), proxy for Figma",
-        defaults:{ fast:true, safe:false, px:384, ratio:"1:1", framing:"hs" }
-      });
-    }
-
-    if (req.method !== "POST") {
-      res.setHeader("content-type","application/json");
-      return res.status(405).json({ ok:false, error:"method_not_allowed" });
-    }
-
-    let body = req.body;
-    if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
-    if (!body || typeof body !== "object") body = {};
-
     const n = normalize(body);
     const [W,H] = dimsFromPx(n.px, n.ratio);
     const prompt = buildPrompt(n, body.prompt);
@@ -291,8 +321,7 @@ export default async function handler(req, res){
     });
 
   } catch (e) {
-    // trace dans les logs Vercel
-    console.error("v1-preview FATAL:", e);
+    console.error("v1-preview error:", e);
     res.setHeader("content-type","application/json");
     res.setHeader("x-safe","0");
     return res.status(500).json({ ok:false, error:"server_error", message:String(e).slice(0,200) });
