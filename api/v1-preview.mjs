@@ -6,9 +6,9 @@
 //
 // Objectifs : vitesse, cadrage contrôlé (hs|cu|wu), seeds réutilisables, femme/homme,
 // poitrine/décolleté côté femme. Aucune persistance. "safe" = false (FORCÉ côté serveur).
-// Negative prompt anti close-up.
+// Negative prompt anti close-up. Qualité “ultra-clean” par défaut.
 //
-// ENV optionnels: POLLINATIONS_TOKEN, PREVIEW_ENHANCE, MAX_FUNCTION_S, MIN_IMAGE_BYTES
+// ENV optionnels: POLLINATIONS_TOKEN, PREVIEW_ENHANCE, MAX_FUNCTION_S, MIN_IMAGE_BYTES, PREVIEW_MIN_PX
 export const config = { runtime: "nodejs", maxDuration: 25 };
 
 /* ----------------------------- CORS ----------------------------- */
@@ -25,13 +25,14 @@ function setCORS(req, res) {
 }
 
 /* ------------------------------ ENV ----------------------------- */
-const POL_TOKEN       = process.env.POLLINATIONS_TOKEN || "";
-const PREVIEW_ENHANCE = (process.env.PREVIEW_ENHANCE ?? "false") === "true";
-const MIN_IMAGE_BYTES = Number(process.env.MIN_IMAGE_BYTES || 1024);
-const MAX_FUNCTION_S  = Number(process.env.MAX_FUNCTION_S || 25);
-const SAFETY_MARGIN_S = 3;
-const TIME_BUDGET_MS  = Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000);
-const POL_TIMEOUT_MS  = Math.max(4000, Math.min(TIME_BUDGET_MS - 1500, 15000));
+const POL_TOKEN        = process.env.POLLINATIONS_TOKEN || "";
+const PREVIEW_ENHANCE  = (process.env.PREVIEW_ENHANCE ?? "false") === "true";
+const MIN_IMAGE_BYTES  = Number(process.env.MIN_IMAGE_BYTES || 1024);
+const MAX_FUNCTION_S   = Number(process.env.MAX_FUNCTION_S || 25);
+const PREVIEW_MIN_PX   = Number(process.env.PREVIEW_MIN_PX || 512);   // ← qualité minimale 512px
+const SAFETY_MARGIN_S  = 3;
+const TIME_BUDGET_MS   = Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000);
+const POL_TIMEOUT_MS   = Math.max(4000, Math.min(TIME_BUDGET_MS - 1500, 15000));
 
 /* ---------------------------- Helpers --------------------------- */
 const ok     = v => typeof v === "string" && v.trim().length > 0;
@@ -118,7 +119,7 @@ function normalize(raw) {
   let   ratio      = RATIO.includes(f.ratio) ? f.ratio : "1:1";
   const skin_tone  = SKIN.includes(f.skin_tone) ? f.skin_tone : (f.skin_tone === "olive" ? "medium" : "medium");
 
-  // Defaults de longueur de cheveux par genre
+  // Defaults “visuels corrects” par genre (évite cheveux trop courts par défaut chez la femme)
   let hair_length  = HAIRLEN.includes(f.hair_length) ? f.hair_length : (gender === "woman" ? "long" : "short");
   let hair_color   = HAIRCOL.includes(f.hair_color) ? f.hair_color : "brown";
   if (hair_length === "bald") hair_color = "none";
@@ -139,10 +140,13 @@ function normalize(raw) {
   // neckline (femmes)
   const neckline   = NECK.includes(f.neckline) ? f.neckline : undefined;
 
-  const px         = clamp(f.px ?? 384, 128, 1024);
+  // QUALITÉ ULTRA-CLEAN: px min imposé côté serveur (par défaut 512)
+  let px           = clamp(f.px ?? PREVIEW_MIN_PX, 128, 1024);
+  if (px < PREVIEW_MIN_PX) px = PREVIEW_MIN_PX;
+
   const fast       = f.fast !== undefined ? toBool(f.fast) : true;
 
-  // IMPORTANT : on FORCE le safe à false (le client est ignoré)
+  // IMPORTANT : FORCE safe=false (le client est ignoré)
   const safe       = false;
 
   const shuffle    = toBool(f.shuffle);
@@ -196,7 +200,7 @@ function buildPrompt(n, customPrompt) {
     ? "chest-up framing (upper torso and both shoulders visible), medium camera distance, balanced headroom"
     : "head-and-shoulders framing (both shoulders visible, small headroom), medium camera distance";
 
-  // Outfit + neckline (femmes → contrôle du décolleté avec wording fashion)
+  // Outfit + neckline (femmes → wording fashion)
   let outfitText = n.outfit;
   if (n.gender === "woman") {
     if (n.outfit === "athleisure") {
@@ -273,17 +277,27 @@ function buildProviderURL({ prompt, width, height, seed, safe, negative_prompt }
     nofeed: "true",
     enhance: PREVIEW_ENHANCE ? "true" : "false",
     safe: safe ? "true" : "false",
-    quality: "medium",
+    quality: "medium", // laisser "medium" ; la netteté vient du px et de enhance
     negative_prompt: String(negative_prompt || "")
   }).toString();
   return `${POL_ENDPOINT}/${encodeURIComponent(prompt)}?${qs}`;
 }
 
-async function fetchProviderBinary(url){
+/* -------- Retry provider (même seed, backoff court, ultra-rapide) -------- */
+async function fetchProviderBinaryWithRetry(url, tries = 2){
   const headers = { Accept:"image/*", "User-Agent":"Photoglow-Preview/1.0" };
   if (POL_TOKEN) headers.Authorization = `Bearer ${POL_TOKEN}`;
-  const res = await fetchWithTimeout(url, { method:"GET", headers }, POL_TIMEOUT_MS);
-  return await readImageResponse(res);
+  let lastErr;
+  for (let i = 0; i <= tries; i++) {
+    try {
+      const res = await fetchWithTimeout(url, { method:"GET", headers }, POL_TIMEOUT_MS);
+      return await readImageResponse(res);
+    } catch (e){
+      lastErr = e;
+      if (i < tries) await new Promise(r => setTimeout(r, 300 * (i+1))); // backoff
+    }
+  }
+  throw lastErr;
 }
 
 /* ------------------------------ API ----------------------------- */
@@ -295,7 +309,7 @@ export default async function handler(req, res){
     return res.status(200).json({
       ok:true, endpoint:"/api/v1-preview",
       notes:"preview only (no storage), proxy for Figma",
-      defaults:{ fast:true, safe:false, px:384, ratio:"1:1", framing:"hs" }
+      defaults:{ fast:true, safe:false, px:PREVIEW_MIN_PX, ratio:"1:1", framing:"hs" }
     });
   }
 
@@ -333,7 +347,7 @@ export default async function handler(req, res){
     // 3) Proxy or Preview
     if (toBool(body.proxy)) {
       try {
-        const { bytes, ctype } = await fetchProviderBinary(provider_url);
+        const { bytes, ctype } = await fetchProviderBinaryWithRetry(provider_url); // ← retry
         const out = ctype.includes("jpeg") ? bytes : await toJPEG(bytes);
         res.setHeader("content-type","image/jpeg");
         res.setHeader("cache-control","no-store");
