@@ -4,9 +4,8 @@
 //  - Preview (default): JSON { ok, mode:"preview", provider_url, width, height, seed, fast }
 //  - Proxy (Figma)    : proxy:true → image/jpeg binaire
 //
-// Objectifs : vitesse, cadrage contrôlé (hs|cu|wu), seeds réutilisables, femme/homme,
-// poitrine/décolleté côté femme. Aucune persistance. "safe" = false (FORCÉ côté serveur).
-// Negative prompt anti close-up. Qualité “ultra-clean” par défaut.
+// Objectifs : vitesse, cadrage contrôlé (CU), seed ultra-stable (par genre),
+// "safe" = false (FORCÉ), negative anti close-up, qualité “ultra-clean” (px min 512).
 //
 // ENV optionnels: POLLINATIONS_TOKEN, PREVIEW_ENHANCE, MAX_FUNCTION_S, MIN_IMAGE_BYTES, PREVIEW_MIN_PX
 export const config = { runtime: "nodejs", maxDuration: 25 };
@@ -20,7 +19,7 @@ function setCORS(req, res) {
   res.setHeader("access-control-allow-methods", "POST,OPTIONS,GET");
   res.setHeader("access-control-allow-headers", "content-type, authorization, idempotency-key");
   res.setHeader("access-control-max-age", "86400");
-  // Expose custom headers for Figma (Origin:null)
+  // Expose headers for Figma (Origin:null)
   res.setHeader("Access-Control-Expose-Headers", "x-provider-url, x-provider-dims, x-seed, x-framing, x-ratio, x-px");
 }
 
@@ -29,7 +28,7 @@ const POL_TOKEN        = process.env.POLLINATIONS_TOKEN || "";
 const PREVIEW_ENHANCE  = (process.env.PREVIEW_ENHANCE ?? "false") === "true";
 const MIN_IMAGE_BYTES  = Number(process.env.MIN_IMAGE_BYTES || 1024);
 const MAX_FUNCTION_S   = Number(process.env.MAX_FUNCTION_S || 25);
-const PREVIEW_MIN_PX   = Number(process.env.PREVIEW_MIN_PX || 512);   // ← qualité minimale 512px
+const PREVIEW_MIN_PX   = Number(process.env.PREVIEW_MIN_PX || 512);   // qualité min 512px
 const SAFETY_MARGIN_S  = 3;
 const TIME_BUDGET_MS   = Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000);
 const POL_TIMEOUT_MS   = Math.max(4000, Math.min(TIME_BUDGET_MS - 1500, 15000));
@@ -107,7 +106,7 @@ const BODY    = ["athletic","slim","average","curvy"];
 const BUST    = ["small","medium","large"];    // femmes
 const BUTT    = ["small","medium","large"];
 const MOOD    = ["neutral","friendly","confident","cool","serious","approachable"];
-const FRAME   = ["hs","cu","wu"];              // head-shoulders / chest-up / waist-up
+const FRAME   = ["hs","cu","wu"];
 const NECK    = ["crew","vneck","scoop","plunge","strapless","sleeveless"];
 
 /* -------------------- Normalisation + seed ---------------------- */
@@ -119,7 +118,7 @@ function normalize(raw) {
   let   ratio      = RATIO.includes(f.ratio) ? f.ratio : "1:1";
   const skin_tone  = SKIN.includes(f.skin_tone) ? f.skin_tone : (f.skin_tone === "olive" ? "medium" : "medium");
 
-  // Defaults “visuels corrects” par genre (évite cheveux trop courts par défaut chez la femme)
+  // Defaults visuels corrects par genre
   let hair_length  = HAIRLEN.includes(f.hair_length) ? f.hair_length : (gender === "woman" ? "long" : "short");
   let hair_color   = HAIRCOL.includes(f.hair_color) ? f.hair_color : "brown";
   if (hair_length === "bald") hair_color = "none";
@@ -133,38 +132,31 @@ function normalize(raw) {
   if (f.butt_size === "average") butt_size = "medium";
   const mood       = MOOD.includes(f.mood) ? f.mood : "confident";
 
-  // cadrage
+  // cadrage (sera surverrouillé CU + 1:1 au handler)
   const framing    = FRAME.includes((f.framing || "").toLowerCase()) ? (f.framing || "hs").toLowerCase() : "hs";
-  if (!ok(f.ratio) && framing === "wu") ratio = "3:4"; // ratio auto
+  if (!ok(f.ratio) && framing === "wu") ratio = "3:4";
 
-  // neckline (femmes)
   const neckline   = NECK.includes(f.neckline) ? f.neckline : undefined;
 
-  // QUALITÉ ULTRA-CLEAN: px min imposé côté serveur (par défaut 512)
   let px           = clamp(f.px ?? PREVIEW_MIN_PX, 128, 1024);
   if (px < PREVIEW_MIN_PX) px = PREVIEW_MIN_PX;
 
   const fast       = f.fast !== undefined ? toBool(f.fast) : true;
-
-  // IMPORTANT : FORCE safe=false (le client est ignoré)
-  const safe       = false;
+  const safe       = false; // force
 
   const shuffle    = toBool(f.shuffle);
   const negative_prompt = ok(f.negative_prompt) ? String(f.negative_prompt) : "";
 
-  const keyParts = {
-    ratio, px, gender, background, outfit, skin_tone, hair_length, hair_color,
-    eye_color, body_type, bust_size, butt_size, mood, framing, neckline: neckline || "-",
-  };
-  const key = JSON.stringify(keyParts);
-
-  let seed = Number.isFinite(Number(f.seed)) ? Math.floor(Number(f.seed)) : undefined;
-  if (!seed) seed = shuffle ? randomSeed() : deriveSeedFromKey(key);
+  // Seed ultra-stable : par genre (optionnellement random si shuffle=true)
+  let seed;
+  if (Number.isFinite(Number(f.seed)))      seed = Math.floor(Number(f.seed));
+  else if (shuffle)                         seed = randomSeed();
+  else                                      seed = deriveSeedFromKey("gender:" + gender);
 
   return {
     gender, background, outfit, ratio, skin_tone, hair_length, hair_color, eye_color,
     body_type, bust_size, butt_size, mood, framing, neckline, px, fast, safe,
-    negative_prompt, seed, key
+    negative_prompt, seed
   };
 }
 
@@ -187,18 +179,9 @@ function randomSeed(){
 function buildPrompt(n, customPrompt) {
   if (ok(customPrompt)) return customPrompt.trim();
 
-  const bgMap = {
-    studio: "white studio background",
-    office: "modern office background",
-    city:   "subtle city background",
-    nature: "soft outdoor background"
-  };
+  const bgMap = { studio:"white studio background", office:"modern office background", city:"subtle city background", nature:"soft outdoor background" };
 
-  const framingTxt = n.framing === "wu"
-    ? "waist-up framing (upper body visible, include both shoulders and arms), medium shot, balanced headroom"
-    : n.framing === "cu"
-    ? "chest-up framing (upper torso and both shoulders visible), medium camera distance, balanced headroom"
-    : "head-and-shoulders framing (both shoulders visible, small headroom), medium camera distance";
+  const framingTxt = "chest-up framing (upper torso and both shoulders visible), medium camera distance, balanced headroom";
 
   // Outfit + neckline (femmes → wording fashion)
   let outfitText = n.outfit;
@@ -218,7 +201,7 @@ function buildPrompt(n, customPrompt) {
     } else if (n.outfit === "blazer") {
       outfitText = "tailored blazer over fitted top";
     }
-  } else { // man
+  } else {
     if (n.outfit === "tee") outfitText = "fitted crew-neck tee";
     if (n.outfit === "shirt") outfitText = "fitted shirt";
     if (n.outfit === "blazer") outfitText = "tailored blazer";
@@ -236,7 +219,7 @@ function buildPrompt(n, customPrompt) {
   const bodyMap = { slim:"slim", athletic:"athletic", curvy:"curvy", average:"average" };
 
   const chestW  = { small:"subtle chest profile", medium:"balanced chest profile", large:"fuller chest profile" };
-  const chestM  = { small:"slim chest",          medium:"balanced chest",         large:"broad chest" };
+  const chestM  = { small:"slim chest", medium:"balanced chest", large:"broad chest" };
   const hips    = { small:"narrow hips", medium:"balanced hips", large:"fuller hips" };
   const chest   = (n.gender === "woman" ? chestW : chestM)[n.bust_size] || (n.gender==="woman" ? "balanced chest profile" : "balanced chest");
   const hipsD   = hips[n.butt_size] || "balanced hips";
@@ -247,7 +230,7 @@ function buildPrompt(n, customPrompt) {
     `youthful adult (25–35) ${subject}, ${n.skin_tone} skin, ${bodyMap[n.body_type]} build`,
     `${hair}, ${n.eye_color} eyes`,
     `wearing ${outfitText}`,
-    chest, (n.framing !== "hs" ? hipsD : null),
+    chest, /* CU: optionnel */ (n.framing !== "hs" ? hipsD : null),
     `${moodMap[n.mood] || "confident look"}, looking at camera`,
     bgMap[n.background] || "white studio background",
     "sharp focus, micro-contrast, detailed eyes, natural skin texture",
@@ -277,16 +260,16 @@ function buildProviderURL({ prompt, width, height, seed, safe, negative_prompt }
     nofeed: "true",
     enhance: PREVIEW_ENHANCE ? "true" : "false",
     safe: safe ? "true" : "false",
-    quality: "medium", // laisser "medium" ; la netteté vient du px et de enhance
+    quality: "medium", // la netteté vient surtout du px et d'enhance
     negative_prompt: String(negative_prompt || "")
   }).toString();
   return `${POL_ENDPOINT}/${encodeURIComponent(prompt)}?${qs}`;
 }
 
-/* -------- Retry provider (même seed, backoff court, ultra-rapide) -------- */
+/* -------- Retry provider (même seed, backoff court) -------- */
 async function fetchProviderBinaryWithRetry(url, tries = 2){
   const headers = { Accept:"image/*", "User-Agent":"Photoglow-Preview/1.0" };
-  if (POL_TOKEN) headers.Authorization = `Bearer ${POL_TOKEN}`;
+  if (POLL_TOKEN) headers.Authorization = `Bearer ${POLL_TOKEN}`;
   let lastErr;
   for (let i = 0; i <= tries; i++) {
     try {
@@ -309,7 +292,7 @@ export default async function handler(req, res){
     return res.status(200).json({
       ok:true, endpoint:"/api/v1-preview",
       notes:"preview only (no storage), proxy for Figma",
-      defaults:{ fast:true, safe:false, px:PREVIEW_MIN_PX, ratio:"1:1", framing:"hs" }
+      defaults:{ fast:true, safe:false, px:PREVIEW_MIN_PX, ratio:"1:1", framing:"cu" }
     });
   }
 
@@ -324,17 +307,19 @@ export default async function handler(req, res){
   if (!body || typeof body !== "object") body = {};
 
   try {
-    // 1) normalize & build
+    // 1) normalize & verrous qualité/variabilité
     const n = normalize(body);
-    // Sécurité supplémentaire : SAFE TOUJOURS FALSE
-    n.safe = false;
+    n.safe    = false;     // force
+    n.ratio   = "1:1";     // lock
+    n.framing = "cu";      // lock (Chest-Up unique)
+    if (n.px < PREVIEW_MIN_PX) n.px = PREVIEW_MIN_PX; // min 512
 
     const [W,H] = dimsFromPx(n.px, n.ratio);
     const prompt = buildPrompt(n, body.prompt);
     const negative_prompt = defaultNegative(n, body.negative_prompt);
     const seed = n.seed;
 
-    // 2) Build URL + expose headers pour debug/front
+    // 2) Build URL + expose headers (debug/front)
     const provider_url = buildProviderURL({ prompt, width: W, height: H, seed, safe: false, negative_prompt });
     res.setHeader("x-provider-url", provider_url);
     res.setHeader("x-provider-dims", `${W}x${H}`);
@@ -347,7 +332,7 @@ export default async function handler(req, res){
     // 3) Proxy or Preview
     if (toBool(body.proxy)) {
       try {
-        const { bytes, ctype } = await fetchProviderBinaryWithRetry(provider_url); // ← retry
+        const { bytes, ctype } = await fetchProviderBinaryWithRetry(provider_url);
         const out = ctype.includes("jpeg") ? bytes : await toJPEG(bytes);
         res.setHeader("content-type","image/jpeg");
         res.setHeader("cache-control","no-store");
