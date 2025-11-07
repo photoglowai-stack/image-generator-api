@@ -106,7 +106,7 @@ const BODY    = ["athletic","slim","average","curvy"];
 const BUST    = ["small","medium","large"];    // femmes
 const BUTT    = ["small","medium","large"];
 const MOOD    = ["neutral","friendly","confident","cool","serious","approachable"];
-const FRAME   = ["hs","cu","wu"];
+const FRAME   = ["hs","cu","wu"];              // (verrouillé CU au handler)
 const NECK    = ["crew","vneck","scoop","plunge","strapless","sleeveless"];
 
 /* -------------------- Normalisation + seed ---------------------- */
@@ -132,26 +132,33 @@ function normalize(raw) {
   if (f.butt_size === "average") butt_size = "medium";
   const mood       = MOOD.includes(f.mood) ? f.mood : "confident";
 
-  // cadrage (sera surverrouillé CU + 1:1 au handler)
+  // cadrage (sera verrouillé CU + 1:1 au handler)
   const framing    = FRAME.includes((f.framing || "").toLowerCase()) ? (f.framing || "hs").toLowerCase() : "hs";
   if (!ok(f.ratio) && framing === "wu") ratio = "3:4";
 
   const neckline   = NECK.includes(f.neckline) ? f.neckline : undefined;
 
+  // QUALITÉ ULTRA-CLEAN: px min imposé côté serveur (par défaut 512)
   let px           = clamp(f.px ?? PREVIEW_MIN_PX, 128, 1024);
   if (px < PREVIEW_MIN_PX) px = PREVIEW_MIN_PX;
 
   const fast       = f.fast !== undefined ? toBool(f.fast) : true;
-  const safe       = false; // force
+
+  // IMPORTANT : FORCE safe=false (le client est ignoré)
+  const safe       = false;
 
   const shuffle    = toBool(f.shuffle);
   const negative_prompt = ok(f.negative_prompt) ? String(f.negative_prompt) : "";
 
-  // Seed ultra-stable : par genre (optionnellement random si shuffle=true)
-  let seed;
-  if (Number.isFinite(Number(f.seed)))      seed = Math.floor(Number(f.seed));
-  else if (shuffle)                         seed = randomSeed();
-  else                                      seed = deriveSeedFromKey("gender:" + gender);
+  // Seed par défaut = déterministe sur l’ensemble des attributs (stable visage)
+  const keyParts = {
+    ratio, px, gender, background, outfit, skin_tone, hair_length, hair_color,
+    eye_color, body_type, bust_size, butt_size, mood, framing, neckline: neckline || "-"
+  };
+  const key = JSON.stringify(keyParts);
+
+  let seed = Number.isFinite(Number(f.seed)) ? Math.floor(Number(f.seed)) : undefined;
+  if (!seed) seed = shuffle ? randomSeed() : deriveSeedFromKey(key);
 
   return {
     gender, background, outfit, ratio, skin_tone, hair_length, hair_color, eye_color,
@@ -181,6 +188,7 @@ function buildPrompt(n, customPrompt) {
 
   const bgMap = { studio:"white studio background", office:"modern office background", city:"subtle city background", nature:"soft outdoor background" };
 
+  // Verrou CU (Chest-Up)
   const framingTxt = "chest-up framing (upper torso and both shoulders visible), medium camera distance, balanced headroom";
 
   // Outfit + neckline (femmes → wording fashion)
@@ -230,7 +238,7 @@ function buildPrompt(n, customPrompt) {
     `youthful adult (25–35) ${subject}, ${n.skin_tone} skin, ${bodyMap[n.body_type]} build`,
     `${hair}, ${n.eye_color} eyes`,
     `wearing ${outfitText}`,
-    chest, /* CU: optionnel */ (n.framing !== "hs" ? hipsD : null),
+    chest, /* CU: optionnel */ (/* verrou CU */ false ? hipsD : null),
     `${moodMap[n.mood] || "confident look"}, looking at camera`,
     bgMap[n.background] || "white studio background",
     "sharp focus, micro-contrast, detailed eyes, natural skin texture",
@@ -260,7 +268,7 @@ function buildProviderURL({ prompt, width, height, seed, safe, negative_prompt }
     nofeed: "true",
     enhance: PREVIEW_ENHANCE ? "true" : "false",
     safe: safe ? "true" : "false",
-    quality: "medium", // la netteté vient surtout du px et d'enhance
+    quality: "medium", // netteté principale via px + enhance
     negative_prompt: String(negative_prompt || "")
   }).toString();
   return `${POL_ENDPOINT}/${encodeURIComponent(prompt)}?${qs}`;
@@ -269,7 +277,7 @@ function buildProviderURL({ prompt, width, height, seed, safe, negative_prompt }
 /* -------- Retry provider (même seed, backoff court) -------- */
 async function fetchProviderBinaryWithRetry(url, tries = 2){
   const headers = { Accept:"image/*", "User-Agent":"Photoglow-Preview/1.0" };
-  if (POLL_TOKEN) headers.Authorization = `Bearer ${POLL_TOKEN}`;
+  if (POL_TOKEN) headers.Authorization = `Bearer ${POL_TOKEN}`; // ← FIX: POL_TOKEN (pas POLL_TOKEN)
   let lastErr;
   for (let i = 0; i <= tries; i++) {
     try {
