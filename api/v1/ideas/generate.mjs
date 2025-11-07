@@ -1,4 +1,4 @@
-// /api/v1/ideas/generate.mjs — FINAL INLINE (single bucket, with category fields)
+// /api/v1/ideas/generate.mjs — FINAL INLINE (single bucket, with category fields, BUCKET_IDEAS priority)
 // Pollinations → Supabase Storage (public or signed), table ideas_examples (optional trace)
 export const config = { runtime: "nodejs" };
 
@@ -17,8 +17,9 @@ function setCORS(req, res, opts = {}) {
 const SUPABASE_URL              = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
-// Un SEUL bucket (par défaut ai_gallery). Compat avec BUCKET_IMAGES ou BUCKET_GALLERY.
-const BUCKET = process.env.BUCKET_IMAGES || process.env.BUCKET_GALLERY || "ai_gallery";
+// Bucket DÉDIÉ à cette route (on ignore BUCKET_IMAGES ici)
+// Priorité: BUCKET_IDEAS > BUCKET_GALLERY > "ai_gallery"
+const BUCKET = process.env.BUCKET_IDEAS || process.env.BUCKET_GALLERY || "ai_gallery";
 
 // Visibilité unique : public (URL directe) ou privé (URL signée)
 const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC ?? "true") === "true";
@@ -104,7 +105,13 @@ export default async function handler(req, res) {
       has_supabase_url: Boolean(SUPABASE_URL),
       has_service_role: Boolean(SUPABASE_SERVICE_ROLE_KEY),
       bucket: BUCKET,
-      output_public: OUTPUT_PUBLIC
+      output_public: OUTPUT_PUBLIC,
+      bucket_env_values: {
+        BUCKET_IDEAS: process.env.BUCKET_IDEAS || null,
+        BUCKET_GALLERY: process.env.BUCKET_GALLERY || null,
+        BUCKET_IMAGES: process.env.BUCKET_IMAGES || null
+      },
+      bucket_selected_precedence: "BUCKET_IDEAS > BUCKET_GALLERY > 'ai_gallery' (BUCKET_IMAGES ignored in this route)"
     });
   }
 
