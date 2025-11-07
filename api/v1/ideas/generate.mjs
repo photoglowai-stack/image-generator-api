@@ -1,4 +1,4 @@
-// /api/v1/ideas/generate.mjs — FINAL INLINE (no local imports)
+// /api/v1/ideas/generate.mjs — FINAL INLINE (single bucket, with category fields)
 // Pollinations → Supabase Storage (public or signed), table ideas_examples (optional trace)
 export const config = { runtime: "nodejs" };
 
@@ -17,14 +17,11 @@ function setCORS(req, res, opts = {}) {
 const SUPABASE_URL              = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
-// Nouveaux buckets (séparation preview vs gallery)
-const BUCKET_PREVIEWS = process.env.BUCKET_PREVIEWS || process.env.BUCKET_IMAGES || process.env.PREVIEW_BUCKET || "ai_previews";
-const BUCKET_GALLERY  = process.env.BUCKET_GALLERY  || "ai_gallery";
+// Un SEUL bucket (par défaut ai_gallery). Compat avec BUCKET_IMAGES ou BUCKET_GALLERY.
+const BUCKET = process.env.BUCKET_IMAGES || process.env.BUCKET_GALLERY || "ai_gallery";
 
-// Compat visibilité : spécifique par bucket, sinon fallback sur OUTPUT_PUBLIC
-const OUTPUT_PUBLIC_FALLBACK   = (process.env.OUTPUT_PUBLIC || "true") === "true";
-const OUTPUT_PUBLIC_PREVIEWS   = (process.env.OUTPUT_PUBLIC_PREVIEWS ?? (OUTPUT_PUBLIC_FALLBACK ? "true" : "false")) === "true";
-const OUTPUT_PUBLIC_GALLERY    = (process.env.OUTPUT_PUBLIC_GALLERY  ?? (OUTPUT_PUBLIC_FALLBACK ? "true" : "false")) === "true";
+// Visibilité unique : public (URL directe) ou privé (URL signée)
+const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC ?? "true") === "true";
 
 const POL_TOKEN     = process.env.POLLINATIONS_TOKEN || "";
 const SIGNED_TTL_S  = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
@@ -106,10 +103,8 @@ export default async function handler(req, res) {
       endpoint: "/api/v1/ideas/generate",
       has_supabase_url: Boolean(SUPABASE_URL),
       has_service_role: Boolean(SUPABASE_SERVICE_ROLE_KEY),
-      bucket_previews: BUCKET_PREVIEWS,
-      bucket_gallery: BUCKET_GALLERY,
-      output_public_previews: OUTPUT_PUBLIC_PREVIEWS,
-      output_public_gallery: OUTPUT_PUBLIC_GALLERY
+      bucket: BUCKET,
+      output_public: OUTPUT_PUBLIC
     });
   }
 
@@ -127,8 +122,15 @@ export default async function handler(req, res) {
     width = 1024,
     height = 1024,
     model = "flux",
-    persist = false,
-    collection
+    persist = false,          // false => previews/, true => outputs/ (dans le même bucket)
+    collection,
+
+    // ---- champs catégories (facultatifs) ----
+    category_id,              // ex: "ai-headshots"
+    prompt_index,             // ex: 1, 2, 3...
+    prompt_title,             // ex: "Studio corporate"
+    prompt_text,              // ex: "professional corporate headshot..."
+    aspect_ratio              // ex: "1:1" | "3:4" | ...
   } = body || {};
 
   if (!slug || !prompt) {
@@ -142,12 +144,11 @@ export default async function handler(req, res) {
 
   const safeSlug = sanitize(slug);
   const coll     = collection ? sanitize(collection) : "";
-  const targetBucket = persist ? BUCKET_GALLERY : BUCKET_PREVIEWS;
-  const baseFolder   = persist
+  const baseFolder = persist
     ? (coll ? `outputs/${coll}`  : "outputs")
     : (coll ? `previews/${coll}` : "previews");
 
-  console.log(`🧾 request | ideas.generate | slug=${safeSlug} | bucket=${targetBucket} | persist=${persist}`);
+  console.log(`🧾 request | ideas.generate | slug=${safeSlug} | bucket=${BUCKET} | persist=${persist}`);
 
   try {
     // 1) Génération via Pollinations
@@ -159,12 +160,12 @@ export default async function handler(req, res) {
     const keyPath = `${baseFolder}/ideas/${safeSlug}/${today()}/${Date.now()}.${ext}`;
 
     // 2) Upload Storage
-    const bucketCheck = await sb.storage.getBucket(targetBucket);
+    const bucketCheck = await sb.storage.getBucket(BUCKET);
     if (!bucketCheck?.data) {
-      return res.status(500).json({ success: false, error: "bucket_not_found", bucket: targetBucket });
+      return res.status(500).json({ success: false, error: "bucket_not_found", bucket: BUCKET });
     }
 
-    const up = await sb.storage.from(targetBucket).upload(keyPath, bytes, {
+    const up = await sb.storage.from(BUCKET).upload(keyPath, bytes, {
       contentType: ctype || "image/jpeg",
       upsert: true,
       cacheControl: CACHE_CONTROL
@@ -173,27 +174,32 @@ export default async function handler(req, res) {
       return res.status(500).json({ success: false, error: "upload_failed", details: String(up.error).slice(0,200) });
     }
 
-    // 3) URL publique / signée (par bucket)
-    const makePublic = persist ? OUTPUT_PUBLIC_GALLERY : OUTPUT_PUBLIC_PREVIEWS;
+    // 3) URL publique / signée (unique)
     let imageUrl;
-    if (makePublic) {
-      const { data } = sb.storage.from(targetBucket).getPublicUrl(keyPath);
+    if (OUTPUT_PUBLIC) {
+      const { data } = sb.storage.from(BUCKET).getPublicUrl(keyPath);
       imageUrl = data.publicUrl;
     } else {
-      const { data, error } = await sb.storage.from(targetBucket).createSignedUrl(keyPath, SIGNED_TTL_S);
+      const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(keyPath, SIGNED_TTL_S);
       if (error) return res.status(500).json({ success: false, error: "signed_url_failed", details: String(error).slice(0,200) });
       imageUrl = data.signedUrl;
     }
     console.log(`📦 stored | ${imageUrl}`);
 
-    // 4) Trace (non bloquant) — tentative enrichie puis fallback minimal
+    // 4) Trace (non bloquant) — tentative enrichie (catégories) puis fallback minimal
     const traceEnriched = {
       slug: safeSlug,
       image_url: imageUrl,
       provider: "pollinations",
-      bucket: targetBucket,
+      bucket: BUCKET,
       key_path: keyPath,
       persist,
+      // ---- champs catégories ----
+      prompt_title: prompt_title || null,
+      prompt_text:  prompt_text  || prompt || null,
+      category_id:  category_id  || null,
+      prompt_index: Number.isFinite(+prompt_index) ? +prompt_index : null,
+      aspect_ratio: aspect_ratio || null,
       created_at: new Date().toISOString()
     };
 
@@ -224,7 +230,7 @@ export default async function handler(req, res) {
       success: true,
       slug: safeSlug,
       image_url: imageUrl,
-      bucket: targetBucket,
+      bucket: BUCKET,
       persist
     });
   } catch (e) {
