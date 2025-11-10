@@ -64,10 +64,8 @@ function fitByAspect({ width, height, aspect_ratio }) {
   let W = clamp(width || 1536, 64, MAX_DIM);
   let H = clamp(height || 1536, 64, MAX_DIM);
   if (ar) {
-    // si une seule dimension est fournie, calcule l'autre
     if (width && !height) H = clamp(Math.round((W * ar.h) / ar.w), 64, MAX_DIM);
     if (!width && height) W = clamp(Math.round((H * ar.w) / ar.h), 64, MAX_DIM);
-    // si les deux existent, on garde (on suppose que Figma a déjà validé)
   }
   return { W, H };
 }
@@ -146,6 +144,38 @@ function getSb() {
 
 function shortHash(s) {
   return crypto.createHash("sha256").update(String(s)).digest("hex").slice(0, 16);
+}
+
+// Trouve un objet existant `${baseId}.(jpg|png|webp)` dans `folder` (search + fallback pagination)
+async function findExistingKey(sb, bucket, folder, baseId) {
+  // Essai avec "search" (si dispo)
+  let list = await sb.storage.from(bucket).list(folder, { search: baseId, limit: 100 });
+  if (!list.error && Array.isArray(list.data)) {
+    const f = list.data.find((x) => x.name === `${baseId}.jpg` || x.name === `${baseId}.png` || x.name === `${baseId}.webp`);
+    if (f) return `${folder}/${f.name}`;
+  }
+  // Fallback pagination
+  const limit = 100;
+  let offset = 0;
+  while (true) {
+    const { data, error } = await sb.storage.from(bucket).list(folder, { limit, offset });
+    if (error || !Array.isArray(data) || data.length === 0) break;
+    const f = data.find((x) => x.name === `${baseId}.jpg` || x.name === `${baseId}.png` || x.name === `${baseId}.webp`);
+    if (f) return `${folder}/${f.name}`;
+    if (data.length < limit) break;
+    offset += limit;
+  }
+  return null;
+}
+
+async function publicOrSignedUrl(sb, bucket, key) {
+  if (OUTPUT_PUBLIC) {
+    const { data } = sb.storage.from(bucket).getPublicUrl(key);
+    return data.publicUrl;
+  }
+  const { data, error } = await sb.storage.from(bucket).createSignedUrl(key, SIGNED_TTL_S);
+  if (error) throw error;
+  return data.signedUrl;
 }
 
 /* ---------- Handler ---------- */
@@ -257,39 +287,20 @@ export default async function handler(req, res) {
     }
 
     // 1) Idempotence côté storage : si persist + fichier déjà présent → retourne l'URL sans regénérer
-    let existingExt = null;
     if (persist) {
-      const { data: list, error: listErr } = await sb.storage.from(BUCKET).list(folder, {
-        search: baseId, // renvoie les fichiers qui contiennent baseId
-        limit: 100,
-      });
-      if (!listErr && Array.isArray(list)) {
-        const found = list.find(
-          (f) => f.name === `${baseId}.jpg` || f.name === `${baseId}.png` || f.name === `${baseId}.webp`
-        );
-        if (found) {
-          existingExt = found.name.split(".").pop();
-          const keyPathExisting = `${folder}/${found.name}`;
-          let imageUrl;
-          if (OUTPUT_PUBLIC) {
-            const { data } = sb.storage.from(BUCKET).getPublicUrl(keyPathExisting);
-            imageUrl = data.publicUrl;
-          } else {
-            const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(keyPathExisting, SIGNED_TTL_S);
-            if (error) throw error;
-            imageUrl = data.signedUrl;
-          }
-          return res.status(200).json({
-            success: true,
-            slug: safeSlug,
-            image_url: imageUrl,
-            bucket: BUCKET,
-            persist,
-            idempotent: true,
-            category_id: category_id || null,
-            style: style || null,
-          });
-        }
+      const existingKey = await findExistingKey(sb, BUCKET, folder, baseId);
+      if (existingKey) {
+        const imageUrl = await publicOrSignedUrl(sb, BUCKET, existingKey);
+        return res.status(200).json({
+          success: true,
+          slug: safeSlug,
+          image_url: imageUrl,
+          bucket: BUCKET,
+          persist,
+          idempotent: true,
+          category_id: category_id || null,
+          style: style || null,
+        });
       }
     }
 
@@ -315,18 +326,7 @@ export default async function handler(req, res) {
     }
 
     // 5) URL publique / signée (unique)
-    let imageUrl;
-    if (OUTPUT_PUBLIC) {
-      const { data } = sb.storage.from(BUCKET).getPublicUrl(keyPath);
-      imageUrl = data.publicUrl;
-    } else {
-      const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(keyPath, SIGNED_TTL_S);
-      if (error)
-        return res
-          .status(500)
-          .json({ success: false, error: "signed_url_failed", details: String(error).slice(0, 200) });
-      imageUrl = data.signedUrl;
-    }
+    const imageUrl = await publicOrSignedUrl(sb, BUCKET, keyPath);
     console.log(`📦 stored | ${imageUrl}`);
 
     // 6) Trace (non bloquant) — tentative enrichie (catégories) puis fallback minimal
