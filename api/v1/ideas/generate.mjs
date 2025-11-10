@@ -1,5 +1,6 @@
 // /api/v1/ideas/generate.mjs — Production-ready (idempotence, retries, HQ defaults)
 // Pollinations → Supabase Storage (public or signed), trace ideas_examples
+// Storage layout configurable (no "ideas/" segment)
 export const config = { runtime: "nodejs" };
 
 import { createClient } from "@supabase/supabase-js";
@@ -34,6 +35,11 @@ const POL_TIMEOUT_MS = Number(process.env.POLLINATIONS_TIMEOUT_MS || 60000);
 // Storage
 const SIGNED_TTL_S = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
 const CACHE_CONTROL = String(process.env.IDEAS_CACHE_CONTROL_S || 31536000);
+
+// Layout configurable
+const OUTPUTS_ROOT = process.env.OUTPUTS_ROOT || "outputs";
+const PREVIEWS_ROOT = process.env.PREVIEWS_ROOT || "previews";
+const ADD_DATE_SUBFOLDER = (process.env.ADD_DATE_SUBFOLDER ?? "true") === "true";
 
 // Divers
 const MAX_DIM = 1792;
@@ -159,6 +165,11 @@ export default async function handler(req, res) {
       has_service_role: Boolean(SUPABASE_SERVICE_ROLE_KEY),
       bucket: BUCKET,
       output_public: OUTPUT_PUBLIC,
+      path_policy: {
+        outputs_root: OUTPUTS_ROOT,
+        previews_root: PREVIEWS_ROOT,
+        add_date_subfolder: String(ADD_DATE_SUBFOLDER),
+      },
       bucket_env_values: {
         BUCKET_IDEAS: process.env.BUCKET_IDEAS || null,
         BUCKET_GALLERY: process.env.BUCKET_GALLERY || null,
@@ -221,10 +232,11 @@ export default async function handler(req, res) {
 
   const safeSlug = sanitize(slug);
   const coll = collection ? sanitize(collection) : "";
-  const baseFolder = persist ? (coll ? `outputs/${coll}` : "outputs") : (coll ? `previews/${coll}` : "previews");
 
-  // Dossier final du jour
-  const folder = `${baseFolder}/ideas/${safeSlug}/${today()}`;
+  // --- Storage layout (configurable), plus de "ideas/"
+  const root = persist ? OUTPUTS_ROOT : PREVIEWS_ROOT;
+  const baseFolder = coll ? `${root}/${coll}` : root;
+  const folder = `${baseFolder}/${safeSlug}${ADD_DATE_SUBFOLDER ? `/${today()}` : ""}`;
 
   // Nom de base déterministe : priorité à la clé client, sinon hash des paramètres
   const baseId =
@@ -252,7 +264,9 @@ export default async function handler(req, res) {
         limit: 100,
       });
       if (!listErr && Array.isArray(list)) {
-        const found = list.find((f) => f.name === `${baseId}.jpg` || f.name === `${baseId}.png` || f.name === `${baseId}.webp`);
+        const found = list.find(
+          (f) => f.name === `${baseId}.jpg` || f.name === `${baseId}.png` || f.name === `${baseId}.webp`
+        );
         if (found) {
           existingExt = found.name.split(".").pop();
           const keyPathExisting = `${folder}/${found.name}`;
@@ -307,7 +321,10 @@ export default async function handler(req, res) {
       imageUrl = data.publicUrl;
     } else {
       const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(keyPath, SIGNED_TTL_S);
-      if (error) return res.status(500).json({ success: false, error: "signed_url_failed", details: String(error).slice(0, 200) });
+      if (error)
+        return res
+          .status(500)
+          .json({ success: false, error: "signed_url_failed", details: String(error).slice(0, 200) });
       imageUrl = data.signedUrl;
     }
     console.log(`📦 stored | ${imageUrl}`);
