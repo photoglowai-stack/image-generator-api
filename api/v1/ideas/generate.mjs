@@ -63,8 +63,9 @@ const OUTPUTS_ROOT = "categories";     // <- always this for persist=true
 const PREVIEWS_ROOT = "previews";      // previews restent possibles
 const ADD_DATE_SUBFOLDER = false;      // never append date
 
-// Divers
-const MAX_DIM = 1792;
+// Divers (↑ pilotable par ENV)
+const MAX_DIM = Number(process.env.POLLINATIONS_MAX_DIM || 1792);
+const MIN_PROVIDER_PIXELS = Number(process.env.MIN_PROVIDER_PIXELS || 2_000_000);
 
 /* ---------- Helpers ---------- */
 const sanitize = (s) =>
@@ -104,56 +105,103 @@ async function fetchWithTimeout(url, init, ms) {
   }
 }
 
-async function callPollinations({ prompt, width = 1024, height = 1024, model = "flux", timeoutMs = POL_TIMEOUT_MS }) {
+/* ---------- Sniffer dimensions (PNG/JPEG/WEBP) ---------- */
+function sniffImageSize(buf) {
+  try {
+    // PNG
+    if (buf.slice(0,8).equals(Buffer.from([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]))) {
+      return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    }
+    // JPEG (SOF0/SOF2)
+    if (buf[0] === 0xFF && buf[1] === 0xD8) {
+      let i = 2;
+      while (i < buf.length) {
+        if (buf[i] !== 0xFF) { i++; continue; }
+        const marker = buf[i+1];
+        const len = buf.readUInt16BE(i+2);
+        if (marker === 0xC0 || marker === 0xC2) {
+          const h = buf.readUInt16BE(i+5);
+          const w = buf.readUInt16BE(i+7);
+          return { width: w, height: h };
+        }
+        i += 2 + len;
+      }
+    }
+    // WEBP (RIFF/WEBP VP8X)
+    if (buf.slice(0,4).toString() === "RIFF" && buf.slice(8,12).toString() === "WEBP") {
+      const idx = buf.indexOf(Buffer.from("VP8X"));
+      if (idx > 0) {
+        const w = 1 + (buf[idx+12] | (buf[idx+13]<<8) | (buf[idx+14]<<16));
+        const h = 1 + (buf[idx+15] | (buf[idx+16]<<8) | (buf[idx+17]<<16));
+        if (w>0 && h>0) return { width: w, height: h };
+      }
+    }
+  } catch {}
+  return null;
+}
+
+/* ---------- Provider (Pollinations) avec seed, Accept PNG, retry qualité ---------- */
+async function callPollinations({
+  prompt,
+  width = 1024,
+  height = 1024,
+  model = "flux",
+  timeoutMs = POL_TIMEOUT_MS,
+  seed
+}) {
   const W = clamp(width, 64, MAX_DIM);
   const H = clamp(height, 64, MAX_DIM);
 
-  const q = new URLSearchParams({
-    model,
-    width: String(W),
-    height: String(H),
-    private: "true",
-    enhance: "true",
-    nologo: "true",
-  }).toString();
+  async function oneCall(s) {
+    const q = new URLSearchParams({
+      model,
+      width: String(W),
+      height: String(H),
+      private: "true",
+      enhance: "true",
+      nologo: "true",
+      ...(s ? { seed: String(s) } : {})
+    }).toString();
 
-  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
-  const headers = {
-    ...(POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {}),
-    Accept: "image/jpeg,image/png,image/webp;q=0.9,*/*;q=0.8",
-    "User-Agent": "Photoglow-API/ideas-generator",
-  };
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
+    const headers = {
+      ...(POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {}),
+      // Préférence PNG (si serveurs négocient le format)
+      Accept: "image/png,image/jpeg;q=0.8,image/webp;q=0.6,*/*;q=0.5",
+      "User-Agent": "Photoglow-API/ideas-generator"
+    };
 
-  // Petit retry (2 tentatives)
-  let lastErr;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const r = await fetchWithTimeout(url, { headers }, timeoutMs);
-      if (!r.ok) {
-        const msg = await r.text().catch(() => "");
-        throw new Error(`pollinations_failed ${r.status} ${r.statusText} | ${msg.slice(0, 200)}`);
-      }
-      const ctype = (r.headers.get("content-type") || "").toLowerCase();
-      if (!/image\/(jpeg|jpg|png|webp)/i.test(ctype)) {
-        const msg = await r.text().catch(() => "");
-        throw new Error(`unexpected_content_type ${ctype || "(empty)"} | ${msg.slice(0, 200)}`);
-      }
-      const bytes = Buffer.from(await r.arrayBuffer());
-      const norm =
-        /image\/(jpeg|jpg)/i.test(ctype)
-          ? "image/jpeg"
-          : /image\/png/i.test(ctype)
-          ? "image/png"
-          : /image\/webp/i.test(ctype)
-          ? "image/webp"
-          : "application/octet-stream";
-      return { bytes, ctype: norm };
-    } catch (e) {
-      lastErr = e;
-      await new Promise((res) => setTimeout(res, 400 * attempt));
+    const r = await fetchWithTimeout(url, { headers }, timeoutMs);
+    if (!r.ok) {
+      const msg = await r.text().catch(() => "");
+      throw new Error(`pollinations_failed ${r.status} ${r.statusText} | ${msg.slice(0,200)}`);
     }
+    const ctype = (r.headers.get("content-type") || "").toLowerCase();
+    if (!/image\/(png|jpeg|jpg|webp)/i.test(ctype)) {
+      const msg = await r.text().catch(() => "");
+      throw new Error(`unexpected_content_type ${ctype || "(empty)"} | ${msg.slice(0,200)}`);
+    }
+    const bytes = Buffer.from(await r.arrayBuffer());
+    const dims = sniffImageSize(bytes) || {};
+    const norm =
+      /image\/png/i.test(ctype) ? "image/png" :
+      /image\/webp/i.test(ctype) ? "image/webp" :
+      /image\/(jpeg|jpg)/i.test(ctype) ? "image/jpeg" :
+      "application/octet-stream";
+    return { bytes, ctype: norm, provider_w: dims.width || null, provider_h: dims.height || null };
   }
-  throw lastErr;
+
+  // tentative 1 (seed anti-cache)
+  const s1 = seed ?? Math.floor(Math.random() * 1e9);
+  let out = await oneCall(s1);
+
+  // seuil qualité (~2–3 Mpx). Si trop petit => 2ème tentative autre seed
+  const ok = out.provider_w && out.provider_h && (out.provider_w * out.provider_h >= MIN_PROVIDER_PIXELS);
+  if (!ok) {
+    const s2 = Math.floor(Math.random() * 1e9);
+    try { out = await oneCall(s2); } catch {}
+  }
+  return out;
 }
 
 function getSb() {
@@ -192,10 +240,12 @@ export default async function handler(req, res) {
         outputs_root: OUTPUTS_ROOT,
         previews_root: PREVIEWS_ROOT,
         add_date_subfolder: String(ADD_DATE_SUBFOLDER),
-        lock: true, // hard-lock actif
+        lock: true,
         persist_ignores_collection: true
       },
       pollinations_timeout_ms: POL_TIMEOUT_MS,
+      max_dim: MAX_DIM,
+      min_provider_pixels: MIN_PROVIDER_PIXELS,
       now: new Date().toISOString()
     });
   }
@@ -245,8 +295,6 @@ export default async function handler(req, res) {
   const safeSlug = sanitize(slug);
 
   // ---- HARD-LOCKED FOLDERS ----
-  // Persist => categories/<slug>
-  // Preview => previews/<slug> (on autorise les previews à rester ailleurs)
   const root = persist ? OUTPUTS_ROOT : PREVIEWS_ROOT;
   const folder = `${root}/${safeSlug}`; // aucune date, aucune collection
 
@@ -300,12 +348,12 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2) Appel provider
+    // 2) Appel provider (avec seed anti-cache + retry qualité)
     const tP0 = Date.now();
-    const { bytes, ctype } = await callPollinations({ prompt, width: W, height: H, model });
+    const { bytes, ctype, provider_w, provider_h } = await callPollinations({ prompt, width: W, height: H, model });
     const tP1 = Date.now();
     tProv += tP1 - tP0;
-    console.log("🧪 provider.call | ok");
+    console.log("🧪 provider.call | ok", provider_w, "x", provider_h, "| bytes=", bytes.length);
 
     // 3) Nom final (extension réelle)
     const ext =
@@ -365,7 +413,17 @@ export default async function handler(req, res) {
       image_url: imageUrl,
       bucket: BUCKET,
       persist,
-      metrics: { total_ms: total, idem_ms: tIdem, provider_ms: tProv, upload_ms: tUp, idempotent: false }
+      metrics: {
+        total_ms: total,
+        idem_ms: tIdem,
+        provider_ms: tProv,
+        upload_ms: tUp,
+        idempotent: false,
+        image_bytes: bytes.length,
+        ctype,
+        provider_w,
+        provider_h
+      }
     });
   } catch (e) {
     console.error("❌ failed | ideas.generate", e);
