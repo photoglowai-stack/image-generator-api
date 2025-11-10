@@ -1,6 +1,6 @@
 // /api/v1/ideas/generate.mjs — Production-ready (idempotence, retries, HQ defaults)
 // Pollinations → Supabase Storage (public or signed), trace ideas_examples
-// Storage layout configurable (no "ideas/" segment)
+// Storage layout configurable (no "ideas/" segment) + metrics (Server-Timing, x-processing-ms, JSON metrics)
 export const config = { runtime: "nodejs" };
 
 import { createClient } from "@supabase/supabase-js";
@@ -64,8 +64,10 @@ function fitByAspect({ width, height, aspect_ratio }) {
   let W = clamp(width || 1536, 64, MAX_DIM);
   let H = clamp(height || 1536, 64, MAX_DIM);
   if (ar) {
+    // si une seule dimension est fournie, calcule l'autre
     if (width && !height) H = clamp(Math.round((W * ar.h) / ar.w), 64, MAX_DIM);
     if (!width && height) W = clamp(Math.round((H * ar.w) / ar.h), 64, MAX_DIM);
+    // si les deux existent, on garde (on suppose que Figma a déjà validé)
   }
   return { W, H };
 }
@@ -146,40 +148,12 @@ function shortHash(s) {
   return crypto.createHash("sha256").update(String(s)).digest("hex").slice(0, 16);
 }
 
-// Trouve un objet existant `${baseId}.(jpg|png|webp)` dans `folder` (search + fallback pagination)
-async function findExistingKey(sb, bucket, folder, baseId) {
-  // Essai avec "search" (si dispo)
-  let list = await sb.storage.from(bucket).list(folder, { search: baseId, limit: 100 });
-  if (!list.error && Array.isArray(list.data)) {
-    const f = list.data.find((x) => x.name === `${baseId}.jpg` || x.name === `${baseId}.png` || x.name === `${baseId}.webp`);
-    if (f) return `${folder}/${f.name}`;
-  }
-  // Fallback pagination
-  const limit = 100;
-  let offset = 0;
-  while (true) {
-    const { data, error } = await sb.storage.from(bucket).list(folder, { limit, offset });
-    if (error || !Array.isArray(data) || data.length === 0) break;
-    const f = data.find((x) => x.name === `${baseId}.jpg` || x.name === `${baseId}.png` || x.name === `${baseId}.webp`);
-    if (f) return `${folder}/${f.name}`;
-    if (data.length < limit) break;
-    offset += limit;
-  }
-  return null;
-}
-
-async function publicOrSignedUrl(sb, bucket, key) {
-  if (OUTPUT_PUBLIC) {
-    const { data } = sb.storage.from(bucket).getPublicUrl(key);
-    return data.publicUrl;
-  }
-  const { data, error } = await sb.storage.from(bucket).createSignedUrl(key, SIGNED_TTL_S);
-  if (error) throw error;
-  return data.signedUrl;
-}
-
 /* ---------- Handler ---------- */
 export default async function handler(req, res) {
+  // [METRICS] chronos
+  const t0 = Date.now();
+  let tIdem = 0, tProv = 0, tUp = 0;
+
   setCORS(req, res, {
     allowMethods: "GET,POST,OPTIONS",
     allowHeaders: "content-type, authorization, idempotency-key",
@@ -287,25 +261,53 @@ export default async function handler(req, res) {
     }
 
     // 1) Idempotence côté storage : si persist + fichier déjà présent → retourne l'URL sans regénérer
+    let existingExt = null;
     if (persist) {
-      const existingKey = await findExistingKey(sb, BUCKET, folder, baseId);
-      if (existingKey) {
-        const imageUrl = await publicOrSignedUrl(sb, BUCKET, existingKey);
-        return res.status(200).json({
-          success: true,
-          slug: safeSlug,
-          image_url: imageUrl,
-          bucket: BUCKET,
-          persist,
-          idempotent: true,
-          category_id: category_id || null,
-          style: style || null,
-        });
+      const tA = Date.now();
+      const { data: list, error: listErr } = await sb.storage.from(BUCKET).list(folder, {
+        search: baseId, // renvoie les fichiers qui contiennent baseId
+        limit: 100,
+      });
+      tIdem += Date.now() - tA;
+
+      if (!listErr && Array.isArray(list)) {
+        const found = list.find(
+          (f) => f.name === `${baseId}.jpg` || f.name === `${baseId}.png` || f.name === `${baseId}.webp`
+        );
+        if (found) {
+          existingExt = found.name.split(".").pop();
+          const keyPathExisting = `${folder}/${found.name}`;
+          let imageUrl;
+          if (OUTPUT_PUBLIC) {
+            const { data } = sb.storage.from(BUCKET).getPublicUrl(keyPathExisting);
+            imageUrl = data.publicUrl;
+          } else {
+            const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(keyPathExisting, SIGNED_TTL_S);
+            if (error) throw error;
+            imageUrl = data.signedUrl;
+          }
+          const total = Date.now() - t0;
+          res.setHeader("server-timing", `idem;dur=${tIdem}, total;dur=${total}`);
+          res.setHeader("x-processing-ms", String(total));
+          return res.status(200).json({
+            success: true,
+            slug: safeSlug,
+            image_url: imageUrl,
+            bucket: BUCKET,
+            persist,
+            idempotent: true,
+            category_id: category_id || null,
+            style: style || null,
+            metrics: { total_ms: total, idem_ms: tIdem, provider_ms: 0, upload_ms: 0, idempotent: true }
+          });
+        }
       }
     }
 
     // 2) Appel provider
+    const tP0 = Date.now();
     const { bytes, ctype } = await callPollinations({ prompt, width: W, height: H, model });
+    tProv += Date.now() - tP0;
     console.log("🧪 provider.call | ok");
 
     // 3) Nom final (extension réelle)
@@ -314,11 +316,13 @@ export default async function handler(req, res) {
     const keyPath = `${folder}/${baseId}.${ext}`;
 
     // 4) Upload Storage
+    const tU0 = Date.now();
     const up = await sb.storage.from(BUCKET).upload(keyPath, bytes, {
       contentType: ctype || "image/jpeg",
       upsert: true,
       cacheControl: CACHE_CONTROL,
     });
+    tUp += Date.now() - tU0;
     if (up?.error) {
       return res
         .status(500)
@@ -326,7 +330,18 @@ export default async function handler(req, res) {
     }
 
     // 5) URL publique / signée (unique)
-    const imageUrl = await publicOrSignedUrl(sb, BUCKET, keyPath);
+    let imageUrl;
+    if (OUTPUT_PUBLIC) {
+      const { data } = sb.storage.from(BUCKET).getPublicUrl(keyPath);
+      imageUrl = data.publicUrl;
+    } else {
+      const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(keyPath, SIGNED_TTL_S);
+      if (error)
+        return res
+          .status(500)
+          .json({ success: false, error: "signed_url_failed", details: String(error).slice(0, 200) });
+      imageUrl = data.signedUrl;
+    }
     console.log(`📦 stored | ${imageUrl}`);
 
     // 6) Trace (non bloquant) — tentative enrichie (catégories) puis fallback minimal
@@ -353,37 +368,4 @@ export default async function handler(req, res) {
     let traceError = null;
     try {
       const ins = await sb.from("ideas_examples").insert(traceEnriched);
-      if (ins?.error) traceError = ins.error;
-    } catch (e) {
-      traceError = e;
-    }
-
-    if (traceError) {
-      console.warn("db_insert_failed_enriched, retry_minimal", traceError);
-      try {
-        await sb.from("ideas_examples").insert({
-          slug: safeSlug,
-          image_url: imageUrl,
-          provider: "pollinations",
-          created_at: new Date().toISOString(),
-        });
-      } catch (e) {
-        console.warn("db_insert_failed_minimal", e);
-      }
-    }
-
-    console.log("✅ succeeded | ideas.generate");
-    return res.status(200).json({
-      success: true,
-      slug: safeSlug,
-      image_url: imageUrl,
-      bucket: BUCKET,
-      persist,
-      category_id: category_id || null,
-      style: style || null,
-    });
-  } catch (e) {
-    console.error("❌ failed | ideas.generate", e);
-    return res.status(500).json({ success: false, error: String(e).slice(0, 200) });
-  }
-}
+      if (ins?.error) traceE
