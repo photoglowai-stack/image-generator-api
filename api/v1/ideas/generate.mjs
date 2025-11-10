@@ -15,7 +15,31 @@ function setCORS(req, res, opts = {}) {
     opts.allowHeaders || "content-type, authorization, idempotency-key"
   );
   res.setHeader("access-control-max-age", "86400");
+  // on met une valeur par défaut, mais sendJSON re-posera le content-type au besoin
   res.setHeader("content-type", "application/json");
+}
+
+/* ---------- Response helpers (compat Next API & Vercel Node) ---------- */
+function sendJSON(res, status, obj) {
+  try {
+    if (typeof res.status === "function" && typeof res.json === "function") {
+      return res.status(status).json(obj);
+    }
+  } catch {}
+  res.statusCode = status;
+  if (!res.getHeader("content-type")) {
+    res.setHeader("content-type", "application/json");
+  }
+  res.end(JSON.stringify(obj));
+}
+function endStatus(res, status = 204) {
+  try {
+    if (typeof res.status === "function" && typeof res.end === "function") {
+      return res.status(status).end();
+    }
+  } catch {}
+  res.statusCode = status;
+  res.end();
 }
 
 /* ---------- ENV (server) ---------- */
@@ -64,10 +88,8 @@ function fitByAspect({ width, height, aspect_ratio }) {
   let W = clamp(width || 1536, 64, MAX_DIM);
   let H = clamp(height || 1536, 64, MAX_DIM);
   if (ar) {
-    // si une seule dimension est fournie, calcule l'autre
     if (width && !height) H = clamp(Math.round((W * ar.h) / ar.w), 64, MAX_DIM);
     if (!width && height) W = clamp(Math.round((H * ar.w) / ar.h), 64, MAX_DIM);
-    // si les deux existent, on garde (on suppose que Figma a déjà validé)
   }
   return { W, H };
 }
@@ -158,11 +180,11 @@ export default async function handler(req, res) {
     allowMethods: "GET,POST,OPTIONS",
     allowHeaders: "content-type, authorization, idempotency-key",
   });
-  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method === "OPTIONS") return endStatus(res, 204);
 
   // Debug léger (sans exposer de secrets)
-  if (req.method === "GET" && req.query?.debug === "1") {
-    return res.status(200).json({
+  if (req.method === "GET" && (req.query?.debug === "1" || (typeof req.url === "string" && req.url.includes("debug=1")))) {
+    return sendJSON(res, 200, {
       ok: true,
       endpoint: "/api/v1/ideas/generate",
       has_supabase_url: Boolean(SUPABASE_URL),
@@ -181,11 +203,12 @@ export default async function handler(req, res) {
       },
       bucket_selected_precedence: "BUCKET_IDEAS > BUCKET_GALLERY > 'ai_gallery' (BUCKET_IMAGES ignored in this route)",
       pollinations_timeout_ms: POL_TIMEOUT_MS,
+      now: new Date().toISOString()
     });
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json({ success: false, error: "method_not_allowed" });
+    return sendJSON(res, 405, { success: false, error: "method_not_allowed" });
   }
 
   // Body tolérant
@@ -217,16 +240,17 @@ export default async function handler(req, res) {
   } = body || {};
 
   if (!slug || !prompt) {
-    return res.status(400).json({ success: false, error: "missing_slug_or_prompt" });
+    return sendJSON(res, 400, { success: false, error: "missing_slug_or_prompt" });
   }
 
   const sb = (() => {
     try {
       return getSb();
     } catch (e) {
-      throw new Error(String(e?.message || e));
+      return sendJSON(res, 500, { success: false, error: String(e?.message || e) });
     }
   })();
+  if (!sb) return; // déjà répondu 500
 
   // Cible dimensions HQ (avec cohérence ratio si fourni)
   const { W, H } = fitByAspect({ width, height, aspect_ratio });
@@ -257,7 +281,7 @@ export default async function handler(req, res) {
     // 0) Bucket check
     const bucketCheck = await sb.storage.getBucket(BUCKET);
     if (!bucketCheck?.data) {
-      return res.status(500).json({ success: false, error: "bucket_not_found", bucket: BUCKET });
+      return sendJSON(res, 500, { success: false, error: "bucket_not_found", bucket: BUCKET });
     }
 
     // 1) Idempotence côté storage : si persist + fichier déjà présent → retourne l'URL sans regénérer
@@ -289,7 +313,7 @@ export default async function handler(req, res) {
           const total = Date.now() - t0;
           res.setHeader("server-timing", `idem;dur=${tIdem}, total;dur=${total}`);
           res.setHeader("x-processing-ms", String(total));
-          return res.status(200).json({
+          return sendJSON(res, 200, {
             success: true,
             slug: safeSlug,
             image_url: imageUrl,
@@ -307,7 +331,8 @@ export default async function handler(req, res) {
     // 2) Appel provider
     const tP0 = Date.now();
     const { bytes, ctype } = await callPollinations({ prompt, width: W, height: H, model });
-    tProv += Date.now() - tP0;
+    const tP1 = Date.now();
+    tProv += tP1 - tP0;
     console.log("🧪 provider.call | ok");
 
     // 3) Nom final (extension réelle)
@@ -322,11 +347,11 @@ export default async function handler(req, res) {
       upsert: true,
       cacheControl: CACHE_CONTROL,
     });
-    tUp += Date.now() - tU0;
+    const tU1 = Date.now();
+    tUp += tU1 - tU0;
+
     if (up?.error) {
-      return res
-        .status(500)
-        .json({ success: false, error: "upload_failed", details: String(up.error).slice(0, 200) });
+      return sendJSON(res, 500, { success: false, error: "upload_failed", details: String(up.error).slice(0, 200) });
     }
 
     // 5) URL publique / signée (unique)
@@ -336,10 +361,7 @@ export default async function handler(req, res) {
       imageUrl = data.publicUrl;
     } else {
       const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(keyPath, SIGNED_TTL_S);
-      if (error)
-        return res
-          .status(500)
-          .json({ success: false, error: "signed_url_failed", details: String(error).slice(0, 200) });
+      if (error) return sendJSON(res, 500, { success: false, error: "signed_url_failed", details: String(error).slice(0, 200) });
       imageUrl = data.signedUrl;
     }
     console.log(`📦 stored | ${imageUrl}`);
@@ -368,4 +390,41 @@ export default async function handler(req, res) {
     let traceError = null;
     try {
       const ins = await sb.from("ideas_examples").insert(traceEnriched);
-      if (ins?.error) traceE
+      if (ins?.error) traceError = ins.error;
+    } catch (e) {
+      traceError = e;
+    }
+
+    if (traceError) {
+      console.warn("db_insert_failed_enriched, retry_minimal", traceError);
+      try {
+        await sb.from("ideas_examples").insert({
+          slug: safeSlug,
+          image_url: imageUrl,
+          provider: "pollinations",
+          created_at: new Date().toISOString(),
+        });
+      } catch (e) {
+        console.warn("db_insert_failed_minimal", e);
+      }
+    }
+
+    console.log("✅ succeeded | ideas.generate");
+    const total = Date.now() - t0;
+    res.setHeader("server-timing", `idem;dur=${tIdem}, provider;dur=${tProv}, upload;dur=${tUp}, total;dur=${total}`);
+    res.setHeader("x-processing-ms", String(total));
+    return sendJSON(res, 200, {
+      success: true,
+      slug: safeSlug,
+      image_url: imageUrl,
+      bucket: BUCKET,
+      persist,
+      category_id: category_id || null,
+      style: style || null,
+      metrics: { total_ms: total, idem_ms: tIdem, provider_ms: tProv, upload_ms: tUp, idempotent: false }
+    });
+  } catch (e) {
+    console.error("❌ failed | ideas.generate", e);
+    return sendJSON(res, 500, { success: false, error: String(e).slice(0, 200) });
+  }
+}
