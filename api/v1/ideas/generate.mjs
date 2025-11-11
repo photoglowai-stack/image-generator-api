@@ -2,7 +2,7 @@
 // Pollinations → Supabase Storage (public or signed), trace ideas_examples
 // HARD-LOCK STORAGE: always ai_gallery/categories/<slug>/<file> (no date, no collection for persist)
 // Metrics: Server-Timing, x-processing-ms, JSON metrics
-export const config = { runtime: "nodejs" };
+export const config = { runtime: "nodejs", maxDuration: 60 };
 
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
@@ -65,7 +65,7 @@ const ADD_DATE_SUBFOLDER = false;  // never append date
 
 // Divers (↑ pilotable par ENV)
 const MAX_DIM = Number(process.env.POLLINATIONS_MAX_DIM || 1792);
-const MIN_PROVIDER_PIXELS = Number(process.env.MIN_PROVIDER_PIXELS || 2_000_000);
+const MIN_PROVIDER_PIXELS = Number(process.env.MIN_PROVIDER_PIXELS || 3_000_000);
 
 /* ---------- Helpers ---------- */
 const sanitize = (s) =>
@@ -152,7 +152,59 @@ async function callPollinations({
   const W = clamp(width, 64, MAX_DIM);
   const H = clamp(height, 64, MAX_DIM);
 
+  const baseHeaders = {
+    ...(POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {}),
+    Accept: "image/png,image/jpeg;q=0.9,*/*;q=0.5",
+    "User-Agent": "Photoglow-API/ideas-generator",
+  };
+
+  async function parseResponse(res) {
+    if (!res.ok) {
+      const msg = await res.text().catch(() => "");
+      throw new Error(`pollinations_failed ${res.status} ${res.statusText} | ${msg.slice(0,200)}`);
+    }
+    const ctype = (res.headers.get("content-type") || "").toLowerCase();
+    if (!/image\/(png|jpeg|jpg|webp)/i.test(ctype)) {
+      const msg = await res.text().catch(() => "");
+      throw new Error(`unexpected_content_type ${ctype || "(empty)"} | ${msg.slice(0,200)}`);
+    }
+    const bytes = Buffer.from(await res.arrayBuffer());
+    const dims = sniffImageSize(bytes) || {};
+    const norm =
+      /image\/png/i.test(ctype) ? "image/png" :
+      /image\/webp/i.test(ctype) ? "image/webp" :
+      /image\/(jpeg|jpg)/i.test(ctype) ? "image/jpeg" :
+      "application/octet-stream";
+    return { bytes, ctype: norm, provider_w: dims.width || null, provider_h: dims.height || null };
+  }
+
   async function oneCall(s) {
+    const postPayload = {
+      prompt,
+      width: W,
+      height: H,
+      model,
+      private: true,
+      enhance: true,
+      nologo: true,
+      ...(s ? { seed: String(s) } : {}),
+    };
+
+    try {
+      const postRes = await fetchWithTimeout(
+        "https://image.pollinations.ai/prompt",
+        {
+          method: "POST",
+          headers: { ...baseHeaders, "content-type": "application/json" },
+          body: JSON.stringify(postPayload),
+        },
+        timeoutMs
+      );
+      return await parseResponse(postRes);
+    } catch (err) {
+      console.warn("[pollinations] POST failed → fallback GET", err?.message || err);
+    }
+
     const q = new URLSearchParams({
       model,
       width: String(W),
@@ -164,31 +216,8 @@ async function callPollinations({
     }).toString();
 
     const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
-    const headers = {
-      ...(POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {}),
-      // Préférence PNG/JPEG ; on évite de forcer le webp
-      Accept: "image/png,image/jpeg;q=0.8,image/webp;q=0.6,*/*;q=0.5",
-      "User-Agent": "Photoglow-API/ideas-generator",
-    };
-
-    const r = await fetchWithTimeout(url, { headers }, timeoutMs);
-    if (!r.ok) {
-      const msg = await r.text().catch(() => "");
-      throw new Error(`pollinations_failed ${r.status} ${r.statusText} | ${msg.slice(0,200)}`);
-    }
-    const ctype = (r.headers.get("content-type") || "").toLowerCase();
-    if (!/image\/(png|jpeg|jpg|webp)/i.test(ctype)) {
-      const msg = await r.text().catch(() => "");
-      throw new Error(`unexpected_content_type ${ctype || "(empty)"} | ${msg.slice(0,200)}`);
-    }
-    const bytes = Buffer.from(await r.arrayBuffer());
-    const dims = sniffImageSize(bytes) || {};
-    const norm =
-      /image\/png/i.test(ctype) ? "image/png" :
-      /image\/webp/i.test(ctype) ? "image/webp" :
-      /image\/(jpeg|jpg)/i.test(ctype) ? "image/jpeg" :
-      "application/octet-stream";
-    return { bytes, ctype: norm, provider_w: dims.width || null, provider_h: dims.height || null };
+    const getRes = await fetchWithTimeout(url, { headers: baseHeaders }, timeoutMs);
+    return await parseResponse(getRes);
   }
 
   // tentative 1 (seed anti-cache)
@@ -198,6 +227,11 @@ async function callPollinations({
   // seuil qualité (~2–3 Mpx). Si trop petit => 2ème tentative autre seed
   const ok = out.provider_w && out.provider_h && (out.provider_w * out.provider_h >= MIN_PROVIDER_PIXELS);
   if (!ok) {
+    console.warn("provider image too small; retrying with new seed", {
+      width: out.provider_w,
+      height: out.provider_h,
+      min_required: MIN_PROVIDER_PIXELS,
+    });
     const s2 = Math.floor(Math.random() * 1e9);
     try { out = await oneCall(s2); } catch {}
   }
