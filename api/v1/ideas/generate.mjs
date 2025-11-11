@@ -67,6 +67,13 @@ const ADD_DATE_SUBFOLDER = false;  // never append date
 const MAX_DIM = Number(process.env.POLLINATIONS_MAX_DIM || 1792);
 const MIN_PROVIDER_PIXELS = Number(process.env.MIN_PROVIDER_PIXELS || 3_000_000);
 
+/* ---------- Time budget (éviter 504 en fonction de la durée Vercel) ---------- */
+const MAX_FUNCTION_S  = Number(process.env.MAX_FUNCTION_S || 25); // durée max de ta fonction
+const SAFETY_MARGIN_S = 3; // marge pour upload + JSON + jitter
+function timeBudgetMs() {
+  return Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000);
+}
+
 /* ---------- Helpers ---------- */
 const sanitize = (s) =>
   String(s).toLowerCase().replace(/[^a-z0-9\-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
@@ -83,8 +90,9 @@ function parseAspectRatio(ratio) {
 
 function fitByAspect({ width, height, aspect_ratio }) {
   const ar = parseAspectRatio(aspect_ratio);
-  let W = clamp(width || 1536, 64, MAX_DIM);
-  let H = clamp(height || 1536, 64, MAX_DIM);
+  // Défaut 1024 (plus rapide et suffisant pour une galerie sync)
+  let W = clamp(width || 1024, 64, MAX_DIM);
+  let H = clamp(height || 1024, 64, MAX_DIM);
   if (ar) {
     if (width && !height) H = clamp(Math.round((W * ar.h) / ar.w), 64, MAX_DIM);
     if (!width && height) W = clamp(Math.round((H * ar.w) / ar.h), 64, MAX_DIM);
@@ -195,13 +203,20 @@ async function callPollinations({
   const s1 = seed ?? Math.floor(Math.random() * 1e9);
   let out = await oneCall(s1);
 
-  // seuil qualité (~2–3 Mpx). Si trop petit => 2ème tentative autre seed
-  const ok = out.provider_w && out.provider_h && (out.provider_w * out.provider_h >= MIN_PROVIDER_PIXELS);
+  // --- Seuil qualité dynamique ---
+  // On accepte l'image si >= min(MIN_PROVIDER_PIXELS, W*H*0.98).
+  // Cela évite un retry inutile quand la demande est plus petite que le seuil global.
+  const targetPx = W * H;
+  const minPx = Math.min(MIN_PROVIDER_PIXELS, Math.floor(targetPx * 0.98));
+  const ok = out.provider_w && out.provider_h && (out.provider_w * out.provider_h >= minPx);
+
   if (!ok) {
     console.warn("provider image too small; retrying with new seed", {
       width: out.provider_w,
       height: out.provider_h,
-      min_required: MIN_PROVIDER_PIXELS,
+      min_required: minPx,
+      global_min: MIN_PROVIDER_PIXELS,
+      requested: { W, H }
     });
     const s2 = Math.floor(Math.random() * 1e9);
     try { out = await oneCall(s2); } catch {}
@@ -353,9 +368,12 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2) Appel provider (avec seed anti-cache + retry qualité)
+    // 2) Appel provider (avec seed anti-cache + retry qualité) — TIME-BUDGET APPLIQUÉ
     const tP0 = Date.now();
-    const { bytes, ctype, provider_w, provider_h } = await callPollinations({ prompt, width: W, height: H, model });
+    const providerTimeout = Math.max(4000, timeBudgetMs() - 1500); // marge pour upload + JSON
+    const { bytes, ctype, provider_w, provider_h } = await callPollinations({
+      prompt, width: W, height: H, model, timeoutMs: providerTimeout
+    });
     const tP1 = Date.now();
     tProv += tP1 - tP0;
     console.log("🧪 provider.call | ok", provider_w, "x", provider_h, "| bytes=", bytes.length);
