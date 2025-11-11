@@ -1,5 +1,5 @@
 // /api/v1/ideas/generate.mjs — Production-ready (idempotence, retries, HQ defaults)
-// Pollinations → Supabase Storage (public or signed), trace ideas_examples
+// Pollinations (Enter API en priorité) → Supabase Storage, trace ideas_examples
 // HARD-LOCK STORAGE: always ai_gallery/categories/<slug>/<file> (no date, no collection for persist)
 // Metrics: Server-Timing, x-processing-ms, JSON metrics
 export const config = { runtime: "nodejs" };
@@ -50,9 +50,14 @@ const BUCKET = process.env.BUCKET_IDEAS || process.env.BUCKET_GALLERY || "ai_gal
 // Visibilité unique : public (URL directe) ou privé (URL signée)
 const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC ?? "true") === "true";
 
-// Provider
+// Provider (public)
 const POL_TOKEN = process.env.POLLINATIONS_TOKEN || "";
 const POL_TIMEOUT_MS = Number(process.env.POLLINATIONS_TIMEOUT_MS || 60000);
+
+// ENTER: Provider (Enter API)
+const USE_POLL_ENTER = (process.env.USE_POLL_ENTER ?? "false") === "true";
+const POL_ENTER_KEY  = process.env.POLLINATIONS_API_KEY || process.env.POLL_ENTER_KEY || "";
+const MAX_DIM_ENTER  = Number(process.env.MAX_DIM_ENTER || 4096);
 
 // Storage
 const SIGNED_TTL_S = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
@@ -83,11 +88,11 @@ function parseAspectRatio(ratio) {
 
 function fitByAspect({ width, height, aspect_ratio }) {
   const ar = parseAspectRatio(aspect_ratio);
-  let W = clamp(width || 1536, 64, MAX_DIM);
-  let H = clamp(height || 1536, 64, MAX_DIM);
+  let W = clamp(width || 1536, 64, (USE_POLL_ENTER && POL_ENTER_KEY) ? MAX_DIM_ENTER : MAX_DIM);
+  let H = clamp(height || 1536, 64, (USE_POLL_ENTER && POL_ENTER_KEY) ? MAX_DIM_ENTER : MAX_DIM);
   if (ar) {
-    if (width && !height) H = clamp(Math.round((W * ar.h) / ar.w), 64, MAX_DIM);
-    if (!width && height) W = clamp(Math.round((H * ar.w) / ar.h), 64, MAX_DIM);
+    if (width && !height) H = clamp(Math.round((W * ar.h) / ar.w), 64, (USE_POLL_ENTER && POL_ENTER_KEY) ? MAX_DIM_ENTER : MAX_DIM);
+    if (!width && height) W = clamp(Math.round((H * ar.w) / ar.h), 64, (USE_POLL_ENTER && POL_ENTER_KEY) ? MAX_DIM_ENTER : MAX_DIM);
   }
   return { W, H };
 }
@@ -140,7 +145,7 @@ function sniffImageSize(buf) {
   return null;
 }
 
-/* ---------- Provider (Pollinations) avec seed, Accept PNG, retry qualité ---------- */
+/* ---------- Provider Pollinations (Enter API en priorité) ---------- */
 async function callPollinations({
   prompt,
   width = 1024,
@@ -149,10 +154,46 @@ async function callPollinations({
   timeoutMs = POL_TIMEOUT_MS,
   seed
 }) {
-  const W = clamp(width, 64, MAX_DIM);
-  const H = clamp(height, 64, MAX_DIM);
+  // Choix du plafond selon Enter/public
+  const maxDim = (USE_POLL_ENTER && POL_ENTER_KEY) ? MAX_DIM_ENTER : MAX_DIM;
+  const W = clamp(width, 64, maxDim);
+  const H = clamp(height, 64, maxDim);
 
+  // Une tentative (Enter ou public)
   async function oneCall(s) {
+    if (USE_POLL_ENTER && POL_ENTER_KEY) {
+      // ENTER: auth Bearer + pas de WebP dans Accept
+      const q = new URLSearchParams({
+        model,
+        width: String(W),
+        height: String(H),
+        enhance: "true",
+        nologo: "true",
+        ...(s ? { seed: String(s) } : {})
+      }).toString();
+      const url = `https://enter.pollinations.ai/api/generate/image/${encodeURIComponent(prompt)}?${q}`;
+      const headers = {
+        Authorization: `Bearer ${POL_ENTER_KEY}`,
+        Accept: "image/jpeg,image/png,*/*;q=0.8",
+        "User-Agent": "Photoglow-API/ideas-generator"
+      };
+      const r = await fetchWithTimeout(url, { headers }, timeoutMs);
+      if (!r.ok) {
+        const msg = await r.text().catch(() => "");
+        throw new Error(`pollinations_enter_failed ${r.status} ${r.statusText} | ${msg.slice(0,200)}`);
+      }
+      const ctype = (r.headers.get("content-type") || "").toLowerCase();
+      if (!/image\/(png|jpeg|jpg)/i.test(ctype)) {
+        const msg = await r.text().catch(() => "");
+        throw new Error(`unexpected_content_type ${ctype || "(empty)"} | ${msg.slice(0,200)}`);
+      }
+      const bytes = Buffer.from(await r.arrayBuffer());
+      const dims = sniffImageSize(bytes) || {};
+      const norm = /png/i.test(ctype) ? "image/png" : "image/jpeg";
+      return { bytes, ctype: norm, provider_w: dims.width || null, provider_h: dims.height || null };
+    }
+
+    // PUBLIC fallback (Bearer facultatif) + éviter webp
     const q = new URLSearchParams({
       model,
       width: String(W),
@@ -162,32 +203,25 @@ async function callPollinations({
       nologo: "true",
       ...(s ? { seed: String(s) } : {})
     }).toString();
-
     const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
     const headers = {
       ...(POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {}),
-      // Préférence PNG (si serveurs négocient le format)
-      Accept: "image/png,image/jpeg;q=0.8,image/webp;q=0.6,*/*;q=0.5",
+      Accept: "image/jpeg,image/png,*/*;q=0.8",
       "User-Agent": "Photoglow-API/ideas-generator"
     };
-
     const r = await fetchWithTimeout(url, { headers }, timeoutMs);
     if (!r.ok) {
       const msg = await r.text().catch(() => "");
       throw new Error(`pollinations_failed ${r.status} ${r.statusText} | ${msg.slice(0,200)}`);
     }
     const ctype = (r.headers.get("content-type") || "").toLowerCase();
-    if (!/image\/(png|jpeg|jpg|webp)/i.test(ctype)) {
+    if (!/image\/(png|jpeg|jpg)/i.test(ctype)) {
       const msg = await r.text().catch(() => "");
       throw new Error(`unexpected_content_type ${ctype || "(empty)"} | ${msg.slice(0,200)}`);
     }
     const bytes = Buffer.from(await r.arrayBuffer());
     const dims = sniffImageSize(bytes) || {};
-    const norm =
-      /image\/png/i.test(ctype) ? "image/png" :
-      /image\/webp/i.test(ctype) ? "image/webp" :
-      /image\/(jpeg|jpg)/i.test(ctype) ? "image/jpeg" :
-      "application/octet-stream";
+    const norm = /png/i.test(ctype) ? "image/png" : "image/jpeg";
     return { bytes, ctype: norm, provider_w: dims.width || null, provider_h: dims.height || null };
   }
 
@@ -244,7 +278,10 @@ export default async function handler(req, res) {
         persist_ignores_collection: true
       },
       pollinations_timeout_ms: POL_TIMEOUT_MS,
-      max_dim: MAX_DIM,
+      use_poll_enter: USE_POLL_ENTER,
+      has_enter_key: Boolean(POL_ENTER_KEY),
+      max_dim_enter: MAX_DIM_ENTER,
+      max_dim_public: MAX_DIM,
       min_provider_pixels: MIN_PROVIDER_PIXELS,
       now: new Date().toISOString()
     });
@@ -422,7 +459,8 @@ export default async function handler(req, res) {
         image_bytes: bytes.length,
         ctype,
         provider_w,
-        provider_h
+        provider_h,
+        enter_used: !!(USE_POLL_ENTER && POL_ENTER_KEY)
       }
     });
   } catch (e) {
