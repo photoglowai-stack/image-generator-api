@@ -65,7 +65,7 @@ const ADD_DATE_SUBFOLDER = false;  // never append date
 
 // Divers (↑ pilotable par ENV)
 const MAX_DIM = Number(process.env.POLLINATIONS_MAX_DIM || 1792);
-const MIN_PROVIDER_PIXELS = Number(process.env.MIN_PROVIDER_PIXELS || 2_000_000);
+const MIN_PROVIDER_PIXELS = Number(process.env.MIN_PROVIDER_PIXELS || 3_000_000);
 
 /* ---------- Helpers ---------- */
 const sanitize = (s) =>
@@ -166,8 +166,8 @@ async function callPollinations({
     const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
     const headers = {
       ...(POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {}),
-      // Préférence PNG/JPEG ; on évite de forcer le webp
-      Accept: "image/png,image/jpeg;q=0.8,image/webp;q=0.6,*/*;q=0.5",
+      // Préférence PNG/JPEG ; on évite de prioriser le webp
+      Accept: "image/png,image/jpeg,*/*;q=0.5",
       "User-Agent": "Photoglow-API/ideas-generator",
     };
 
@@ -198,6 +198,11 @@ async function callPollinations({
   // seuil qualité (~2–3 Mpx). Si trop petit => 2ème tentative autre seed
   const ok = out.provider_w && out.provider_h && (out.provider_w * out.provider_h >= MIN_PROVIDER_PIXELS);
   if (!ok) {
+    console.warn("provider image too small; retrying with new seed", {
+      width: out.provider_w,
+      height: out.provider_h,
+      min_required: MIN_PROVIDER_PIXELS,
+    });
     const s2 = Math.floor(Math.random() * 1e9);
     try { out = await oneCall(s2); } catch {}
   }
