@@ -1,6 +1,6 @@
 // /api/v1/ideas/generate.mjs — Production-ready (idempotence, retries, HQ defaults)
 // Pollinations → Supabase Storage (public or signed), trace ideas_examples
-// HARD-LOCK STORAGE: always ai_gallery/categories/<slug>/<file> (no date, no collection for persist)
+// STORAGE: ai_gallery/categories/<slug>/<file> (no date, no collection)
 // Metrics: Server-Timing, x-processing-ms, JSON metrics
 export const config = { runtime: "nodejs" };
 
@@ -19,7 +19,7 @@ function setCORS(req, res, opts = {}) {
   res.setHeader("content-type", "application/json");
 }
 
-/* ---------- Response helpers (compat Next API & Vercel Node) ---------- */
+/* ---------- Response helpers ---------- */
 function sendJSON(res, status, obj) {
   try {
     if (typeof res.status === "function" && typeof res.json === "function") {
@@ -40,17 +40,17 @@ function endStatus(res, status = 204) {
   res.end();
 }
 
-/* ---------- ENV (server) ---------- */
+/* ---------- ENV ---------- */
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
 // Priorité: BUCKET_IDEAS > BUCKET_GALLERY > "ai_gallery"
 const BUCKET = process.env.BUCKET_IDEAS || process.env.BUCKET_GALLERY || "ai_gallery";
 
-// Visibilité unique : public (URL directe) ou privé (URL signée)
+// URL publique (true) vs signée (false)
 const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC ?? "true") === "true";
 
-// Provider (public)
+// Pollinations
 const POL_TOKEN = process.env.POLLINATIONS_TOKEN || "";
 const POL_TIMEOUT_MS = Number(process.env.POLLINATIONS_TIMEOUT_MS || 60000);
 
@@ -58,18 +58,18 @@ const POL_TIMEOUT_MS = Number(process.env.POLLINATIONS_TIMEOUT_MS || 60000);
 const SIGNED_TTL_S = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
 const CACHE_CONTROL = String(process.env.IDEAS_CACHE_CONTROL_S || 31536000);
 
-// HARD-LOCK LAYOUT (ignore ENV for persist)
-const OUTPUTS_ROOT = "categories"; // <- always this for persist=true
-const PREVIEWS_ROOT = "previews";  // previews restent possibles
-const ADD_DATE_SUBFOLDER = false;  // never append date
+// Layout (persist / previews)
+const OUTPUTS_ROOT = "categories";
+const PREVIEWS_ROOT = "previews";
+const ADD_DATE_SUBFOLDER = false;
 
-// Divers (↑ pilotable par ENV)
+// Divers
 const MAX_DIM = Number(process.env.POLLINATIONS_MAX_DIM || 1792);
 const MIN_PROVIDER_PIXELS = Number(process.env.MIN_PROVIDER_PIXELS || 3_000_000);
 
-/* ---------- Time budget (éviter 504 en fonction de la durée Vercel) ---------- */
-const MAX_FUNCTION_S  = Number(process.env.MAX_FUNCTION_S || 25); // durée max de ta fonction
-const SAFETY_MARGIN_S = 3; // marge pour upload + JSON + jitter
+// Time budget (Vercel)
+const MAX_FUNCTION_S  = Number(process.env.MAX_FUNCTION_S || 25);
+const SAFETY_MARGIN_S = 3;
 function timeBudgetMs() {
   return Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000);
 }
@@ -90,7 +90,7 @@ function parseAspectRatio(ratio) {
 
 function fitByAspect({ width, height, aspect_ratio }) {
   const ar = parseAspectRatio(aspect_ratio);
-  // Défaut 1024 (plus rapide et suffisant pour une galerie sync)
+  // défaut rapide 1024
   let W = clamp(width || 1024, 64, MAX_DIM);
   let H = clamp(height || 1024, 64, MAX_DIM);
   if (ar) {
@@ -106,14 +106,11 @@ async function fetchWithTimeout(url, init, ms) {
   }
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort("timeout"), ms);
-  try {
-    return await fetch(url, { ...init, signal: ac.signal });
-  } finally {
-    clearTimeout(t);
-  }
+  try { return await fetch(url, { ...init, signal: ac.signal }); }
+  finally { clearTimeout(t); }
 }
 
-/* ---------- Sniffer dimensions (PNG/JPEG/WEBP) ---------- */
+/* ---------- Sniffer dimensions ---------- */
 function sniffImageSize(buf) {
   try {
     // PNG
@@ -148,7 +145,7 @@ function sniffImageSize(buf) {
   return null;
 }
 
-/* ---------- Provider (Pollinations) avec seed, Accept PNG, retry qualité ---------- */
+/* ---------- Provider: Pollinations (alias /p + fallback /prompt) ---------- */
 async function callPollinations({
   prompt,
   width = 1024,
@@ -159,27 +156,16 @@ async function callPollinations({
 }) {
   const W = clamp(width, 64, MAX_DIM);
   const H = clamp(height, 64, MAX_DIM);
+  const enhance = "false"; // + rapide/stable en sync
 
-  async function oneCall(s) {
-    const q = new URLSearchParams({
-      model,
-      width: String(W),
-      height: String(H),
-      private: "true",
-      enhance: "true",
-      nologo: "true",
-      ...(s ? { seed: String(s) } : {})
-    }).toString();
+  const headers = {
+    ...(POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {}),
+    Accept: "image/png,image/jpeg,*/*;q=0.5",
+    "User-Agent": "Photoglow-API/ideas-generator",
+  };
 
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
-    const headers = {
-      ...(POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {}),
-      // Préférence PNG/JPEG ; on évite de prioriser le webp
-      Accept: "image/png,image/jpeg,*/*;q=0.5",
-      "User-Agent": "Photoglow-API/ideas-generator",
-    };
-
-    const r = await fetchWithTimeout(url, { headers }, timeoutMs);
+  async function tryFetch(u) {
+    const r = await fetchWithTimeout(u, { headers }, timeoutMs);
     if (!r.ok) {
       const msg = await r.text().catch(() => "");
       throw new Error(`pollinations_failed ${r.status} ${r.statusText} | ${msg.slice(0,200)}`);
@@ -194,32 +180,44 @@ async function callPollinations({
     const norm =
       /image\/png/i.test(ctype) ? "image/png" :
       /image\/webp/i.test(ctype) ? "image/webp" :
-      /image\/(jpeg|jpg)/i.test(ctype) ? "image/jpeg" :
-      "application/octet-stream";
+      /image\/(jpeg|jpg)/i.test(ctype) ? "image/jpeg" : "application/octet-stream";
     return { bytes, ctype: norm, provider_w: dims.width || null, provider_h: dims.height || null };
   }
 
-  // tentative 1 (seed anti-cache)
-  const s1 = seed ?? Math.floor(Math.random() * 1e9);
-  let out = await oneCall(s1);
+  // seed anti-cache
+  const s = String(seed ?? Math.floor(Math.random() * 1e9));
 
-  // --- Seuil qualité dynamique ---
-  // On accepte l'image si >= min(MIN_PROVIDER_PIXELS, W*H*0.98).
-  // Cela évite un retry inutile quand la demande est plus petite que le seuil global.
+  // 1) Alias rapide /p
+  const uP =
+    `https://pollinations.ai/p/${encodeURIComponent(prompt)}` +
+    `?model=${encodeURIComponent(model)}&width=${W}&height=${H}&enhance=${enhance}&nologo=true&private=true&seed=${s}`;
+
+  // 2) Fallback /prompt
+  const uPrompt =
+    `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}` +
+    `?model=${encodeURIComponent(model)}&width=${W}&height=${H}&enhance=${enhance}&nologo=true&private=true&seed=${s}`;
+
+  // Essai /p, puis /prompt si échec
+  let out = null, err1 = null;
+  try { out = await tryFetch(uP); }
+  catch (e) { err1 = e; }
+
+  if (!out) {
+    try { out = await tryFetch(uPrompt); }
+    catch (e2) { throw new Error(`pollinations_both_failed | p:${String(err1).slice(0,160)} | prompt:${String(e2).slice(0,160)}`); }
+  }
+
+  // Seuil qualité dynamique: min(MIN_PROVIDER_PIXELS, ~100% W*H)
   const targetPx = W * H;
   const minPx = Math.min(MIN_PROVIDER_PIXELS, Math.floor(targetPx * 0.98));
   const ok = out.provider_w && out.provider_h && (out.provider_w * out.provider_h >= minPx);
-
   if (!ok) {
-    console.warn("provider image too small; retrying with new seed", {
-      width: out.provider_w,
-      height: out.provider_h,
-      min_required: minPx,
-      global_min: MIN_PROVIDER_PIXELS,
-      requested: { W, H }
-    });
-    const s2 = Math.floor(Math.random() * 1e9);
-    try { out = await oneCall(s2); } catch {}
+    // Retry une seconde fois avec nouvelle seed (anti-cache)
+    try {
+      const s2 = String(Math.floor(Math.random() * 1e9));
+      const u2 = uP.replace(/seed=\d+/, `seed=${s2}`);
+      out = await tryFetch(u2);
+    } catch {}
   }
   return out;
 }
@@ -237,7 +235,6 @@ function shortHash(s) {
 
 /* ---------- Handler ---------- */
 export default async function handler(req, res) {
-  // [METRICS]
   const t0 = Date.now();
   let tIdem = 0, tProv = 0, tUp = 0;
 
@@ -276,9 +273,7 @@ export default async function handler(req, res) {
 
   // Body tolérant
   let body = req.body;
-  if (typeof body === "string") {
-    try { body = JSON.parse(body); } catch { body = {}; }
-  }
+  if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
 
   const {
     slug,
@@ -286,9 +281,8 @@ export default async function handler(req, res) {
     width,
     height,
     model = "flux",
-    persist = false,             // false => previews, true => categories
-    // collection,                // IGNORÉ pour persist=true (hard-lock)
-    // ---- facultatifs (trace) ----
+    persist = false,
+    // facultatifs (trace)
     category_id,
     prompt_index,
     prompt_title,
@@ -302,23 +296,23 @@ export default async function handler(req, res) {
   }
 
   const sb = (() => {
-    try { return getSb(); } catch (e) { return sendJSON(res, 500, { success: false, error: String(e?.message || e) }); }
+    try { return getSb(); }
+    catch (e) { return sendJSON(res, 500, { success: false, error: String(e?.message || e) }); }
   })();
   if (!sb) return;
 
   // Dimensions
   const { W, H } = fitByAspect({ width, height, aspect_ratio });
 
-  // Idempotence — clé côté client (Figma) → devient le nom de fichier
+  // Idempotence (clé => nom de fichier)
   const IDEM = (req.headers["idempotency-key"] || "").toString().slice(0, 160);
-
   const safeSlug = sanitize(slug);
 
-  // ---- HARD-LOCKED FOLDERS ----
+  // Folders
   const root = persist ? OUTPUTS_ROOT : PREVIEWS_ROOT;
-  const folder = `${root}/${safeSlug}`; // aucune date, aucune collection
+  const folder = `${root}/${safeSlug}`;
 
-  // BaseId : priorité à l'idempotency-key sinon hash
+  // BaseId (idempotency-key prioritaire sinon hash)
   const baseId =
     IDEM ||
     `${safeSlug}-${shortHash(
@@ -337,15 +331,11 @@ export default async function handler(req, res) {
     // 1) Idempotence côté storage
     if (persist) {
       const tA = Date.now();
-      const { data: list, error: listErr } = await sb.storage.from(BUCKET).list(folder, {
-        search: baseId, limit: 100,
-      });
+      const { data: list, error: listErr } = await sb.storage.from(BUCKET).list(folder, { search: baseId, limit: 100 });
       tIdem += Date.now() - tA;
 
       if (!listErr && Array.isArray(list)) {
-        const found = list.find((f) =>
-          f.name === `${baseId}.jpg` || f.name === `${baseId}.png` || f.name === `${baseId}.webp`
-        );
+        const found = list.find((f) => f.name === `${baseId}.jpg` || f.name === `${baseId}.png` || f.name === `${baseId}.webp`);
         if (found) {
           const keyPathExisting = `${folder}/${found.name}`;
           const imageUrl = OUTPUT_PUBLIC
@@ -368,19 +358,20 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2) Appel provider (avec seed anti-cache + retry qualité) — TIME-BUDGET APPLIQUÉ
+    // 2) Appel provider (respect du time budget)
     const tP0 = Date.now();
-    const providerTimeout = Math.max(4000, timeBudgetMs() - 1500); // marge pour upload + JSON
+    const providerTimeout = Math.max(4000, timeBudgetMs() - 1500);
     const { bytes, ctype, provider_w, provider_h } = await callPollinations({
       prompt, width: W, height: H, model, timeoutMs: providerTimeout
     });
-    const tP1 = Date.now();
-    tProv += tP1 - tP0;
+    tProv += Date.now() - tP0;
     console.log("🧪 provider.call | ok", provider_w, "x", provider_h, "| bytes=", bytes.length);
 
     // 3) Nom final (extension réelle)
     const ext =
-      ctype === "image/png" ? "png" : ctype === "image/webp" ? "webp" : ctype === "image/jpeg" ? "jpg" : "jpg";
+      ctype === "image/png" ? "png" :
+      ctype === "image/webp" ? "webp" :
+      ctype === "image/jpeg" ? "jpg" : "jpg";
     const keyPath = `${folder}/${baseId}.${ext}`;
 
     // 4) Upload Storage
@@ -390,8 +381,7 @@ export default async function handler(req, res) {
       upsert: true,
       cacheControl: CACHE_CONTROL,
     });
-    const tU1 = Date.now();
-    tUp += tU1 - tU0;
+    tUp += Date.now() - tU0;
 
     if (up?.error) {
       return sendJSON(res, 500, { success: false, error: "upload_failed", details: String(up.error).slice(0, 200) });
