@@ -1,13 +1,14 @@
-// /api/v1/ideas/generate.mjs — Production-ready (idempotence, retries, HQ defaults)
-// Pollinations → Supabase Storage (public or signed), trace ideas_examples
+// /api/v1/ideas/generate.mjs
+// Photoglow — v1 HQ (Pollinations → Supabase Storage → URL publique/signée)
 // STORAGE: ai_gallery/categories/<slug>/<file> (no date, no collection)
-// Metrics: Server-Timing, x-processing-ms, JSON metrics
-export const config = { runtime: "nodejs" };
+// Objectif: meilleure qualité que v1-preview (résolution plus élevée + enhance=true par défaut)
+
+export const config = { runtime: "nodejs", maxDuration: 25 };
 
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
 
-/* ---------- CORS ---------- */
+/* ----------------------------- CORS ----------------------------- */
 function setCORS(req, res, opts = {}) {
   res.setHeader("access-control-allow-origin", "*");
   res.setHeader("access-control-allow-methods", opts.allowMethods || "GET,POST,OPTIONS");
@@ -16,10 +17,9 @@ function setCORS(req, res, opts = {}) {
     opts.allowHeaders || "content-type, authorization, idempotency-key"
   );
   res.setHeader("access-control-max-age", "86400");
-  res.setHeader("content-type", "application/json");
 }
 
-/* ---------- Response helpers ---------- */
+/* ----------------------- Response helpers ----------------------- */
 function sendJSON(res, status, obj) {
   try {
     if (typeof res.status === "function" && typeof res.json === "function") {
@@ -40,7 +40,7 @@ function endStatus(res, status = 204) {
   res.end();
 }
 
-/* ---------- ENV ---------- */
+/* ----------------------------- ENV ------------------------------ */
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
@@ -52,32 +52,31 @@ const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC ?? "true") === "true";
 
 // Pollinations
 const POL_TOKEN = process.env.POLLINATIONS_TOKEN || "";
-const POL_TIMEOUT_MS = Number(process.env.POLLINATIONS_TIMEOUT_MS || 60000);
+const POL_ENHANCE = (process.env.POL_ENHANCE ?? "true") === "true"; // HQ: true par défaut
+const POL_ENDPOINT_P = process.env.POL_ENDPOINT_P || "https://pollinations.ai/p";
+const POL_ENDPOINT_PROMPT = process.env.POL_ENDPOINT_PROMPT || "https://image.pollinations.ai/prompt";
+
+// Time budget (Vercel)
+const MAX_FUNCTION_S = Number(process.env.MAX_FUNCTION_S || 25);
+const SAFETY_MARGIN_S = 4; // laisse du temps pour upload + JSON
+function timeBudgetMs() {
+  return Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000);
+}
+const POL_TIMEOUT_MS = Math.max(6000, timeBudgetMs() - 2000);
 
 // Storage
 const SIGNED_TTL_S = Number(process.env.OUTPUT_SIGNED_TTL_S || 60 * 60 * 24 * 30);
 const CACHE_CONTROL = String(process.env.IDEAS_CACHE_CONTROL_S || 31536000);
 
-// Layout (persist / previews)
-const OUTPUTS_ROOT = "categories";
-const PREVIEWS_ROOT = "previews";
-const ADD_DATE_SUBFOLDER = false;
-
-// Divers
-const MAX_DIM = Number(process.env.POLLINATIONS_MAX_DIM || 1792);
+// Résolution & qualité
+const MAX_DIM = Number(process.env.POLLINATIONS_MAX_DIM || 1792); // plus haut que preview
+const DEFAULT_PX = Number(process.env.GENERATE_DEFAULT_PX || 1536); // base HQ
 const MIN_PROVIDER_PIXELS = Number(process.env.MIN_PROVIDER_PIXELS || 3_000_000);
 
-// Time budget (Vercel)
-const MAX_FUNCTION_S  = Number(process.env.MAX_FUNCTION_S || 25);
-const SAFETY_MARGIN_S = 3;
-function timeBudgetMs() {
-  return Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000);
-}
-
-/* ---------- Helpers ---------- */
+/* ---------------------------- Helpers --------------------------- */
 const sanitize = (s) =>
   String(s).toLowerCase().replace(/[^a-z0-9\-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-const clamp = (n, min, max) => Math.max(min, Math.min(max, Math.floor(n || 0)));
+const clamp = (n, min, max) => Math.max(min, Math.min(max, Math.floor(Number(n) || 0)));
 
 function parseAspectRatio(ratio) {
   if (!ratio || typeof ratio !== "string") return null;
@@ -88,29 +87,43 @@ function parseAspectRatio(ratio) {
   return { w, h };
 }
 
-function fitByAspect({ width, height, aspect_ratio }) {
+// Dimensions HQ (plus haut que v1-preview)
+function computeDims({ width, height, aspect_ratio }) {
   const ar = parseAspectRatio(aspect_ratio);
-  // défaut rapide 1024
-  let W = clamp(width || 1024, 64, MAX_DIM);
-  let H = clamp(height || 1024, 64, MAX_DIM);
+  let W = clamp(width || DEFAULT_PX, 512, MAX_DIM);
+  let H = clamp(height || DEFAULT_PX, 512, MAX_DIM);
+
   if (ar) {
-    if (width && !height) H = clamp(Math.round((W * ar.h) / ar.w), 64, MAX_DIM);
-    if (!width && height) W = clamp(Math.round((H * ar.w) / ar.h), 64, MAX_DIM);
+    if (width && !height) {
+      H = clamp(Math.round((W * ar.h) / ar.w), 512, MAX_DIM);
+    } else if (!width && height) {
+      W = clamp(Math.round((H * ar.w) / ar.h), 512, MAX_DIM);
+    } else if (!width && !height) {
+      // par défaut: portrait 3:4 si aspect_ratio fourni
+      if (ar.h > ar.w) {
+        W = clamp(DEFAULT_PX, 512, MAX_DIM);
+        H = clamp(Math.round((W * ar.h) / ar.w), 512, MAX_DIM);
+      } else {
+        H = clamp(DEFAULT_PX, 512, MAX_DIM);
+        W = clamp(Math.round((H * ar.w) / ar.h), 512, MAX_DIM);
+      }
+    }
   }
+
   return { W, H };
 }
 
-async function fetchWithTimeout(url, init, ms) {
+async function fetchWithTimeout(url, init = {}, timeoutMs = POL_TIMEOUT_MS) {
   if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
-    return fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
+    return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
   }
   const ac = new AbortController();
-  const t = setTimeout(() => ac.abort("timeout"), ms);
+  const t = setTimeout(() => ac.abort("timeout"), timeoutMs);
   try { return await fetch(url, { ...init, signal: ac.signal }); }
   finally { clearTimeout(t); }
 }
 
-/* ---------- Sniffer dimensions ---------- */
+/* ----------------- Sniffer dimensions simple -------------------- */
 function sniffImageSize(buf) {
   try {
     // PNG
@@ -145,27 +158,39 @@ function sniffImageSize(buf) {
   return null;
 }
 
-/* ---------- Provider: Pollinations (alias /p + fallback /prompt) ---------- */
-async function callPollinations({
+/* ------------------ Provider: Pollinations HQ ------------------- */
+async function callPollinationsHQ({
   prompt,
-  width = 1024,
-  height = 1024,
+  width,
+  height,
   model = "flux",
   timeoutMs = POL_TIMEOUT_MS,
   seed
 }) {
-  const W = clamp(width, 64, MAX_DIM);
-  const H = clamp(height, 64, MAX_DIM);
-  const enhance = "false"; // + rapide/stable en sync
+  const W = clamp(width, 512, MAX_DIM);
+  const H = clamp(height, 512, MAX_DIM);
+  const enhance = POL_ENHANCE ? "true" : "false";
 
   const headers = {
-    ...(POL_TOKEN ? { Authorization: `Bearer ${POL_TOKEN}` } : {}),
-    Accept: "image/png,image/jpeg,*/*;q=0.5",
-    "User-Agent": "Photoglow-API/ideas-generator",
+    Accept: "image/png,image/jpeg,image/webp,*/*;q=0.5",
+    "User-Agent": "Photoglow-API/generate-hq",
   };
+  if (POL_TOKEN) headers.Authorization = `Bearer ${POL_TOKEN}`;
 
-  async function tryFetch(u) {
-    const r = await fetchWithTimeout(u, { headers }, timeoutMs);
+  async function oneURL(baseEndpoint, s) {
+    const q = new URLSearchParams({
+      model,
+      width: String(W),
+      height: String(H),
+      private: "true",
+      nologo: "true",
+      enhance,
+      nofeed: "true",
+      seed: String(s),
+      quality: "high",
+    }).toString();
+    const url = `${baseEndpoint}/${encodeURIComponent(prompt)}?${q}`;
+    const r = await fetchWithTimeout(url, { headers }, timeoutMs);
     if (!r.ok) {
       const msg = await r.text().catch(() => "");
       throw new Error(`pollinations_failed ${r.status} ${r.statusText} | ${msg.slice(0,200)}`);
@@ -180,48 +205,56 @@ async function callPollinations({
     const norm =
       /image\/png/i.test(ctype) ? "image/png" :
       /image\/webp/i.test(ctype) ? "image/webp" :
-      /image\/(jpeg|jpg)/i.test(ctype) ? "image/jpeg" : "application/octet-stream";
-    return { bytes, ctype: norm, provider_w: dims.width || null, provider_h: dims.height || null };
+      /image\/(jpeg|jpg)/i.test(ctype) ? "image/jpeg" :
+      "application/octet-stream";
+    return { bytes, ctype: norm, provider_w: dims.width || null, provider_h: dims.height || null, url };
   }
 
   // seed anti-cache
-  const s = String(seed ?? Math.floor(Math.random() * 1e9));
+  const s1 = seed ?? Math.floor(Math.random() * 1e9);
 
-  // 1) Alias rapide /p
-  const uP =
-    `https://pollinations.ai/p/${encodeURIComponent(prompt)}` +
-    `?model=${encodeURIComponent(model)}&width=${W}&height=${H}&enhance=${enhance}&nologo=true&private=true&seed=${s}`;
+  let out = null;
+  let lastErr = null;
 
-  // 2) Fallback /prompt
-  const uPrompt =
-    `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}` +
-    `?model=${encodeURIComponent(model)}&width=${W}&height=${H}&enhance=${enhance}&nologo=true&private=true&seed=${s}`;
+  // 1) /p (pollinations.ai)
+  try {
+    out = await oneURL(POL_ENDPOINT_P, s1);
+  } catch (e) {
+    lastErr = e;
+  }
 
-  // Essai /p, puis /prompt si échec
-  let out = null, err1 = null;
-  try { out = await tryFetch(uP); }
-  catch (e) { err1 = e; }
-
+  // 2) fallback /prompt (image.pollinations.ai)
   if (!out) {
-    try { out = await tryFetch(uPrompt); }
-    catch (e2) { throw new Error(`pollinations_both_failed | p:${String(err1).slice(0,160)} | prompt:${String(e2).slice(0,160)}`); }
+    try {
+      out = await oneURL(POL_ENDPOINT_PROMPT, s1);
+    } catch (e2) {
+      throw new Error(
+        `pollinations_both_failed | p:${String(lastErr).slice(0,160)} | prompt:${String(e2).slice(0,160)}`
+      );
+    }
   }
 
-  // Seuil qualité dynamique: min(MIN_PROVIDER_PIXELS, ~100% W*H)
+  // 3) Seuil qualité: on veut au moins ~90% des pixels demandés (ou MIN_PROVIDER_PIXELS, le plus petit)
   const targetPx = W * H;
-  const minPx = Math.min(MIN_PROVIDER_PIXELS, Math.floor(targetPx * 0.98));
+  const minPx = Math.min(MIN_PROVIDER_PIXELS, Math.floor(targetPx * 0.9));
   const ok = out.provider_w && out.provider_h && (out.provider_w * out.provider_h >= minPx);
+
   if (!ok) {
-    // Retry une seconde fois avec nouvelle seed (anti-cache)
+    // Retry une fois avec une nouvelle seed, mais toujours HQ
     try {
-      const s2 = String(Math.floor(Math.random() * 1e9));
-      const u2 = uP.replace(/seed=\d+/, `seed=${s2}`);
-      out = await tryFetch(u2);
-    } catch {}
+      const s2 = Math.floor(Math.random() * 1e9);
+      const retry = await oneURL(POL_ENDPOINT_P, s2);
+      return retry;
+    } catch {
+      // on garde le premier résultat même s'il est un peu en dessous
+      return out;
+    }
   }
+
   return out;
 }
 
+/* ------------------------ Supabase client ----------------------- */
 function getSb() {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("Missing env: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) & SUPABASE_SERVICE_ROLE_KEY");
@@ -233,15 +266,16 @@ function shortHash(s) {
   return crypto.createHash("sha256").update(String(s)).digest("hex").slice(0, 16);
 }
 
-/* ---------- Handler ---------- */
+/* ------------------------------ API ----------------------------- */
 export default async function handler(req, res) {
   const t0 = Date.now();
-  let tIdem = 0, tProv = 0, tUp = 0;
+  let tProv = 0, tUp = 0;
 
   setCORS(req, res, {
     allowMethods: "GET,POST,OPTIONS",
     allowHeaders: "content-type, authorization, idempotency-key",
   });
+
   if (req.method === "OPTIONS") return endStatus(res, 204);
 
   // Debug
@@ -253,16 +287,10 @@ export default async function handler(req, res) {
       has_service_role: Boolean(SUPABASE_SERVICE_ROLE_KEY),
       bucket: BUCKET,
       output_public: OUTPUT_PUBLIC,
-      path_policy: {
-        outputs_root: OUTPUTS_ROOT,
-        previews_root: PREVIEWS_ROOT,
-        add_date_subfolder: String(ADD_DATE_SUBFOLDER),
-        lock: true,
-        persist_ignores_collection: true
-      },
-      pollinations_timeout_ms: POL_TIMEOUT_MS,
       max_dim: MAX_DIM,
-      min_provider_pixels: MIN_PROVIDER_PIXELS,
+      default_px: DEFAULT_PX,
+      pollinations_timeout_ms: POL_TIMEOUT_MS,
+      pollinations_enhance: POL_ENHANCE,
       now: new Date().toISOString()
     });
   }
@@ -273,173 +301,131 @@ export default async function handler(req, res) {
 
   // Body tolérant
   let body = req.body;
-  if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+  if (typeof body === "string") {
+    try { body = JSON.parse(body); } catch { body = {}; }
+  }
+  if (!body || typeof body !== "object") body = {};
 
   const {
     slug,
     prompt,
     width,
     height,
-    model = "flux",
-    persist = false,
-    // facultatifs (trace)
-    category_id,
-    prompt_index,
-    prompt_title,
-    prompt_text,
     aspect_ratio,
-    style,
-  } = body || {};
+    model = "flux",
+    seed,
+  } = body;
 
   if (!slug || !prompt) {
     return sendJSON(res, 400, { success: false, error: "missing_slug_or_prompt" });
   }
 
-  const sb = (() => {
-    try { return getSb(); }
-    catch (e) { return sendJSON(res, 500, { success: false, error: String(e?.message || e) }); }
-  })();
-  if (!sb) return;
+  let sb;
+  try {
+    sb = getSb();
+  } catch (e) {
+    return sendJSON(res, 500, { success: false, error: String(e?.message || e) });
+  }
 
-  // Dimensions
-  const { W, H } = fitByAspect({ width, height, aspect_ratio });
+  // Dimensions HQ
+  const { W, H } = computeDims({ width, height, aspect_ratio });
 
-  // Idempotence (clé => nom de fichier)
+  // Idempotence : Idempotency-Key → nom de fichier stable
   const IDEM = (req.headers["idempotency-key"] || "").toString().slice(0, 160);
   const safeSlug = sanitize(slug);
+  const folder = `categories/${safeSlug}`;
 
-  // Folders
-  const root = persist ? OUTPUTS_ROOT : PREVIEWS_ROOT;
-  const folder = `${root}/${safeSlug}`;
-
-  // BaseId (idempotency-key prioritaire sinon hash)
+  // BaseId
   const baseId =
     IDEM ||
     `${safeSlug}-${shortHash(
-      `${category_id || ""}|${style || ""}|${prompt_title || ""}|${prompt_text || prompt}|${W}x${H}|${model}|${aspect_ratio || ""}|${persist}`
+      `${prompt}|${W}x${H}|${model}|${aspect_ratio || ""}`
     )}`;
 
-  console.log(`🧾 request | ideas.generate | slug=${safeSlug} | folder=${folder} | baseId=${baseId} | ${W}x${H}`);
+  console.log(`🧾 request | ideas.generate HQ | slug=${safeSlug} | baseId=${baseId} | ${W}x${H}`);
 
   try {
-    // 0) Bucket check
+    // 0) Bucket check (simple, pas d'idempotence storage pour rester rapide)
     const bucketCheck = await sb.storage.getBucket(BUCKET);
     if (!bucketCheck?.data) {
       return sendJSON(res, 500, { success: false, error: "bucket_not_found", bucket: BUCKET });
     }
 
-    // 1) Idempotence côté storage
-    if (persist) {
-      const tA = Date.now();
-      const { data: list, error: listErr } = await sb.storage.from(BUCKET).list(folder, { search: baseId, limit: 100 });
-      tIdem += Date.now() - tA;
-
-      if (!listErr && Array.isArray(list)) {
-        const found = list.find((f) => f.name === `${baseId}.jpg` || f.name === `${baseId}.png` || f.name === `${baseId}.webp`);
-        if (found) {
-          const keyPathExisting = `${folder}/${found.name}`;
-          const imageUrl = OUTPUT_PUBLIC
-            ? sb.storage.from(BUCKET).getPublicUrl(keyPathExisting).data.publicUrl
-            : (await sb.storage.from(BUCKET).createSignedUrl(keyPathExisting, SIGNED_TTL_S)).data.signedUrl;
-
-          const total = Date.now() - t0;
-          res.setHeader("server-timing", `idem;dur=${tIdem}, total;dur=${total}`);
-          res.setHeader("x-processing-ms", String(total));
-          return sendJSON(res, 200, {
-            success: true,
-            slug: safeSlug,
-            image_url: imageUrl,
-            bucket: BUCKET,
-            persist,
-            idempotent: true,
-            metrics: { total_ms: total, idem_ms: tIdem, provider_ms: 0, upload_ms: 0, idempotent: true }
-          });
-        }
-      }
-    }
-
-    // 2) Appel provider (respect du time budget)
+    // 1) Appel provider HQ
     const tP0 = Date.now();
-    const providerTimeout = Math.max(4000, timeBudgetMs() - 1500);
-    const { bytes, ctype, provider_w, provider_h } = await callPollinations({
-      prompt, width: W, height: H, model, timeoutMs: providerTimeout
+    const { bytes, ctype, provider_w, provider_h } = await callPollinationsHQ({
+      prompt,
+      width: W,
+      height: H,
+      model,
+      timeoutMs: POL_TIMEOUT_MS,
+      seed,
     });
-    tProv += Date.now() - tP0;
-    console.log("🧪 provider.call | ok", provider_w, "x", provider_h, "| bytes=", bytes.length);
+    tProv = Date.now() - tP0;
+    console.log("🧪 provider.call HQ | ok", provider_w, "x", provider_h, "| bytes=", bytes.length, "| ctype=", ctype);
 
-    // 3) Nom final (extension réelle)
+    // 2) Déterminer extension
     const ext =
       ctype === "image/png" ? "png" :
       ctype === "image/webp" ? "webp" :
       ctype === "image/jpeg" ? "jpg" : "jpg";
+
     const keyPath = `${folder}/${baseId}.${ext}`;
 
-    // 4) Upload Storage
+    // 3) Upload Supabase
     const tU0 = Date.now();
     const up = await sb.storage.from(BUCKET).upload(keyPath, bytes, {
       contentType: ctype || "image/jpeg",
       upsert: true,
       cacheControl: CACHE_CONTROL,
     });
-    tUp += Date.now() - tU0;
+    tUp = Date.now() - tU0;
 
     if (up?.error) {
-      return sendJSON(res, 500, { success: false, error: "upload_failed", details: String(up.error).slice(0, 200) });
+      return sendJSON(res, 500, {
+        success: false,
+        error: "upload_failed",
+        details: String(up.error).slice(0, 200),
+      });
     }
 
-    // 5) URL publique / signée
+    // 4) URL publique / signée
     const imageUrl = OUTPUT_PUBLIC
       ? sb.storage.from(BUCKET).getPublicUrl(keyPath).data.publicUrl
       : (await sb.storage.from(BUCKET).createSignedUrl(keyPath, SIGNED_TTL_S)).data.signedUrl;
 
-    console.log(`📦 stored | ${imageUrl}`);
-
-    // 6) Trace DB (non bloquant)
-    const trace = {
-      slug: safeSlug,
-      image_url: imageUrl,
-      provider: "pollinations",
-      bucket: BUCKET,
-      key_path: keyPath,
-      persist,
-      style: style || null,
-      prompt_title: prompt_title || null,
-      prompt_text: prompt_text || prompt || null,
-      category_id: category_id || null,
-      prompt_index: Number.isFinite(+prompt_index) ? +prompt_index : null,
-      aspect_ratio: aspect_ratio || null,
-      width: W,
-      height: H,
-      model_used: model,
-      created_at: new Date().toISOString(),
-    };
-    try { await sb.from("ideas_examples").insert(trace); } catch (e) {
-      console.warn("db_insert_failed", e);
-    }
+    console.log(`📦 stored HQ | ${imageUrl}`);
 
     const total = Date.now() - t0;
-    res.setHeader("server-timing", `idem;dur=${tIdem}, provider;dur=${tProv}, upload;dur=${tUp}, total;dur=${total}`);
+    res.setHeader("content-type", "application/json");
     res.setHeader("x-processing-ms", String(total));
+    res.setHeader(
+      "server-timing",
+      `provider;dur=${tProv}, upload;dur=${tUp}, total;dur=${total}`
+    );
+
     return sendJSON(res, 200, {
       success: true,
       slug: safeSlug,
       image_url: imageUrl,
       bucket: BUCKET,
-      persist,
+      key_path: keyPath,
+      model_used: model,
+      requested: { width: W, height: H, aspect_ratio: aspect_ratio || null },
+      provider_dims: { width: provider_w, height: provider_h },
       metrics: {
         total_ms: total,
-        idem_ms: tIdem,
         provider_ms: tProv,
         upload_ms: tUp,
-        idempotent: false,
         image_bytes: bytes.length,
         ctype,
-        provider_w,
-        provider_h
-      }
+      },
     });
   } catch (e) {
-    console.error("❌ failed | ideas.generate", e);
-    return sendJSON(res, 500, { success: false, error: String(e).slice(0, 200) });
+    console.error("❌ failed | ideas.generate HQ", e);
+    return sendJSON(res, 500, {
+      success: false,
+      error: String(e).slice(0, 200),
+    });
   }
 }
