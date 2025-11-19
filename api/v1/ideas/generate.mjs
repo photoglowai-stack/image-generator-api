@@ -3,7 +3,7 @@
 // STORAGE: ai_gallery/categories/<slug>/<file> (no date, no collection)
 // Objectif: meilleure qualité que v1-preview (résolution plus élevée + enhance=true par défaut)
 
-export const config = { runtime: "nodejs", maxDuration: 25 };
+export const config = { runtime: "nodejs", maxDuration: 60 };
 
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
@@ -56,21 +56,24 @@ const BUCKET =
 const OUTPUT_PUBLIC = (process.env.OUTPUT_PUBLIC ?? "true") === "true";
 
 // Pollinations
+// Récupération du token depuis les variables d'env Vercel
 const POL_TOKEN = process.env.POLLINATIONS_TOKEN || "";
 const POL_ENHANCE = (process.env.POL_ENHANCE ?? "true") === "true"; // HQ: true par défaut
 const POL_ENDPOINT_PROMPT =
   process.env.POL_ENDPOINT_PROMPT || "https://image.pollinations.ai/prompt";
 
 // Time budget (Vercel)
-const MAX_FUNCTION_S = Number(process.env.MAX_FUNCTION_S || 25);
+// MODIFICATION ICI : On passe à 55s par défaut (maxDuration est à 60s dans vercel.json)
+const MAX_FUNCTION_S = Number(process.env.MAX_FUNCTION_S || 55);
 const SAFETY_MARGIN_S = 4; // laisse du temps pour upload + JSON
 
 function timeBudgetMs() {
   return Math.max(5000, (MAX_FUNCTION_S - SAFETY_MARGIN_S) * 1000);
 }
 
-// Timeout provider ~15s max
-const POL_TIMEOUT_MS = Math.min(15000, timeBudgetMs() - 2000);
+// Timeout provider : On autorise jusqu'à 45s d'attente (au lieu de 15s)
+// Cela permet à l'option "Enhance" de terminer son travail HQ.
+const POL_TIMEOUT_MS = Math.min(45000, timeBudgetMs() - 2000);
 
 // Storage
 const SIGNED_TTL_S = Number(
@@ -223,6 +226,7 @@ async function callPollinationsHQ({
     Accept: "image/png,image/jpeg,image/webp,*/*;q=0.5",
     "User-Agent": "Photoglow-API/generate-hq",
   };
+  // Injection du token si présent
   if (POL_TOKEN) headers.Authorization = `Bearer ${POL_TOKEN}`;
 
   const s = seed ?? Math.floor(Math.random() * 1e9);
@@ -336,6 +340,7 @@ export default async function handler(req, res) {
       default_px: DEFAULT_PX,
       pollinations_timeout_ms: POL_TIMEOUT_MS,
       pollinations_enhance: POL_ENHANCE,
+      pollinations_token_configured: Boolean(POL_TOKEN),
       now: new Date().toISOString(),
     });
   }
